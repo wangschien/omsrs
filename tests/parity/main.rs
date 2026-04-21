@@ -26,12 +26,14 @@ mod test_models;
 mod test_order;
 mod test_simulation_models;
 mod test_utils;
+mod test_virtual_broker;
 
 use test_base::*;
 use test_models::*;
 use test_order::*;
 use test_simulation_models::*;
 use test_utils::*;
+use test_virtual_broker::*;
 
 const MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -211,6 +213,29 @@ register_parity_tests!(
     test_order_fill_stop_buy,
     test_order_fill_stop_sell,
     test_order_fill_stop_as_market,
+    // R6 — tests/simulation/test_virtual.py VirtualBroker subset (22)
+    test_virtual_broker_defaults,
+    test_virtual_broker_is_failure,
+    test_virtual_broker_order_place_success,
+    test_virtual_broker_order_place_success_fields,
+    test_virtual_broker_order_place_failure,
+    test_virtual_broker_order_place_user_response,
+    test_virtual_broker_order_place_validation_error,
+    test_virtual_broker_get,
+    test_virtual_broker_order_modify,
+    test_virtual_broker_order_modify_failure,
+    test_virtual_broker_order_modify_kwargs_response,
+    test_virtual_broker_order_cancel,
+    test_virtual_broker_order_cancel_failure,
+    test_virtual_broker_order_cancel_kwargs_response,
+    test_virtual_broker_add_user,
+    test_virtual_broker_order_place_users,
+    test_virtual_broker_order_place_same_memory,
+    test_virtual_broker_order_place_delay,
+    test_virtual_broker_get_order_by_status,
+    test_virtual_broker_update_ticker,
+    test_virtual_broker_ltp,
+    test_virtual_broker_ohlc,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the

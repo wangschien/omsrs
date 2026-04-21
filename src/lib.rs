@@ -9,6 +9,7 @@ pub mod parity_gate;
 pub mod persistence;
 pub mod simulation;
 pub mod utils;
+pub mod virtual_broker;
 
 pub use broker::{rename, Broker};
 pub use brokers::Paper;

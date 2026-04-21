@@ -2,7 +2,7 @@
 # stripped and blank lines ignored at load time. Phase gates extend this
 # file monotonically; §4.1.1 of PORT-PLAN pins the R10 length at 237.
 #
-# Current phase gate: R5 (cumulative 158 = R1 20 + R2 10 + R3 64 + R4 10 + R5 54).
+# Current phase gate: R6 (cumulative 180 = R1 20 + R2 10 + R3 64 + R4 10 + R5 54 + R6 22).
 
 # --- R1: tests/test_utils.py (17) ---
 test_create_basic_positions_from_orders_dict_keys
@@ -175,3 +175,27 @@ test_order_fill_stop_no_trigger_price
 test_order_fill_stop_buy
 test_order_fill_stop_sell
 test_order_fill_stop_as_market
+
+# --- R6: tests/simulation/test_virtual.py VirtualBroker subset (22) ---
+test_virtual_broker_defaults
+test_virtual_broker_is_failure
+test_virtual_broker_order_place_success
+test_virtual_broker_order_place_success_fields
+test_virtual_broker_order_place_failure
+test_virtual_broker_order_place_user_response
+test_virtual_broker_order_place_validation_error
+test_virtual_broker_get
+test_virtual_broker_order_modify
+test_virtual_broker_order_modify_failure
+test_virtual_broker_order_modify_kwargs_response
+test_virtual_broker_order_cancel
+test_virtual_broker_order_cancel_failure
+test_virtual_broker_order_cancel_kwargs_response
+test_virtual_broker_add_user
+test_virtual_broker_order_place_users
+test_virtual_broker_order_place_same_memory
+test_virtual_broker_order_place_delay
+test_virtual_broker_get_order_by_status
+test_virtual_broker_update_ticker
+test_virtual_broker_ltp
+test_virtual_broker_ohlc
