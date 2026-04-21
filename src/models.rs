@@ -8,6 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{clock_system_default, Clock};
 
+/// Serde default for `OrderLock`'s skipped `*_lock_till` timestamps.
+/// Upstream stores these as `PrivateAttr`s and re-initialises them from
+/// `pendulum.now(tz=self.timezone)` in `__init__`, so a round-tripped
+/// payload has no timestamp keys. Mirror that: skip on serialise, default
+/// to `Utc::now()` on deserialise. The model's real clock source (injected
+/// `Arc<dyn Clock>`) overrides this on the first `create/modify/cancel`
+/// call, so any wall-clock default here is replaced before it's observed.
+fn utc_now_default() -> DateTime<Utc> {
+    Utc::now()
+}
+
 /// Upstream `models.QuantityMatch`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantityMatch {
@@ -165,8 +176,11 @@ pub struct OrderLock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
 
+    #[serde(skip, default = "utc_now_default")]
     creation_lock_till: DateTime<Utc>,
+    #[serde(skip, default = "utc_now_default")]
     modification_lock_till: DateTime<Utc>,
+    #[serde(skip, default = "utc_now_default")]
     cancellation_lock_till: DateTime<Utc>,
 
     #[serde(skip, default = "clock_system_default")]

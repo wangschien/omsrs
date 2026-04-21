@@ -100,66 +100,73 @@ pub fn test_orderbook_total_bid_ask_quantity() {
 
 // ── R2: OrderLock ───────────────────────────────────────────────────────
 
-/// Upstream tests use `pendulum.travel_to(known, freeze=True)`. We inject a
-/// `MockClock` at construction so `clock.now()` returns a deterministic UTC
-/// instant. Timezone info on `OrderLock` is carried but doesn't affect
-/// arithmetic — pendulum's equality is instant-based and so is chrono's.
-fn known() -> chrono::DateTime<Utc> {
+/// Upstream tests use `pendulum.travel_to(known, freeze=True)` or
+/// `@patch("pendulum.now")`. We inject a `MockClock` at construction so
+/// `clock.now()` returns a deterministic UTC instant. Helpers below
+/// UTC-normalise each upstream `tz=…` fixture so the Rust `known_*` instant
+/// equals the upstream wall-clock instant, not just its label.
+fn known_defaults_utc() -> chrono::DateTime<Utc> {
+    // Upstream: `pendulum.datetime(2022, 1, 1, 10, 10, 13, tz=None)` —
+    // naive datetime, pendulum compares as UTC.
+    Utc.with_ymd_and_hms(2022, 1, 1, 10, 10, 13).unwrap()
+}
+
+fn known_kolkata_utc() -> chrono::DateTime<Utc> {
+    // Upstream: `pendulum.datetime(2022, 1, 1, 10, 10, 15, tz="Asia/Kolkata")`.
+    // Asia/Kolkata = UTC+5:30 → 10:10:15 IST = 04:40:15 UTC.
+    Utc.with_ymd_and_hms(2022, 1, 1, 4, 40, 15).unwrap()
+}
+
+fn known_max_duration_utc() -> chrono::DateTime<Utc> {
+    // Upstream: `pendulum.datetime(2022, 1, 1, 10, 10, 15, tz="local")`.
+    // "local" is host-dependent — we UTC-normalise to 10:10:15 UTC and
+    // verify assertions relative to this base. All expected values in the
+    // test are base + Xs, so the absolute UTC instant is inconsequential.
     Utc.with_ymd_and_hms(2022, 1, 1, 10, 10, 15).unwrap()
 }
 
 pub fn test_order_lock_defaults() {
-    let clock = MockClock::new(known());
+    let clock = MockClock::new(known_defaults_utc());
     let arc: Arc<dyn Clock + Send + Sync> = Arc::new(clock.clone());
     let lock = OrderLock::with_clock(arc);
-    assert_eq!(lock.creation_lock_till(), known());
-    assert_eq!(lock.modification_lock_till(), known());
-    assert_eq!(lock.cancellation_lock_till(), known());
+    assert_eq!(lock.creation_lock_till(), known_defaults_utc());
+    assert_eq!(lock.modification_lock_till(), known_defaults_utc());
+    assert_eq!(lock.cancellation_lock_till(), known_defaults_utc());
 }
 
 pub fn test_order_lock_methods() {
-    let clock = MockClock::new(known());
+    let base = known_kolkata_utc();
+    let clock = MockClock::new(base);
     let arc: Arc<dyn Clock + Send + Sync> = Arc::new(clock.clone());
     let mut lock = OrderLock::with_clock(arc);
 
-    // create(20): known + 20s
+    // create(20): base + 20s
     lock.create(20.0);
-    assert_eq!(lock.creation_lock_till(), known() + Duration::seconds(20));
+    assert_eq!(lock.creation_lock_till(), base + Duration::seconds(20));
 
-    // modify(60): known + 60s = 10:11:15
+    // modify(60): base + 60s
     lock.modify(60.0);
-    assert_eq!(
-        lock.modification_lock_till(),
-        Utc.with_ymd_and_hms(2022, 1, 1, 10, 11, 15).unwrap()
-    );
+    assert_eq!(lock.modification_lock_till(), base + Duration::seconds(60));
 
-    // cancel(15): known + 15s = 10:10:30
+    // cancel(15): base + 15s
     lock.cancel(15.0);
-    assert_eq!(
-        lock.cancellation_lock_till(),
-        Utc.with_ymd_and_hms(2022, 1, 1, 10, 10, 30).unwrap()
-    );
+    assert_eq!(lock.cancellation_lock_till(), base + Duration::seconds(15));
 }
 
 pub fn test_order_lock_methods_max_duration() {
-    let clock = MockClock::new(known());
+    let base = known_max_duration_utc();
+    let clock = MockClock::new(base);
     let arc: Arc<dyn Clock + Send + Sync> = Arc::new(clock.clone());
     let mut lock = OrderLock::with_clock(arc);
 
-    // max = 60 (default). create(90) → capped at 60s → 10:11:15.
+    // max = 60 (default). create(90) → capped at 60s.
     lock.create(90.0);
-    assert_eq!(
-        lock.creation_lock_till(),
-        Utc.with_ymd_and_hms(2022, 1, 1, 10, 11, 15).unwrap()
-    );
+    assert_eq!(lock.creation_lock_till(), base + Duration::seconds(60));
 
-    // Bump max to 120. create(90) → uncapped 90s → 10:11:45.
+    // Bump max to 120. create(90) → uncapped 90s.
     lock.max_order_creation_lock_time = 120.0;
     lock.create(90.0);
-    assert_eq!(
-        lock.creation_lock_till(),
-        Utc.with_ymd_and_hms(2022, 1, 1, 10, 11, 45).unwrap()
-    );
+    assert_eq!(lock.creation_lock_till(), base + Duration::seconds(90));
 }
 
 /// Upstream parametrizes over `("can_create", "can_modify", "can_cancel")`
@@ -173,7 +180,9 @@ enum LockKind {
 }
 
 fn run_can_methods(kind: LockKind) {
-    let clock = MockClock::new(known());
+    // Upstream uses `tz="Asia/Kolkata"` for this parametrize; UTC-normalise.
+    let base = known_kolkata_utc();
+    let clock = MockClock::new(base);
     let arc: Arc<dyn Clock + Send + Sync> = Arc::new(clock.clone());
     let mut lock = OrderLock::with_clock(arc);
 
@@ -194,17 +203,17 @@ fn run_can_methods(kind: LockKind) {
         }
     };
 
-    // At `known`, now == lock_till → can_* is False (strict greater).
-    assert!(!can(&lock), "at known, can_* must be False");
+    // At `base`, now == lock_till → can_* is False (strict greater).
+    assert!(!can(&lock), "at base, can_* must be False");
 
     // Advance 1s → now > lock_till → True. Then lock for 10s → False.
-    clock.set(known() + Duration::seconds(1));
+    clock.set(base + Duration::seconds(1));
     assert!(can(&lock));
     do_lock(&mut lock, 10.0);
     assert!(!can(&lock));
 
-    // Advance to known+12s → past the 10s lock (known+1+10 = known+11) → True.
-    clock.set(known() + Duration::seconds(12));
+    // Advance to base+12s → past the 10s lock (base+1+10 = base+11) → True.
+    clock.set(base + Duration::seconds(12));
     assert!(can(&lock));
 }
 
