@@ -1,0 +1,29 @@
+# Frozen parity-item manifest — one Rust trial name per line, `#` comments
+# stripped and blank lines ignored at load time. Phase gates extend this
+# file monotonically; §4.1.1 of PORT-PLAN pins the R10 length at 237.
+#
+# Current phase gate: R1 (20 items = 17 utils + 3 BasicPosition).
+
+# --- R1: tests/test_utils.py (17) ---
+test_create_basic_positions_from_orders_dict_keys
+test_create_basic_positions_from_orders_dict_quantity
+test_create_basic_positions_from_orders_dict_value
+test_create_basic_positions_from_orders_dict_qty_non_match
+test_empty_dict
+test_identity_dict
+test_simple_dict
+test_no_matching_dict
+test_filter_one
+test_filter_two
+test_multi_filter
+test_update_quantity_case0
+test_update_quantity_case1
+test_update_quantity_case2
+test_update_quantity_case3
+test_update_quantity_case4
+test_update_quantity_case5
+
+# --- R1: tests/test_models.py BasicPosition (3) ---
+test_basic_position
+test_basic_position_calculations
+test_basic_position_zero_quantity
