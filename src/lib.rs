@@ -3,6 +3,7 @@
 pub mod broker;
 pub mod brokers;
 pub mod clock;
+pub mod compound_order;
 pub mod models;
 pub mod order;
 pub mod parity_gate;

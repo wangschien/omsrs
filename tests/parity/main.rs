@@ -22,6 +22,7 @@ use serde::Deserialize;
 mod fixtures;
 mod mock_broker;
 mod test_base;
+mod test_compound_order;
 mod test_models;
 mod test_order;
 mod test_replica_broker;
@@ -30,6 +31,7 @@ mod test_utils;
 mod test_virtual_broker;
 
 use test_base::*;
+use test_compound_order::*;
 use test_models::*;
 use test_order::*;
 use test_replica_broker::*;
@@ -249,6 +251,41 @@ register_parity_tests!(
     test_replica_broker_order_cancel,
     test_replica_broker_order_cancel_multiple_times,
     test_replica_broker_no_symbol,
+    // R8 — tests/test_order.py compound_order subset, non-persistence (34)
+    test_compound_order_id_custom,
+    test_compound_order_count,
+    test_compound_order_len,
+    test_compound_order_positions,
+    test_compound_order_add_order,
+    test_compound_order_average_buy_price,
+    test_compound_order_average_sell_price,
+    test_compound_order_buy_quantity,
+    test_compound_order_sell_quantity,
+    test_compound_order_update_ltp,
+    test_compound_order_net_value,
+    test_compound_order_mtm,
+    test_compound_order_total_mtm,
+    test_compound_order_completed_orders,
+    test_compound_order_pending_orders,
+    test_compound_order_add_id_if_not_exist,
+    test_compound_order_indexes,
+    test_compound_order_auto_index_when_add_order,
+    test_compound_order_manual_index_when_add_order,
+    test_compound_order_index_error_when_add_order,
+    test_compound_order_get_next_index,
+    test_compound_order_index_when_add,
+    test_compound_order_keys_default,
+    test_compound_order_keys_add_order,
+    test_compound_order_keys_add,
+    test_compound_order_get,
+    test_compound_order_keys_hashable,
+    test_compound_order_add_as_order,
+    test_compound_order_execute_all_default,
+    test_compound_order_execute_all_order_args,
+    test_compound_order_execute_all_order_args_class,
+    test_compound_order_execute_all_order_args_override,
+    test_compound_order_check_flags_convert_to_market_after_expiry,
+    test_compound_order_check_flags_cancel_after_expiry,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the
@@ -267,6 +304,13 @@ const PERSISTENCE_PARITY_NAMES: &[&str] = &[
     "test_new_db",
     "test_new_db_with_values",
     "test_new_db_all_values",
+    // R8.b — SQLite-backed compound_order items
+    "test_compound_order_update_orders",
+    "test_compound_order_update_orders_multiple_connections",
+    "test_compound_order_save_to_db",
+    "test_compound_order_save_to_db_add_order",
+    "test_compound_order_add_as_order_multiple_connections",
+    "test_compound_order_save",
 ];
 
 #[cfg(feature = "persistence")]
@@ -290,6 +334,24 @@ fn persistence_trials() -> Vec<Trial> {
         wrap_trial("test_new_db", test_new_db),
         wrap_trial("test_new_db_with_values", test_new_db_with_values),
         wrap_trial("test_new_db_all_values", test_new_db_all_values),
+        wrap_trial(
+            "test_compound_order_update_orders",
+            test_compound_order_update_orders,
+        ),
+        wrap_trial(
+            "test_compound_order_update_orders_multiple_connections",
+            test_compound_order_update_orders_multiple_connections,
+        ),
+        wrap_trial("test_compound_order_save_to_db", test_compound_order_save_to_db),
+        wrap_trial(
+            "test_compound_order_save_to_db_add_order",
+            test_compound_order_save_to_db_add_order,
+        ),
+        wrap_trial(
+            "test_compound_order_add_as_order_multiple_connections",
+            test_compound_order_add_as_order_multiple_connections,
+        ),
+        wrap_trial("test_compound_order_save", test_compound_order_save),
     ]
 }
 
