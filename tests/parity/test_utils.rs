@@ -42,7 +42,9 @@ pub fn test_create_basic_positions_from_orders_dict_quantity() {
     let positions = create_basic_positions_from_orders_dict(&orders);
     let expected = [160, 429, 136, 286, 733, 28, 50, 50, 2, 540, 46];
     for (s, q) in BASIC_POSITION_SYMBOLS.iter().zip(expected) {
-        let pos = positions.get(*s).unwrap_or_else(|| panic!("no pos for {s}"));
+        let pos = positions
+            .get(*s)
+            .unwrap_or_else(|| panic!("no pos for {s}"));
         let q = Decimal::from(q);
         assert_eq!(pos.buy_quantity, q, "buy_qty {s}");
         assert_eq!(pos.sell_quantity, q, "sell_qty {s}");
@@ -246,4 +248,3 @@ pub fn test_update_quantity_case4() {
 pub fn test_update_quantity_case5() {
     check_uqty(100, 0, 0, 50, UQty::new(100, 50, 0, 50));
 }
-

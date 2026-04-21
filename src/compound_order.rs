@@ -28,9 +28,8 @@ use crate::persistence::PersistenceHandle;
 /// pattern from `test_order_strategy_run` (`CompoundOrderRun.run(self, data)`).
 /// Strategies call each child's `run_fn` when present; compound orders
 /// without it are the `CompoundOrderNoRun` analogue (run is skipped).
-pub type RunFn = Arc<
-    dyn Fn(&mut CompoundOrder, &std::collections::HashMap<String, f64>) + Send + Sync,
->;
+pub type RunFn =
+    Arc<dyn Fn(&mut CompoundOrder, &std::collections::HashMap<String, f64>) + Send + Sync>;
 
 pub struct CompoundOrder {
     pub broker: Option<Arc<dyn Broker>>,
@@ -172,7 +171,11 @@ impl CompoundOrder {
         let mut out: HashMap<String, i64> = HashMap::new();
         for order in &self.orders {
             let qty = order.filled_quantity;
-            let sign: i64 = if order.side.eq_ignore_ascii_case("sell") { -1 } else { 1 };
+            let sign: i64 = if order.side.eq_ignore_ascii_case("sell") {
+                -1
+            } else {
+                1
+            };
             *out.entry(order.symbol.clone()).or_insert(0) += qty * sign;
         }
         out
@@ -218,7 +221,9 @@ impl CompoundOrder {
             let price = order.average_price;
             let v = price * qty;
             *value.entry(order.symbol.clone()).or_insert(Decimal::ZERO) += v;
-            *quantity.entry(order.symbol.clone()).or_insert(Decimal::ZERO) += qty;
+            *quantity
+                .entry(order.symbol.clone())
+                .or_insert(Decimal::ZERO) += qty;
         }
         let mut out = HashMap::new();
         for (sym, v) in &value {
@@ -383,7 +388,9 @@ impl CompoundOrder {
             .map(|(i, _)| i)
             .collect();
         for pos in pending_positions {
-            let Some(oid) = self.orders[pos].order_id.clone() else { continue };
+            let Some(oid) = self.orders[pos].order_id.clone() else {
+                continue;
+            };
             if let Some(update) = data.get(&oid) {
                 let ok = self.orders[pos].update(update);
                 out.insert(oid, ok);

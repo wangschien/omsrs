@@ -4,9 +4,9 @@
 
 use chrono::{Duration, TimeZone, Utc};
 use omsrs::simulation::{
-    generate_orderbook, GenericResponse, GenericResponseData, Instrument, OHLC, OHLCV, OHLCVI,
-    OrderFill, OrderResponse, OrderType, Response, ResponseStatus, Side, Status, Ticker,
-    TickerMode, VOrder, VOrderInit, VPosition, VQuote, VTrade, VUser,
+    generate_orderbook, GenericResponse, GenericResponseData, Instrument, OrderFill, OrderResponse,
+    OrderType, Response, ResponseStatus, Side, Status, Ticker, TickerMode, VOrder, VOrderInit,
+    VPosition, VQuote, VTrade, VUser, OHLC, OHLCV, OHLCVI,
 };
 
 fn vorder_kwargs() -> VOrderInit {
@@ -351,12 +351,24 @@ fn is_done_case(filled: f64, pending: f64, canceled: f64, expected: bool) {
     let order = VOrder::from_init(init).unwrap();
     assert_eq!(order.is_done(), expected);
 }
-pub fn test_vorder_is_done_case0() { is_done_case(0.0, 100.0, 0.0, false); }
-pub fn test_vorder_is_done_case1() { is_done_case(50.0, 100.0, 0.0, false); }
-pub fn test_vorder_is_done_case2() { is_done_case(100.0, 0.0, 0.0, true); }
-pub fn test_vorder_is_done_case3() { is_done_case(50.0, 50.0, 0.0, false); }
-pub fn test_vorder_is_done_case4() { is_done_case(50.0, 0.0, 50.0, true); }
-pub fn test_vorder_is_done_case5() { is_done_case(50.0, 0.0, 100.0, true); }
+pub fn test_vorder_is_done_case0() {
+    is_done_case(0.0, 100.0, 0.0, false);
+}
+pub fn test_vorder_is_done_case1() {
+    is_done_case(50.0, 100.0, 0.0, false);
+}
+pub fn test_vorder_is_done_case2() {
+    is_done_case(100.0, 0.0, 0.0, true);
+}
+pub fn test_vorder_is_done_case3() {
+    is_done_case(50.0, 50.0, 0.0, false);
+}
+pub fn test_vorder_is_done_case4() {
+    is_done_case(50.0, 0.0, 50.0, true);
+}
+pub fn test_vorder_is_done_case5() {
+    is_done_case(50.0, 0.0, 100.0, true);
+}
 
 // ── delay / modify_by_status ────────────────────────────────────────────
 

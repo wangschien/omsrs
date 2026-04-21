@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use crate::mock_broker::MockBroker;
 
 fn default_clock() -> Arc<dyn Clock + Send + Sync> {
-    Arc::new(MockClock::new(Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap()))
+    Arc::new(MockClock::new(
+        Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap(),
+    ))
 }
 
 /// Build a fresh `MockBroker` whose `order_place` returns the sequence

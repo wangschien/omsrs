@@ -35,8 +35,9 @@ fn basic_tickers() -> HashMap<String, Ticker> {
 }
 
 fn basic_broker() -> VirtualBroker {
-    let clock: Arc<dyn Clock + Send + Sync> =
-        Arc::new(MockClock::new(Utc.with_ymd_and_hms(2023, 2, 1, 10, 17, 0).unwrap()));
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(MockClock::new(
+        Utc.with_ymd_and_hms(2023, 2, 1, 10, 17, 0).unwrap(),
+    ));
     VirtualBroker::with_clock(clock).with_tickers(basic_tickers())
 }
 
@@ -178,10 +179,7 @@ pub fn test_virtual_broker_order_place_validation_error() {
     assert!(resp.data.is_none());
 
     // Only quantity missing.
-    let reply = b.order_place(kwargs(&[
-        ("symbol", json!("aapl")),
-        ("side", json!(-1)),
-    ]));
+    let reply = b.order_place(kwargs(&[("symbol", json!("aapl")), ("side", json!(-1))]));
     let resp = reply.as_order().unwrap();
     assert_eq!(resp.status, ResponseStatus::Failure);
     let msg = resp.error_msg.as_ref().unwrap();
@@ -200,7 +198,16 @@ pub fn test_virtual_broker_get() {
             ("side", json!(1)),
             ("quantity", json!(q)),
         ]));
-        ids.push(reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone());
+        ids.push(
+            reply
+                .as_order()
+                .unwrap()
+                .data
+                .as_ref()
+                .unwrap()
+                .order_id
+                .clone(),
+        );
     }
     assert_eq!(b.orders().len(), 3);
     let target = ids[1].clone();
@@ -216,11 +223,21 @@ pub fn test_virtual_broker_order_modify() {
         ("side", json!(1)),
         ("quantity", json!(50)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
 
     let resp = b.order_modify(&order_id, kwargs(&[("quantity", json!(25))]));
     assert_eq!(resp.as_order().unwrap().status, ResponseStatus::Success);
-    assert_eq!(resp.as_order().unwrap().data.as_ref().unwrap().quantity, 25.0);
+    assert_eq!(
+        resp.as_order().unwrap().data.as_ref().unwrap().quantity,
+        25.0
+    );
 
     let resp = b.order_modify(&order_id, kwargs(&[("price", json!(1000))]));
     assert_eq!(resp.as_order().unwrap().status, ResponseStatus::Success);
@@ -239,7 +256,14 @@ pub fn test_virtual_broker_order_modify_failure() {
         ("side", json!(1)),
         ("quantity", json!(50)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
 
     let resp = b.order_modify("hexid", kwargs(&[("quantity", json!(25))]));
     let r = resp.as_order().unwrap();
@@ -262,10 +286,7 @@ pub fn test_virtual_broker_order_modify_kwargs_response() {
             ("response", json!({"a": 10, "b": 15})),
         ]),
     );
-    assert_eq!(
-        resp.as_passthrough().unwrap(),
-        &json!({"a": 10, "b": 15})
-    );
+    assert_eq!(resp.as_passthrough().unwrap(), &json!({"a": 10, "b": 15}));
 }
 
 pub fn test_virtual_broker_order_cancel() {
@@ -276,7 +297,14 @@ pub fn test_virtual_broker_order_cancel() {
         ("side", json!(1)),
         ("quantity", json!(50)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
 
     let resp = b.order_cancel(&order_id, HashMap::new());
     let r = resp.as_order().unwrap();
@@ -296,7 +324,14 @@ pub fn test_virtual_broker_order_cancel_failure() {
         ("side", json!(1)),
         ("quantity", json!(50)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
 
     let resp = b.order_modify("hexid", kwargs(&[("quantity", json!(25))]));
     let r = resp.as_order().unwrap();
@@ -322,10 +357,7 @@ pub fn test_virtual_broker_order_cancel_kwargs_response() {
             ("response", json!({"a": 10, "b": 15})),
         ]),
     );
-    assert_eq!(
-        resp.as_passthrough().unwrap(),
-        &json!({"a": 10, "b": 15})
-    );
+    assert_eq!(resp.as_passthrough().unwrap(), &json!({"a": 10, "b": 15}));
 }
 
 pub fn test_virtual_broker_add_user() {
@@ -427,7 +459,10 @@ pub fn test_virtual_broker_order_place_delay() {
     // Find orders by symbol and check delays.
     let mut delays_by_symbol = HashMap::new();
     for order in b.orders().values() {
-        delays_by_symbol.insert(order.symbol.clone(), order.delay.num_microseconds().unwrap());
+        delays_by_symbol.insert(
+            order.symbol.clone(),
+            order.delay.num_microseconds().unwrap(),
+        );
     }
     assert_eq!(delays_by_symbol.get("aapl"), Some(&1_000_000));
     assert_eq!(delays_by_symbol.get("goog"), Some(&5_000_000));
@@ -446,7 +481,14 @@ pub fn test_virtual_broker_get_order_by_status() {
         ("quantity", json!(10)),
         ("side", json!(1)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
     {
         let order = b.get_default(&order_id).unwrap();
         assert_eq!(order.pending_quantity, 10.0);
@@ -472,7 +514,14 @@ pub fn test_virtual_broker_get_order_by_status() {
         ("quantity", json!(10)),
         ("side", json!(1)),
     ]));
-    let order_id = reply.as_order().unwrap().data.as_ref().unwrap().order_id.clone();
+    let order_id = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
 
     clock_handle.set(known + Duration::seconds(3));
     let order = b.get(&order_id, Status::Canceled).unwrap();

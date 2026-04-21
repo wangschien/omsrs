@@ -7,9 +7,7 @@
 
 use std::collections::HashSet;
 
-use omsrs::parity_gate::{
-    gate_arithmetic, validate_excused, ExcusedRow, GateExit,
-};
+use omsrs::parity_gate::{gate_arithmetic, validate_excused, ExcusedRow, GateExit};
 use serde::Deserialize;
 
 fn manifest() -> Vec<&'static str> {
@@ -57,7 +55,9 @@ fn drive(
 }
 
 fn parse_excused_toml(src: Option<&str>) -> Result<Vec<ExcusedRow>, GateExit> {
-    let Some(body) = src else { return Ok(Vec::new()); };
+    let Some(body) = src else {
+        return Ok(Vec::new());
+    };
 
     #[derive(Deserialize)]
     struct ExcusedFile {
@@ -83,7 +83,14 @@ fn row01_absent_all_pass_yields_zero() {
 fn row02_present_empty_all_pass_yields_zero() {
     let m = manifest();
     let src = "# just comments, no rows\n";
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::Pass);
     assert_eq!(gate.code(), 0);
 }
@@ -138,7 +145,14 @@ rationale = "dup"
 approved_at = "R_smoke"
 approved_by = "codex"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::DuplicateExcused);
     assert_eq!(gate.code(), 2);
 }
@@ -154,7 +168,14 @@ rationale = "not in manifest"
 approved_at = "R_smoke"
 approved_by = "codex"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::UnknownExcusedId);
     assert_eq!(gate.code(), 3);
 }
@@ -225,7 +246,14 @@ rationale = "8"
 approved_at = "R_smoke"
 approved_by = "codex"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::ExcusedOverCap);
     assert_eq!(gate.code(), 5);
 }
@@ -235,7 +263,14 @@ approved_by = "codex"
 fn row09_malformed_toml_yields_six() {
     let m = manifest();
     let src = "[[excused\nid = \"t01\""; // unterminated array-of-tables header
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::TomlInvalid);
     assert_eq!(gate.code(), 6);
 }
@@ -245,7 +280,14 @@ fn row09_malformed_toml_yields_six() {
 fn row10_wrong_shape_yields_six() {
     let m = manifest();
     let src = r#"excused = "should be array""#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::TomlInvalid);
     assert_eq!(gate.code(), 6);
 }
@@ -260,7 +302,14 @@ id = "t05"
 approved_at = "R_smoke"
 approved_by = "codex"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::TomlInvalid);
     assert_eq!(gate.code(), 6);
 }
@@ -275,7 +324,14 @@ id = "t05"
 rationale = "x"
 approved_by = "codex"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::TomlInvalid);
     assert_eq!(gate.code(), 6);
 }
@@ -290,7 +346,14 @@ id = "t05"
 rationale = "x"
 approved_at = "R_smoke"
 "#;
-    let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
+    let gate = drive(
+        &m,
+        &manifest_set(),
+        Some(src),
+        &all_pass(),
+        &empty(),
+        R0_OFF,
+    );
     assert_eq!(gate, GateExit::TomlInvalid);
     assert_eq!(gate.code(), 6);
 }

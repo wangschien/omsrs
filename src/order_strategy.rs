@@ -90,10 +90,7 @@ impl OrderStrategy {
         self.ltp.clone()
     }
 
-    pub fn update_orders(
-        &mut self,
-        data: &HashMap<String, HashMap<String, serde_json::Value>>,
-    ) {
+    pub fn update_orders(&mut self, data: &HashMap<String, HashMap<String, serde_json::Value>>) {
         for co in &mut self.orders {
             co.update_orders(data);
         }

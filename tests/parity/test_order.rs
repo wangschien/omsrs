@@ -23,9 +23,7 @@ fn kwargs(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
         .collect()
 }
 
-fn simple_order_arc(
-    clock: Arc<dyn Clock + Send + Sync>,
-) -> Order {
+fn simple_order_arc(clock: Arc<dyn Clock + Send + Sync>) -> Order {
     Order::from_init_with_clock(
         OrderInit {
             symbol: "aapl".into(),
@@ -621,7 +619,10 @@ pub fn test_simple_order_cancel() {
     );
     order.cancel(&broker, None);
     assert_eq!(broker.cancel_call_count(), 1);
-    assert_eq!(broker.cancel_calls()[0].get("order_id"), Some(&json!("abcdef")));
+    assert_eq!(
+        broker.cancel_calls()[0].get("order_id"),
+        Some(&json!("abcdef"))
+    );
 }
 
 pub fn test_simple_order_cancel_none() {
@@ -944,11 +945,7 @@ pub fn test_order_modify_args_to_add() {
     order.client_id = Some("abcd1234".into());
     order.exchange = Some("nyse".into());
     let attribs = ["client_id"];
-    order.modify(
-        &broker,
-        Some(&attribs),
-        kwargs(&[("price", json!("600"))]),
-    );
+    order.modify(&broker, Some(&attribs), kwargs(&[("price", json!("600"))]));
     assert_eq!(broker.modify_call_count(), 1);
     assert_eq!(order.price, Some(dec!(600)));
     let args = &broker.modify_calls()[0];
@@ -973,11 +970,7 @@ pub fn test_order_modify_args_to_add_no_args() {
     order.client_id = Some("abcd1234".into());
     order.exchange = Some("nyse".into());
     let attribs = ["transform", "segment"];
-    order.modify(
-        &broker,
-        Some(&attribs),
-        kwargs(&[("price", json!("600"))]),
-    );
+    order.modify(&broker, Some(&attribs), kwargs(&[("price", json!("600"))]));
     let args = &broker.modify_calls()[0];
     let expected: HashMap<String, Value> = [
         ("order_id", json!("abcdef")),
@@ -1022,11 +1015,7 @@ pub fn test_order_modify_args_dont_modify_frozen() {
     let broker = MockBroker::new();
     let mut order = simple_order_arc(default_mock_clock());
     let attribs = ["symbol", "side"];
-    order.modify(
-        &broker,
-        Some(&attribs),
-        kwargs(&[("price", json!("600"))]),
-    );
+    order.modify(&broker, Some(&attribs), kwargs(&[("price", json!("600"))]));
     let args = &broker.modify_calls()[0];
     let expected: HashMap<String, Value> = [
         ("order_id", json!("abcdef")),
@@ -1177,7 +1166,6 @@ pub fn test_order_execute_attribs_to_copy_override() {
     assert_eq!(args, &expected);
 }
 
-
 pub fn test_get_other_args_from_attribs() {
     let broker = MockBroker::new();
     broker.set_attribs_to_copy_execute(Some(vec!["exchange".into(), "client_id".into()]));
@@ -1269,11 +1257,7 @@ fn new_db() -> Arc<SqlitePersistenceHandle> {
 }
 
 #[cfg(feature = "persistence")]
-fn order_with_conn(
-    symbol: &str,
-    quantity: i64,
-    con: Arc<SqlitePersistenceHandle>,
-) -> Order {
+fn order_with_conn(symbol: &str, quantity: i64, con: Arc<SqlitePersistenceHandle>) -> Order {
     let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
     Order::from_init_with_clock(
         OrderInit {
@@ -1435,7 +1419,14 @@ pub fn test_new_db() {
     );
     order.save_to_db();
     // New-column presence check, upstream keys:
-    let keys = ["can_peg", "strategy_id", "portfolio_id", "pseudo_id", "JSON", "error"];
+    let keys = [
+        "can_peg",
+        "strategy_id",
+        "portfolio_id",
+        "pseudo_id",
+        "JSON",
+        "error",
+    ];
     for row in con.query_all().unwrap() {
         for k in keys {
             assert!(row.contains_key(k), "missing column {k}");

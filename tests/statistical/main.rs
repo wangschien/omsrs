@@ -57,10 +57,7 @@ fn test_ticker_ltp_statistical() {
     let std = var.sqrt();
     // Generous bounds — 0.05 tick-rounding introduces per-step bias; over
     // 1000 samples the Normal(0,1) shape should still be visible.
-    assert!(
-        mean.abs() < 0.2,
-        "Ticker Z-mean drifted too far: {mean:.4}"
-    );
+    assert!(mean.abs() < 0.2, "Ticker Z-mean drifted too far: {mean:.4}");
     assert!(
         std > 0.7 && std < 1.3,
         "Ticker Z-std out of [0.7, 1.3]: {std:.4}"
@@ -69,7 +66,10 @@ fn test_ticker_ltp_statistical() {
 
 fn main() -> ExitCode {
     let args = Arguments::from_args();
-    let trials = vec![wrap("test_ticker_ltp_statistical", test_ticker_ltp_statistical)];
+    let trials = vec![wrap(
+        "test_ticker_ltp_statistical",
+        test_ticker_ltp_statistical,
+    )];
     let conclusion = run(&args, trials);
     if conclusion.has_failed() {
         ExitCode::from(1)

@@ -78,10 +78,7 @@ impl VirtualBroker {
         Self::with_clock_and_seed(clock, 0)
     }
 
-    pub fn with_clock_and_seed(
-        clock: Arc<dyn Clock + Send + Sync>,
-        seed: u64,
-    ) -> Self {
+    pub fn with_clock_and_seed(clock: Arc<dyn Clock + Send + Sync>, seed: u64) -> Self {
         Self {
             name: "VBroker".into(),
             tickers: HashMap::new(),
@@ -212,10 +209,17 @@ impl VirtualBroker {
         let order_id = uuid::Uuid::new_v4().simple().to_string();
         let init = VOrderInit {
             order_id: order_id.clone(),
-            symbol: args.get("symbol").and_then(Value::as_str).unwrap_or_default().into(),
+            symbol: args
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
             quantity: args.get("quantity").and_then(Value::as_f64).unwrap_or(0.0),
             side: args.get("side").and_then(value_to_side),
-            side_str: args.get("side_str").and_then(Value::as_str).map(str::to_string),
+            side_str: args
+                .get("side_str")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             price: args.get("price").and_then(Value::as_f64),
             trigger_price: args.get("trigger_price").and_then(Value::as_f64),
             average_price: args.get("average_price").and_then(Value::as_f64),
@@ -234,9 +238,7 @@ impl VirtualBroker {
                 return BrokerReply::Order(Box::new(OrderResponse {
                     status: ResponseStatus::Failure,
                     timestamp: Some(now),
-                    error_msg: Some(format!(
-                        "Found 1 validation errors; in field side {msg}"
-                    )),
+                    error_msg: Some(format!("Found 1 validation errors; in field side {msg}")),
                     data: None,
                 }));
             }
@@ -247,7 +249,10 @@ impl VirtualBroker {
         if let Some(uid) = userid_upper {
             if self.clients.contains(&uid) {
                 // Attach the same order id to the matching user.
-                let attached = self.orders.get(&order_id).and_then(VOrder::cloned_clone_weak);
+                let attached = self
+                    .orders
+                    .get(&order_id)
+                    .and_then(VOrder::cloned_clone_weak);
                 for u in &mut self.users {
                     if u.userid == uid {
                         if let Some(clone) = attached {

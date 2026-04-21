@@ -267,10 +267,7 @@ impl Order {
         Self::from_init(OrderInit::from_row(row))
     }
 
-    pub fn from_init_with_clock(
-        init: OrderInit,
-        clock: Arc<dyn Clock + Send + Sync>,
-    ) -> Self {
+    pub fn from_init_with_clock(init: OrderInit, clock: Arc<dyn Clock + Send + Sync>) -> Self {
         assert!(init.quantity >= 0, "quantity must be positive");
 
         let quantity = init.quantity;
@@ -580,10 +577,7 @@ impl Order {
             order_args.insert("price".into(), decimal_value(p));
         }
         order_args.insert("trigger_price".into(), decimal_value(self.trigger_price));
-        order_args.insert(
-            "disclosed_quantity".into(),
-            json!(self.disclosed_quantity),
-        );
+        order_args.insert("disclosed_quantity".into(), json!(self.disclosed_quantity));
 
         // Precedence (matches upstream `order.py:507-509`):
         //   1. build defaults (above)
@@ -673,10 +667,7 @@ impl Order {
         }
         order_args.insert("trigger_price".into(), decimal_value(self.trigger_price));
         order_args.insert("order_type".into(), json!(self.order_type.to_uppercase()));
-        order_args.insert(
-            "disclosed_quantity".into(),
-            json!(self.disclosed_quantity),
-        );
+        order_args.insert("disclosed_quantity".into(), json!(self.disclosed_quantity));
 
         for (k, v) in other_args {
             order_args.insert(k, v);

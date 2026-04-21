@@ -14,9 +14,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use omsrs::parity_gate::{
-    gate_arithmetic, validate_excused, ExcusedRow, GateExit,
-};
+use omsrs::parity_gate::{gate_arithmetic, validate_excused, ExcusedRow, GateExit};
 use serde::Deserialize;
 
 mod fixtures;
@@ -352,7 +350,10 @@ fn persistence_trials() -> Vec<Trial> {
             "test_compound_order_update_orders_multiple_connections",
             test_compound_order_update_orders_multiple_connections,
         ),
-        wrap_trial("test_compound_order_save_to_db", test_compound_order_save_to_db),
+        wrap_trial(
+            "test_compound_order_save_to_db",
+            test_compound_order_save_to_db,
+        ),
         wrap_trial(
             "test_compound_order_save_to_db_add_order",
             test_compound_order_save_to_db_add_order,
@@ -480,7 +481,9 @@ fn run_gate(
 }
 
 fn parse_excused_toml(src: Option<&str>) -> Result<Vec<ExcusedRow>, GateExit> {
-    let Some(body) = src else { return Ok(Vec::new()); };
+    let Some(body) = src else {
+        return Ok(Vec::new());
+    };
 
     #[derive(Deserialize)]
     struct ExcusedFile {
@@ -546,8 +549,10 @@ fn emit_report(
     println!("  manifest size : {}", manifest.len());
     println!("  passed        : {}", passing.len());
     println!("  failed        : {}", failing.len());
-    println!("  libtest num_passed / num_failed : {} / {}",
-        conclusion.num_passed, conclusion.num_failed);
+    println!(
+        "  libtest num_passed / num_failed : {} / {}",
+        conclusion.num_passed, conclusion.num_failed
+    );
     println!("  gate          : {:?} (exit {})", gate, gate.code());
     if !failing.is_empty() {
         let mut sorted: Vec<&&str> = failing.iter().collect();

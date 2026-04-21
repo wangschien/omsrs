@@ -577,8 +577,10 @@ pub fn test_compound_order_keys_default() {
 pub fn test_compound_order_keys_add_order() {
     let mut com = CompoundOrder::with_clock(default_clock());
     com.add_order(order_kwargs(), None, None).unwrap();
-    com.add_order(order_kwargs(), None, Some("first".into())).unwrap();
-    com.add_order(order_kwargs(), None, Some("10".into())).unwrap();
+    com.add_order(order_kwargs(), None, Some("first".into()))
+        .unwrap();
+    com.add_order(order_kwargs(), None, Some("10".into()))
+        .unwrap();
     assert_eq!(com.keys_map().len(), 2);
     assert!(com.keys_map().contains_key("10"));
     // orders[1] has key "first".
@@ -686,7 +688,8 @@ pub fn test_compound_order_keys_hashable() {
     // Upstream uses Python tuple `(4, 5)` — Rust API is String-keyed, so
     // we canonicalise to "[4,5]" (the JSON form).
     let key = "[4,5]".to_string();
-    com.add_order(order_kwargs(), None, Some(key.clone())).unwrap();
+    com.add_order(order_kwargs(), None, Some(key.clone()))
+        .unwrap();
     // Upstream `{"a": 5}` raises TypeError — Rust String keys accept any
     // valid string, so there's no equivalent "unhashable" path. The
     // upstream "dict keys unhashable" assertion is structurally not
@@ -764,7 +767,10 @@ pub fn test_compound_order_add_as_order_multiple_connections() {
         com.connection.as_ref().unwrap()
     ));
     // orders[1] keeps its own con1.
-    assert!(Arc::ptr_eq(com.orders[1].connection.as_ref().unwrap(), &con1));
+    assert!(Arc::ptr_eq(
+        com.orders[1].connection.as_ref().unwrap(),
+        &con1
+    ));
 }
 
 // ── execute_all ─────────────────────────────────────────────────────────
@@ -1148,7 +1154,6 @@ pub fn test_compound_order_update_orders_multiple_connections() {
     assert_eq!(beta.get("disclosed_quantity"), Some(&json!(5)));
 }
 
-
 #[cfg(feature = "persistence")]
 pub fn test_compound_order_save() {
     use omsrs::persistence::SqlitePersistenceHandle;
@@ -1208,8 +1213,14 @@ pub fn test_compound_order_save() {
             .cmp(b.get("symbol").and_then(Value::as_str).unwrap_or(""))
     });
     // `alphabet` comes before `beta` alphabetically → orders[1] is alphabet.
-    let alphabet = sorted.iter().find(|r| r.get("symbol") == Some(&json!("alphabet"))).unwrap();
-    let beta = sorted.iter().find(|r| r.get("symbol") == Some(&json!("beta"))).unwrap();
+    let alphabet = sorted
+        .iter()
+        .find(|r| r.get("symbol") == Some(&json!("alphabet")))
+        .unwrap();
+    let beta = sorted
+        .iter()
+        .find(|r| r.get("symbol") == Some(&json!("beta")))
+        .unwrap();
     assert_eq!(alphabet.get("quantity"), Some(&json!(7)));
     assert_eq!(beta.get("quantity"), Some(&json!(5)));
 }

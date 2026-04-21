@@ -15,9 +15,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::simulation::{
-    Instrument, OrderType, Side, VOrder, VOrderInit,
-};
+use crate::simulation::{Instrument, OrderType, Side, VOrder, VOrderInit};
 
 pub type OrderHandle = Arc<Mutex<VOrder>>;
 
@@ -108,9 +106,7 @@ impl ReplicaBroker {
         let symbol = handle.lock().symbol.clone();
         if !self.instruments.contains_key(&symbol) {
             let mut g = handle.lock();
-            g.status_message = Some(format!(
-                "REJECTED: Symbol {symbol} not found on the system"
-            ));
+            g.status_message = Some(format!("REJECTED: Symbol {symbol} not found on the system"));
             g.canceled_quantity = g.quantity;
             g.pending_quantity = 0.0;
             drop(g);
@@ -309,7 +305,9 @@ fn apply_fill_update(handle: &OrderHandle, last_price: f64) {
             if g.trigger_price.is_none() {
                 g.trigger_price = g.price;
             }
-            let Some(trigger) = g.trigger_price else { return };
+            let Some(trigger) = g.trigger_price else {
+                return;
+            };
             let triggered = match g.side {
                 Side::Buy => last_price > trigger,
                 Side::Sell => last_price < trigger,

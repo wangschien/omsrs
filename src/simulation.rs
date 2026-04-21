@@ -171,11 +171,7 @@ impl Ticker {
         Self::with_seed(name, initial_price, 0)
     }
 
-    pub fn with_seed(
-        name: impl Into<String>,
-        initial_price: f64,
-        seed: u64,
-    ) -> Self {
+    pub fn with_seed(name: impl Into<String>, initial_price: f64, seed: u64) -> Self {
         Self {
             name: name.into(),
             token: None,
@@ -344,9 +340,7 @@ impl VOrder {
         let side = match (init.side, init.side_str) {
             (Some(s), _) => s,
             (None, Some(s)) => Side::parse(&s)?,
-            (None, None) => {
-                return Err("VOrder requires side (enum) or side_str".into())
-            }
+            (None, None) => return Err("VOrder requires side (enum) or side_str".into()),
         };
         let order_type = match (init.order_type, init.order_type_str) {
             (Some(t), _) => t,

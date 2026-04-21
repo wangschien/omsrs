@@ -130,10 +130,7 @@ pub mod sqlite {
         ///
         /// Fails with `PersistenceError::Unique` on primary-key conflict;
         /// other rusqlite errors bubble up as `Backend`.
-        pub fn insert_raw(
-            &self,
-            row: HashMap<String, Value>,
-        ) -> Result<(), PersistenceError> {
+        pub fn insert_raw(&self, row: HashMap<String, Value>) -> Result<(), PersistenceError> {
             if row.is_empty() {
                 return Err(PersistenceError::Backend("empty row".into()));
             }
@@ -179,14 +176,9 @@ pub mod sqlite {
         /// `Value` map. Column order matches `ORDER_COLUMNS`.
         pub fn query_all(&self) -> Result<Vec<HashMap<String, Value>>, PersistenceError> {
             let conn = self.inner.lock();
-            let mut stmt = conn
-                .prepare("SELECT * FROM orders")
-                .map_err(backend)?;
-            let col_names: Vec<String> = stmt
-                .column_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut stmt = conn.prepare("SELECT * FROM orders").map_err(backend)?;
+            let col_names: Vec<String> =
+                stmt.column_names().iter().map(|s| s.to_string()).collect();
             let rows = stmt
                 .query_map([], |row| {
                     let mut m = HashMap::new();
@@ -254,9 +246,7 @@ pub mod sqlite {
     fn classify(e: rusqlite::Error) -> PersistenceError {
         if let rusqlite::Error::SqliteFailure(sqlite_err, msg) = &e {
             if sqlite_err.code == ErrorCode::ConstraintViolation {
-                return PersistenceError::Unique(
-                    msg.clone().unwrap_or_else(|| e.to_string()),
-                );
+                return PersistenceError::Unique(msg.clone().unwrap_or_else(|| e.to_string()));
             }
         }
         PersistenceError::Backend(e.to_string())

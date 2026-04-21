@@ -81,10 +81,7 @@ impl Broker for MockBroker {
         // about the return still see something non-None.
         let mut guard = self.place_returns.lock().unwrap();
         if guard.is_empty() {
-            Some(format!(
-                "MOCK-{}",
-                self.place_calls.lock().unwrap().len()
-            ))
+            Some(format!("MOCK-{}", self.place_calls.lock().unwrap().len()))
         } else {
             guard.remove(0)
         }

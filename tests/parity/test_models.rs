@@ -52,7 +52,10 @@ pub fn test_order_book() {
     assert_eq!(ob.bid[0].orders_count, None);
     assert_eq!(ob.bid.last().unwrap().orders_count, Some(2));
     assert_eq!(ob.ask[1].quantity, 28);
-    assert_eq!(ob.ask.last().unwrap().value(), dec!(118) * Decimal::from(28));
+    assert_eq!(
+        ob.ask.last().unwrap().value(),
+        dec!(118) * Decimal::from(28)
+    );
 }
 
 fn sample_orderbook() -> OrderBook {

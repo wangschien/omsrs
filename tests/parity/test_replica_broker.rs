@@ -96,10 +96,7 @@ pub fn test_replica_broker_defaults() {
 pub fn test_replica_broker_update() {
     let mut b = ReplicaBroker::new();
     let names = ["AAPL", "XOM", "DOW"];
-    let instruments: Vec<Instrument> = names
-        .iter()
-        .map(|n| instrument(n, 120.0))
-        .collect();
+    let instruments: Vec<Instrument> = names.iter().map(|n| instrument(n, 120.0)).collect();
     b.update(instruments);
     for name in names {
         assert!(b.instruments.contains_key(name));

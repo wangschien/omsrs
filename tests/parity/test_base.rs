@@ -350,13 +350,7 @@ pub fn test_close_all_positions_given_positions() {
     ])];
     broker.close_all_positions(Some(positions), None, None, None);
     assert_eq!(broker.place_call_count(), 1);
-    assert_eq!(
-        broker.place_calls()[0].get("symbol"),
-        Some(&json!("aapl"))
-    );
-    assert_eq!(
-        broker.place_calls()[0].get("quantity"),
-        Some(&json!(10))
-    );
+    assert_eq!(broker.place_calls()[0].get("symbol"), Some(&json!("aapl")));
+    assert_eq!(broker.place_calls()[0].get("quantity"), Some(&json!(10)));
     assert_eq!(broker.place_calls()[0].get("side"), Some(&json!("sell")));
 }
