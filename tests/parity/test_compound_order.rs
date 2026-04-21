@@ -439,9 +439,14 @@ pub fn test_compound_order_total_mtm() {
 }
 
 pub fn test_compound_order_completed_orders() {
-    let com = simple_compound_order();
-    let completed = com.completed_orders();
-    assert_eq!(completed.len(), 2);
+    let mut com = simple_compound_order();
+    assert_eq!(com.completed_orders().len(), 2);
+    // Upstream mutates the 3rd order into COMPLETE + filled=12 and
+    // re-asserts completed grows to 3.
+    let last = com.orders.last_mut().unwrap();
+    last.status = Some("COMPLETE".into());
+    last.filled_quantity = 12;
+    assert_eq!(com.completed_orders().len(), 3);
 }
 
 pub fn test_compound_order_pending_orders() {
@@ -925,18 +930,34 @@ pub fn test_compound_order_check_flags_cancel_after_expiry() {
 #[cfg(feature = "persistence")]
 pub fn test_compound_order_save_to_db() {
     use omsrs::persistence::SqlitePersistenceHandle;
-    let con: Arc<dyn omsrs::PersistenceHandle> =
-        Arc::new(SqlitePersistenceHandle::in_memory().unwrap());
+    // Single concrete handle, upcast for the compound.connection so we
+    // can still query via the concrete Arc afterwards (R3.b pattern).
     let con_concrete = Arc::new(SqlitePersistenceHandle::in_memory().unwrap());
-    // Re-bind to the same Arc via a trick — easier path: just use the first one.
-    let mut com = CompoundOrder::with_clock(default_clock()).with_connection(con.clone());
+    let con: Arc<dyn omsrs::PersistenceHandle> = con_concrete.clone();
+    let mut com = CompoundOrder::with_clock(default_clock()).with_connection(con);
     com.broker = Some(Arc::new(MockBroker::new()));
-    com.add_order(order_kwargs(), None, None).unwrap();
+    com.add_order(
+        OrderInit {
+            symbol: "aapl".into(),
+            side: "buy".into(),
+            quantity: 20,
+            filled_quantity: Some(20),
+            average_price: Some(dec!(920)),
+            status: Some("COMPLETE".into()),
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .unwrap();
     com.add_order(
         OrderInit {
             symbol: "goog".into(),
             side: "sell".into(),
             quantity: 10,
+            filled_quantity: Some(10),
+            average_price: Some(dec!(338)),
+            status: Some("COMPLETE".into()),
             ..Default::default()
         },
         None,
@@ -948,17 +969,23 @@ pub fn test_compound_order_save_to_db() {
             symbol: "aapl".into(),
             side: "sell".into(),
             quantity: 12,
+            filled_quantity: Some(9),
+            average_price: Some(dec!(975)),
             ..Default::default()
         },
         None,
         None,
     )
     .unwrap();
-    // We need to count rows via the concrete SqlitePersistenceHandle —
-    // downcast the Arc<dyn>. Since we lost the concrete handle, we
-    // test the "at least 3 saves" invariant by calling save() and
-    // checking the return count.
-    let _ = con_concrete; // unused in this path
+    assert_eq!(con_concrete.count().unwrap(), 3);
+    let rows = con_concrete.query_all().unwrap();
+    let quantities: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.get("quantity").and_then(Value::as_i64))
+        .collect();
+    let mut sorted = quantities.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![10, 12, 20]);
     let saved = com.save();
     assert_eq!(saved, 3);
 }
