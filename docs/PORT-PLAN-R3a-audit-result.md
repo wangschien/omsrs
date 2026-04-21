@@ -47,3 +47,29 @@ None.
 - `rg -n "#\\[ignore\\]|ignore\\]" src tests Cargo.toml rust-tests scripts`
 - `rg -v "^\\s*(#|$)" rust-tests/parity-item-manifest.txt | wc -l`
 - `rg -n "^\\s*\\[\\[excused\\]\\]" tests/parity/excused.toml`
+
+## Re-audit (post-fix)
+
+Post-fix verdict: ACK. R3.b may start: the prior P1/P2 blockers are closed, the normal parity gate now matches the expected 85 manifest / 84 passing / 1 failing / 1 excused shape, and the lone failure is the codex-approved `test_order_timezone` §14(B) row.
+
+### Prior NACK closure
+
+- P1.1 closed. `test_order_timezone` is no longer counted as a silent active pass. It asserts the portable `timezone == "local"` half, then deliberately panics with a `§14B` message (`tests/parity/test_order.rs:810`-`tests/parity/test_order.rs:821`). `tests/parity/excused.toml` contains the matching required row with `id`, `rationale`, `approved_at`, and `approved_by` (`tests/parity/excused.toml:4`-`tests/parity/excused.toml:8`).
+- P2.1 closed. `Order::execute` now applies copied `other_args` first and then filtered caller kwargs, so kwargs override copied attributes without overriding default order fields (`src/order.rs:468`-`src/order.rs:493`). `test_order_execute_attribs_to_copy_override` covers the conflict case (`tests/parity/test_order.rs:1144`-`tests/parity/test_order.rs:1177`).
+- P2.2 closed. `Order::execute` returns the existing `order_id` when an order is already complete or already placed (`src/order.rs:442`-`src/order.rs:500`), matching upstream's existing-id branch.
+- P2.3 closed. Broker kwargs still serialize `Decimal` values as strings via `decimal_value`, while persistence rows now use `decimal_persistence_value` to emit JSON numbers for `price`, `trigger_price`, and `average_price` (`src/order.rs:729`-`src/order.rs:739`, `src/order.rs:840`-`src/order.rs:855`).
+
+### Verification matrix
+
+- `cargo test` passed. The parity harness reported manifest size 85, passed 84, failed 1, gate `Pass (exit 0)`, failing id `test_order_timezone`; smoke also passed 13/13.
+- `scripts/parity_gate.sh` passed in release mode with the same shape: manifest size 85, passed 84, failed 1, gate `Pass (exit 0)`, failing id `test_order_timezone`.
+- `cargo clippy --all-features --all-targets -- -D warnings` passed.
+- `cargo build` passed warning-free.
+- `cargo build --no-default-features` passed warning-free.
+- `cargo test --test parity_runner_smoke` passed 13/13.
+- `OMSRS_R0_GATE=1 cargo test --test parity` returned `R0GateViolation (exit 4)`, because the R0 guard intentionally rejects the now non-empty `excused.toml`. This is expected after approving the R3.a §14(B) row and is not a post-fix NACK blocker.
+- `rg -n "#\\[ignore\\]|ignore\\]" src tests Cargo.toml rust-tests scripts` returned no hits.
+- `rg -v "^\\s*(#|$)" rust-tests/parity-item-manifest.txt | wc -l` returned `85`.
+- `tests/parity/excused.toml` has exactly one row, `test_order_timezone`, with the required fields.
+
+No new R3.a drift found.
