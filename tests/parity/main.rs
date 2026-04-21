@@ -24,11 +24,13 @@ mod mock_broker;
 mod test_base;
 mod test_models;
 mod test_order;
+mod test_simulation_models;
 mod test_utils;
 
 use test_base::*;
 use test_models::*;
 use test_order::*;
+use test_simulation_models::*;
 use test_utils::*;
 
 const MANIFEST: &str = include_str!(concat!(
@@ -154,6 +156,61 @@ register_parity_tests!(
     test_close_all_positions_quantity_as_error,
     test_close_all_positions_symbol_transfomer,
     test_close_all_positions_given_positions,
+    // R5 — tests/simulation/test_models.py (54, minus test_ticker_ltp §14A)
+    test_vtrade_defaults,
+    test_vorder_defaults,
+    test_vorder_quantities,
+    test_vposition_defaults,
+    test_vorder_status,
+    test_vorder_status_canceled_rejected,
+    test_vtrade_value,
+    test_vorder_value,
+    test_vorder_value_price,
+    test_vposition_price,
+    test_response,
+    test_order_response,
+    test_ohlc,
+    test_ohlcv,
+    test_ohlcvi,
+    test_vquote,
+    test_generic_response,
+    test_vuser_defaults,
+    test_vuser_add,
+    test_vorder_is_done_case0,
+    test_vorder_is_done_case1,
+    test_vorder_is_done_case2,
+    test_vorder_is_done_case3,
+    test_vorder_is_done_case4,
+    test_vorder_is_done_case5,
+    test_vorder_is_past_delay,
+    test_vorder_custom_delay,
+    test_vorder_modify_by_status_complete,
+    test_vorder_modify_by_status_canceled,
+    test_vorder_modify_by_status_open,
+    test_vorder_modify_by_status_pending,
+    test_vorder_modify_by_status,
+    test_vorder_modify_by_status_do_not_modify_done,
+    test_vorder_modify_by_status_partial_fill,
+    test_ticker_defaults,
+    test_ticker_is_random,
+    test_ticker_ohlc,
+    test_ticker_ticker_mode,
+    test_ticker_update,
+    test_vorder_side,
+    test_vorder_side_error,
+    test_instrument_defaults,
+    test_order_fill_ltp,
+    test_order_fill_different_ltp,
+    test_order_fill_ltp_buy,
+    test_order_fill_ltp_sell,
+    test_order_fill_modified_price,
+    test_order_fill_as_market_buy,
+    test_order_fill_as_market_sell,
+    test_order_fill_ltp_all_quantity,
+    test_order_fill_stop_no_trigger_price,
+    test_order_fill_stop_buy,
+    test_order_fill_stop_sell,
+    test_order_fill_stop_as_market,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the

@@ -7,6 +7,7 @@ pub mod models;
 pub mod order;
 pub mod parity_gate;
 pub mod persistence;
+pub mod simulation;
 pub mod utils;
 
 pub use broker::{rename, Broker};

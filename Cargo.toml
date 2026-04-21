@@ -21,7 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
-rand = "=0.8"
+rand = { version = "=0.8", features = ["small_rng"] }
 rand_distr = "=0.4"
 parking_lot = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
@@ -41,8 +41,11 @@ harness = false
 name = "parity_runner_smoke"
 path = "tests/parity_runner_smoke/main.rs"
 
-# [[test]] name = "statistical" is added at R5 gate when the tests/statistical
-# module first ships (PORT-PLAN §4.1.1, §9.4).
+[[test]]
+name = "statistical"
+path = "tests/statistical/main.rs"
+harness = false
+required-features = ["statistical-tests"]
 
 [lints.rust]
 warnings = "deny"
