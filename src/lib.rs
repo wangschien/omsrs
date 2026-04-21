@@ -1,6 +1,7 @@
 //! omsrs — Rust port of omspy's order-management core.
 
 pub mod broker;
+pub mod brokers;
 pub mod clock;
 pub mod models;
 pub mod order;
@@ -8,7 +9,8 @@ pub mod parity_gate;
 pub mod persistence;
 pub mod utils;
 
-pub use broker::Broker;
+pub use broker::{rename, Broker};
+pub use brokers::Paper;
 pub use clock::{clock_system_default, Clock, MockClock, SystemClock};
 pub use models::{BasicPosition, OrderBook, OrderLock, QuantityMatch, Quote};
 pub use order::{Order, OrderInit};

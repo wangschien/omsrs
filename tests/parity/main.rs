@@ -21,10 +21,12 @@ use serde::Deserialize;
 
 mod fixtures;
 mod mock_broker;
+mod test_base;
 mod test_models;
 mod test_order;
 mod test_utils;
 
+use test_base::*;
 use test_models::*;
 use test_order::*;
 use test_utils::*;
@@ -141,6 +143,17 @@ register_parity_tests!(
     test_order_cancel_attribs_to_copy_broker,
     test_order_do_not_save_to_db_if_no_connection,
     test_order_save_to_db_dont_update_order_no_connection,
+    // R4 — tests/test_base.py (10 of 12, minus the 2 cover_orders)
+    test_dummy_broker_values,
+    test_close_all_positions,
+    test_cancel_all_orders,
+    test_close_all_positions_copy_keys,
+    test_close_all_positions_add_keys,
+    test_close_all_positions_copy_and_add_keys,
+    test_close_all_positions_quantity_as_string,
+    test_close_all_positions_quantity_as_error,
+    test_close_all_positions_symbol_transfomer,
+    test_close_all_positions_given_positions,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the
