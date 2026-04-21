@@ -138,6 +138,16 @@ register_parity_tests!(
     test_order_cancel_attribs_to_copy_broker,
     test_order_do_not_save_to_db_if_no_connection,
     test_order_save_to_db_dont_update_order_no_connection,
+    // R3.b — SQLite-backed
+    test_order_create_db,
+    test_order_create_db_primary_key_duplicate_error,
+    test_order_save_to_db,
+    test_order_save_to_db_update,
+    test_order_save_to_db_multiple_orders,
+    test_order_save_to_db_update_order,
+    test_new_db,
+    test_new_db_with_values,
+    test_new_db_all_values,
 );
 
 static PASSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());

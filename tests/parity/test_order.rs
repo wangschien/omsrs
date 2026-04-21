@@ -1255,3 +1255,274 @@ pub fn test_order_save_to_db_dont_update_order_no_connection() {
     }
     assert!(!order.save_to_db());
 }
+
+// ── R3.b: SQLite-backed tests ───────────────────────────────────────────
+
+use omsrs::persistence::SqlitePersistenceHandle;
+use omsrs::PersistenceError;
+
+fn new_db() -> Arc<SqlitePersistenceHandle> {
+    Arc::new(SqlitePersistenceHandle::in_memory().expect("sqlite in-memory"))
+}
+
+fn order_with_conn(
+    symbol: &str,
+    quantity: i64,
+    con: Arc<SqlitePersistenceHandle>,
+) -> Order {
+    let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
+    Order::from_init_with_clock(
+        OrderInit {
+            symbol: symbol.into(),
+            side: "buy".into(),
+            quantity,
+            timezone: Some("Europe/Paris".into()),
+            connection: Some(handle),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    )
+}
+
+pub fn test_order_create_db() {
+    let _order = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "aapl".into(),
+            side: "buy".into(),
+            quantity: 10,
+            timezone: Some("Europe/Paris".into()),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    let con = new_db();
+    for i in 0..10 {
+        con.insert_raw(kwargs(&[
+            ("symbol", json!("aapl")),
+            ("quantity", json!(i)),
+            ("id", json!(format!("id-{i}"))),
+        ]))
+        .expect("insert");
+    }
+    assert_eq!(con.count().unwrap(), 10);
+}
+
+pub fn test_order_create_db_primary_key_duplicate_error() {
+    let order = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "aapl".into(),
+            side: "buy".into(),
+            quantity: 10,
+            timezone: Some("Europe/Paris".into()),
+            id: Some("primary_id".into()),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    let con = new_db();
+    let id = order.id.clone().unwrap();
+    let row = kwargs(&[
+        ("symbol", json!("aapl")),
+        ("quantity", json!(0)),
+        ("id", json!(id.clone())),
+    ]);
+    con.insert_raw(row.clone()).expect("first insert ok");
+    match con.insert_raw(row.clone()) {
+        Err(PersistenceError::Unique(_)) => {} // expected
+        other => panic!("expected Unique error, got {other:?}"),
+    }
+}
+
+pub fn test_order_save_to_db() {
+    let con = new_db();
+    let order = order_with_conn("aapl", 10, con.clone());
+    assert!(order.save_to_db());
+    assert_eq!(con.count().unwrap(), 1);
+    let rows = con.query_all().unwrap();
+    assert_eq!(rows[0].get("symbol"), Some(&json!("aapl")));
+}
+
+pub fn test_order_save_to_db_update() {
+    let con = new_db();
+    let mut order = order_with_conn("aapl", 10, con.clone());
+    order.save_to_db();
+    for i in 1..8 {
+        order.filled_quantity = i;
+        order.save_to_db();
+    }
+    assert_eq!(con.count().unwrap(), 1);
+    let rows = con.query_all().unwrap();
+    assert_eq!(rows[0].get("filled_quantity"), Some(&json!(7)));
+}
+
+pub fn test_order_save_to_db_multiple_orders() {
+    let con = new_db();
+    let order1 = order_with_conn("aapl", 10, con.clone());
+    let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
+    let order2 = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "goog".into(),
+            side: "sell".into(),
+            quantity: 20,
+            timezone: Some("Europe/Paris".into()),
+            connection: Some(handle),
+            tag: Some("short".into()),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    order1.save_to_db();
+    order2.save_to_db();
+    assert_eq!(con.count().unwrap(), 2);
+    for _ in 0..10 {
+        order1.save_to_db();
+        order2.save_to_db();
+    }
+    // Still 2 rows — upsert by id.
+    assert_eq!(con.count().unwrap(), 2);
+    for row in con.query_all().unwrap() {
+        match row.get("symbol").and_then(|v| v.as_str()) {
+            Some("aapl") => {
+                assert_eq!(row.get("quantity"), Some(&json!(10)));
+                assert_eq!(row.get("tag"), Some(&json!(null)));
+            }
+            Some("goog") => {
+                assert_eq!(row.get("tag"), Some(&json!("short")));
+            }
+            _ => panic!("unexpected symbol"),
+        }
+    }
+}
+
+pub fn test_order_save_to_db_update_order() {
+    let con = new_db();
+    let mut order = order_with_conn("aapl", 10, con.clone());
+    for _ in 0..3 {
+        order.update(&kwargs(&[
+            ("filled_quantity", json!(7)),
+            ("average_price", json!("780")),
+        ]));
+    }
+    assert_eq!(con.count().unwrap(), 1);
+    let rows = con.query_all().unwrap();
+    assert_eq!(rows[0].get("filled_quantity"), Some(&json!(7)));
+    assert_eq!(rows[0].get("average_price"), Some(&json!(780.0)));
+}
+
+pub fn test_new_db() {
+    let con = new_db();
+    let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
+    let order = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "amzn".into(),
+            side: "sell".into(),
+            quantity: 10,
+            connection: Some(handle),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    order.save_to_db();
+    // New-column presence check, upstream keys:
+    let keys = ["can_peg", "strategy_id", "portfolio_id", "pseudo_id", "JSON", "error"];
+    for row in con.query_all().unwrap() {
+        for k in keys {
+            assert!(row.contains_key(k), "missing column {k}");
+        }
+    }
+}
+
+pub fn test_new_db_with_values() {
+    let con = new_db();
+    let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
+    let mut json_val: HashMap<String, Value> = HashMap::new();
+    json_val.insert("a".into(), json!(10));
+    json_val.insert("b".into(), json!([4, 5, 6]));
+    let order = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "amzn".into(),
+            side: "sell".into(),
+            quantity: 10,
+            connection: Some(handle),
+            json: Some(json_val.clone()),
+            pseudo_id: Some("hex_pseudo_id".into()),
+            error: Some("some_error_message".into()),
+            tag: Some("this is a tag".into()),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    order.save_to_db();
+
+    let expected_json =
+        serde_json::to_string(&serde_json::json!({"a": 10, "b": [4, 5, 6]})).unwrap();
+
+    for row in con.query_all().unwrap() {
+        assert_eq!(row.get("can_peg"), Some(&json!(1)));
+        assert_eq!(row.get("JSON"), Some(&json!(expected_json)));
+        assert_eq!(row.get("tag"), Some(&json!("this is a tag")));
+        assert_eq!(row.get("is_multi"), Some(&json!(0)));
+        assert_eq!(row.get("last_updated_at"), Some(&json!(null)));
+
+        let retrieved = Order::from_row(&row);
+        assert!(retrieved.can_peg);
+        assert_eq!(retrieved.json, Some(json_val.clone()));
+        assert_eq!(retrieved.pseudo_id.as_deref(), Some("hex_pseudo_id"));
+    }
+}
+
+pub fn test_new_db_all_values() {
+    let con = new_db();
+    let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
+    let mut json_val: HashMap<String, Value> = HashMap::new();
+    json_val.insert("a".into(), json!(10));
+    json_val.insert("b".into(), json!([4, 5, 6]));
+    let order = Order::from_init_with_clock(
+        OrderInit {
+            symbol: "amzn".into(),
+            side: "sell".into(),
+            quantity: 10,
+            connection: Some(handle),
+            json: Some(json_val.clone()),
+            pseudo_id: Some("hex_pseudo_id".into()),
+            error: Some("some_error_message".into()),
+            timezone: Some("Asia/Kolkata".into()),
+            ..Default::default()
+        },
+        default_mock_clock(),
+    );
+    order.save_to_db();
+
+    for row in con.query_all().unwrap() {
+        let retrieved = Order::from_row(&row);
+        // Field-by-field equality (upstream asserts model_dump, minus
+        // `connection` — our `connection` is serde(skip) so both sides
+        // have it `None` after reconstruction).
+        assert_eq!(retrieved.symbol, order.symbol);
+        assert_eq!(retrieved.side, order.side);
+        assert_eq!(retrieved.quantity, order.quantity);
+        assert_eq!(retrieved.id, order.id);
+        assert_eq!(retrieved.order_type, order.order_type);
+        assert_eq!(retrieved.price, order.price);
+        assert_eq!(retrieved.trigger_price, order.trigger_price);
+        assert_eq!(retrieved.average_price, order.average_price);
+        assert_eq!(retrieved.filled_quantity, order.filled_quantity);
+        assert_eq!(retrieved.cancelled_quantity, order.cancelled_quantity);
+        assert_eq!(retrieved.disclosed_quantity, order.disclosed_quantity);
+        assert_eq!(retrieved.validity, order.validity);
+        assert_eq!(retrieved.expires_in, order.expires_in);
+        assert_eq!(retrieved.timezone, order.timezone);
+        assert_eq!(retrieved.max_modifications, order.max_modifications);
+        assert_eq!(retrieved.retries, order.retries);
+        assert_eq!(retrieved.can_peg, order.can_peg);
+        assert_eq!(retrieved.is_multi, order.is_multi);
+        assert_eq!(retrieved.pseudo_id, order.pseudo_id);
+        assert_eq!(retrieved.error, order.error);
+        assert_eq!(retrieved.json, order.json);
+        assert_eq!(retrieved.cancel_after_expiry, order.cancel_after_expiry);
+        assert_eq!(
+            retrieved.convert_to_market_after_expiry,
+            order.convert_to_market_after_expiry
+        );
+    }
+}

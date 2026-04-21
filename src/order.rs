@@ -24,6 +24,99 @@ use crate::persistence::PersistenceHandle;
 /// Input carrier — `Default` gives upstream's pydantic-default field set,
 /// letting tests write `Order::from_init(OrderInit { symbol: "aapl".into(),
 /// side: "buy".into(), quantity: 10, ..Default::default() })`.
+impl OrderInit {
+    /// Parse a DB row back into an `OrderInit`. Missing columns default to
+    /// `None` / `0` / empty; present-but-null columns do too.
+    pub fn from_row(row: &HashMap<String, Value>) -> Self {
+        let s = |k: &str| row.get(k).and_then(|v| v.as_str().map(String::from));
+        let s_opt = |k: &str| {
+            row.get(k).and_then(|v| match v {
+                Value::Null => None,
+                Value::String(x) => Some(x.clone()),
+                _ => None,
+            })
+        };
+        let i = |k: &str| row.get(k).and_then(|v| v.as_i64());
+        let b = |k: &str| {
+            row.get(k).map(|v| match v {
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_i64().map(|x| x != 0).unwrap_or(false),
+                Value::String(s) => {
+                    let lower = s.to_ascii_lowercase();
+                    lower == "true" || lower == "1"
+                }
+                _ => false,
+            })
+        };
+        let d = |k: &str| -> Option<Decimal> {
+            row.get(k).and_then(|v| match v {
+                Value::Null => None,
+                Value::Number(n) => n.as_f64().and_then(|f| Decimal::try_from(f).ok()),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+        };
+        let dt = |k: &str| -> Option<DateTime<Utc>> {
+            row.get(k).and_then(|v| match v {
+                Value::Null => None,
+                Value::String(s) => DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|t| t.with_timezone(&Utc)),
+                _ => None,
+            })
+        };
+        let jmap = |k: &str| -> Option<HashMap<String, Value>> {
+            row.get(k).and_then(|v| match v {
+                Value::Null => None,
+                Value::String(s) => serde_json::from_str(s).ok(),
+                Value::Object(m) => Some(m.clone().into_iter().collect()),
+                _ => None,
+            })
+        };
+
+        Self {
+            symbol: s("symbol").unwrap_or_default(),
+            side: s("side").unwrap_or_default(),
+            quantity: i("quantity").unwrap_or(0),
+            id: s_opt("id"),
+            parent_id: s_opt("parent_id"),
+            timestamp: dt("timestamp"),
+            order_type: s_opt("order_type"),
+            broker_timestamp: dt("broker_timestamp"),
+            exchange_timestamp: dt("exchange_timestamp"),
+            order_id: s_opt("order_id"),
+            exchange_order_id: s_opt("exchange_order_id"),
+            price: d("price"),
+            trigger_price: d("trigger_price"),
+            average_price: d("average_price"),
+            pending_quantity: i("pending_quantity"),
+            filled_quantity: i("filled_quantity"),
+            cancelled_quantity: i("cancelled_quantity"),
+            disclosed_quantity: i("disclosed_quantity"),
+            validity: s_opt("validity"),
+            status: s_opt("status"),
+            expires_in: i("expires_in"),
+            timezone: s_opt("timezone"),
+            client_id: s_opt("client_id"),
+            convert_to_market_after_expiry: b("convert_to_market_after_expiry"),
+            cancel_after_expiry: b("cancel_after_expiry"),
+            retries: i("retries"),
+            max_modifications: i("max_modifications"),
+            exchange: s_opt("exchange"),
+            tag: s_opt("tag"),
+            connection: None,
+            can_peg: b("can_peg"),
+            pseudo_id: s_opt("pseudo_id"),
+            strategy_id: s_opt("strategy_id"),
+            portfolio_id: s_opt("portfolio_id"),
+            json: jmap("JSON"),
+            error: s_opt("error"),
+            is_multi: b("is_multi"),
+            last_updated_at: dt("last_updated_at"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OrderInit {
     pub symbol: String,
@@ -161,6 +254,17 @@ impl Order {
     /// post-init, and wires a `SystemClock`.
     pub fn from_init(init: OrderInit) -> Self {
         Self::from_init_with_clock(init, clock_system_default())
+    }
+
+    /// Reconstruct an `Order` from a DB row (matches upstream `Order(**row)`).
+    /// Fields absent from `row` fall back to `OrderInit` defaults; fields
+    /// whose type needs normalising (bool 0/1 → `bool`, float → `Decimal`,
+    /// ISO-string → `DateTime<Utc>`, JSON-string → `HashMap<String, Value>`)
+    /// are converted here. Runs through `from_init` so upstream's
+    /// `pending_quantity = quantity` reset and `expires_in` guards fire
+    /// identically on reconstruction.
+    pub fn from_row(row: &HashMap<String, Value>) -> Self {
+        Self::from_init(OrderInit::from_row(row))
     }
 
     pub fn from_init_with_clock(

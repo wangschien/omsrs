@@ -2,8 +2,7 @@
 # stripped and blank lines ignored at load time. Phase gates extend this
 # file monotonically; §4.1.1 of PORT-PLAN pins the R10 length at 237.
 #
-# Current phase gate: R3.a (cumulative 85 = R1 20 + R2 10 + R3.a 55). R3.b
-# adds the 9 SQLite-backed items to reach R3's planned 64, totalling 94.
+# Current phase gate: R3 (cumulative 94 = R1 20 + R2 10 + R3.a 55 + R3.b 9).
 
 # --- R1: tests/test_utils.py (17) ---
 test_create_basic_positions_from_orders_dict_keys
@@ -97,3 +96,14 @@ test_order_modify_attribs_to_copy_broker
 test_order_cancel_attribs_to_copy_broker
 test_order_do_not_save_to_db_if_no_connection
 test_order_save_to_db_dont_update_order_no_connection
+
+# --- R3.b: tests/test_order.py SQLite-backed (9) ---
+test_order_create_db
+test_order_create_db_primary_key_duplicate_error
+test_order_save_to_db
+test_order_save_to_db_update
+test_order_save_to_db_multiple_orders
+test_order_save_to_db_update_order
+test_new_db
+test_new_db_with_values
+test_new_db_all_values
