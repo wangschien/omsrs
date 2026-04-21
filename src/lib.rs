@@ -6,6 +6,7 @@ pub mod clock;
 pub mod compound_order;
 pub mod models;
 pub mod order;
+pub mod order_strategy;
 pub mod parity_gate;
 pub mod persistence;
 pub mod replica_broker;

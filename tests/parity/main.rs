@@ -25,6 +25,7 @@ mod test_base;
 mod test_compound_order;
 mod test_models;
 mod test_order;
+mod test_order_strategy;
 mod test_replica_broker;
 mod test_simulation_models;
 mod test_utils;
@@ -34,6 +35,7 @@ use test_base::*;
 use test_compound_order::*;
 use test_models::*;
 use test_order::*;
+use test_order_strategy::*;
 use test_replica_broker::*;
 use test_simulation_models::*;
 use test_utils::*;
@@ -286,6 +288,14 @@ register_parity_tests!(
     test_compound_order_execute_all_order_args_override,
     test_compound_order_check_flags_convert_to_market_after_expiry,
     test_compound_order_check_flags_cancel_after_expiry,
+    // R9 — tests/test_order_strategy.py (7)
+    test_order_strategy_defaults,
+    test_order_strategy_positions,
+    test_order_strategy_update_ltp,
+    test_order_strategy_update_orders,
+    test_order_strategy_mtm,
+    test_order_strategy_run,
+    test_order_strategy_add,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the

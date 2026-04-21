@@ -24,6 +24,14 @@ use crate::clock::{clock_system_default, Clock};
 use crate::order::{Order, OrderInit};
 use crate::persistence::PersistenceHandle;
 
+/// `run_fn` is the Rust analogue of upstream's CompoundOrder subclassing
+/// pattern from `test_order_strategy_run` (`CompoundOrderRun.run(self, data)`).
+/// Strategies call each child's `run_fn` when present; compound orders
+/// without it are the `CompoundOrderNoRun` analogue (run is skipped).
+pub type RunFn = Arc<
+    dyn Fn(&mut CompoundOrder, &std::collections::HashMap<String, f64>) + Send + Sync,
+>;
+
 pub struct CompoundOrder {
     pub broker: Option<Arc<dyn Broker>>,
     pub id: String,
@@ -31,6 +39,7 @@ pub struct CompoundOrder {
     pub orders: Vec<Order>,
     pub connection: Option<Arc<dyn PersistenceHandle>>,
     pub order_args: HashMap<String, Value>,
+    pub run_fn: Option<RunFn>,
     index: HashMap<i64, usize>,
     keys: HashMap<String, usize>,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -65,6 +74,7 @@ impl CompoundOrder {
             orders: Vec::new(),
             connection: None,
             order_args: HashMap::new(),
+            run_fn: None,
             index: HashMap::new(),
             keys: HashMap::new(),
             clock,

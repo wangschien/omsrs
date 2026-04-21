@@ -2,7 +2,7 @@
 # stripped and blank lines ignored at load time. Phase gates extend this
 # file monotonically; §4.1.1 of PORT-PLAN pins the R10 length at 237.
 #
-# Current phase gate: R8 (cumulative 230 = R1 20 + R2 10 + R3 64 + R4 10 + R5 54 + R6 22 + R7 10 + R8 40).
+# Current phase gate: R9 (cumulative 237 = R1 20 + R2 10 + R3 64 + R4 10 + R5 54 + R6 22 + R7 10 + R8 40 + R9 7). Frozen at R10.
 
 # --- R1: tests/test_utils.py (17) ---
 test_create_basic_positions_from_orders_dict_keys
@@ -255,3 +255,12 @@ test_compound_order_save_to_db
 test_compound_order_save_to_db_add_order
 test_compound_order_add_as_order_multiple_connections
 test_compound_order_save
+
+# --- R9: tests/test_order_strategy.py (7) ---
+test_order_strategy_defaults
+test_order_strategy_positions
+test_order_strategy_update_ltp
+test_order_strategy_update_orders
+test_order_strategy_mtm
+test_order_strategy_run
+test_order_strategy_add
