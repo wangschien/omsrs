@@ -75,6 +75,7 @@ fn row01_absent_all_pass_yields_zero() {
     let m = manifest();
     let gate = drive(&m, &manifest_set(), None, &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::Pass);
+    assert_eq!(gate.code(), 0);
 }
 
 // Row 2: present-empty (zero rows) + all pass → exit 0
@@ -84,6 +85,7 @@ fn row02_present_empty_all_pass_yields_zero() {
     let src = "# just comments, no rows\n";
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::Pass);
+    assert_eq!(gate.code(), 0);
 }
 
 // Row 3: failing id ∈ excused, ≥ (|m|-7) pass, |excused| ≤ 7 → exit 0
@@ -103,6 +105,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &p, &f, R0_OFF);
     assert_eq!(gate, GateExit::Pass);
+    assert_eq!(gate.code(), 0);
 }
 
 // Row 4: failing id ∉ excused → exit 1
@@ -115,6 +118,7 @@ fn row04_unexcused_failure_yields_one() {
     f.insert("t05");
     let gate = drive(&m, &manifest_set(), None, &p, &f, R0_OFF);
     assert_eq!(gate, GateExit::RegressionOrShort);
+    assert_eq!(gate.code(), 1);
 }
 
 // Row 5: excused id duplicated → exit 2
@@ -136,6 +140,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::DuplicateExcused);
+    assert_eq!(gate.code(), 2);
 }
 
 // Row 6: excused id not in manifest → exit 3
@@ -151,6 +156,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::UnknownExcusedId);
+    assert_eq!(gate.code(), 3);
 }
 
 // Row 7: OMSRS_R0_GATE=1 + non-empty excused → exit 4
@@ -170,6 +176,7 @@ approved_by = "codex"
     f.insert("t05");
     let gate = drive(&m, &manifest_set(), Some(src), &p, &f, R0_ON);
     assert_eq!(gate, GateExit::R0GateViolation);
+    assert_eq!(gate.code(), 4);
 }
 
 // Row 8: |excused| > 7 → exit 5
@@ -220,6 +227,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::ExcusedOverCap);
+    assert_eq!(gate.code(), 5);
 }
 
 // Row 9: malformed TOML (syntactically invalid) → exit 6
@@ -229,6 +237,7 @@ fn row09_malformed_toml_yields_six() {
     let src = "[[excused\nid = \"t01\""; // unterminated array-of-tables header
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::TomlInvalid);
+    assert_eq!(gate.code(), 6);
 }
 
 // Row 10: well-formed TOML, wrong shape (`excused` is a string) → exit 6
@@ -238,6 +247,7 @@ fn row10_wrong_shape_yields_six() {
     let src = r#"excused = "should be array""#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::TomlInvalid);
+    assert_eq!(gate.code(), 6);
 }
 
 // Row 11: row missing `rationale` → exit 6
@@ -252,6 +262,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::TomlInvalid);
+    assert_eq!(gate.code(), 6);
 }
 
 // Row 12: row missing `approved_at` → exit 6
@@ -266,6 +277,7 @@ approved_by = "codex"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::TomlInvalid);
+    assert_eq!(gate.code(), 6);
 }
 
 // Row 13: row missing `approved_by` → exit 6
@@ -280,4 +292,5 @@ approved_at = "R_smoke"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &all_pass(), &empty(), R0_OFF);
     assert_eq!(gate, GateExit::TomlInvalid);
+    assert_eq!(gate.code(), 6);
 }
