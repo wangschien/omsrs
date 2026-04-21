@@ -1,5 +1,6 @@
 //! omsrs — Rust port of omspy's order-management core.
 
+pub mod async_broker;
 pub mod broker;
 pub mod brokers;
 pub mod clock;
@@ -14,6 +15,7 @@ pub mod simulation;
 pub mod utils;
 pub mod virtual_broker;
 
+pub use async_broker::AsyncBroker;
 pub use broker::{rename, Broker};
 pub use brokers::Paper;
 pub use clock::{clock_system_default, Clock, MockClock, SystemClock};

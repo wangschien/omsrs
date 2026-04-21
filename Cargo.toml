@@ -1,6 +1,6 @@
 [package]
 name = "omsrs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
@@ -25,12 +25,19 @@ rand = { version = "=0.8", features = ["small_rng"] }
 rand_distr = "=0.4"
 parking_lot = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# R11.1 (v0.2): AsyncBroker trait needs async_trait for dyn-compatibility.
+# Tiny, zero-runtime crate; added unconditionally so no feature gate is
+# required at consumer sites.
+async-trait = "0.1"
 
 [dev-dependencies]
 proptest = "1.4"
 pretty_assertions = "1.4"
 libtest-mimic = "0.7"
 toml = "0.8"
+# R11.2: async parity harness uses #[tokio::test] to mirror the sync
+# R4 Paper test_base suite against AsyncPaper.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
 [[test]]
 name = "parity"
