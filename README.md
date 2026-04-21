@@ -6,7 +6,9 @@ Pure-Rust re-implementation of omspy's MVP order-management core: `Order` lifecy
 
 ## Status
 
-**All 10 implementation phases complete.** Parity gate: 237 upstream pytest items, 236 pass + 1 excused (`test_order_timezone` — pendulum tz-name not expressible in `chrono::DateTime<Utc>`, §14B). Every phase codex-audited individually; see `docs/PORT-PLAN-R{1..10}-audit-result.md`.
+**v0.1.0** (2026-04-21): all 10 implementation phases complete. Parity gate: 237 upstream pytest items, 236 pass + 1 excused (`test_order_timezone` — pendulum tz-name not expressible in `chrono::DateTime<Utc>`, §14B). Every phase codex-audited individually; see `docs/PORT-PLAN-R{1..10}-audit-result.md`.
+
+**v0.2.0** (2026-04-21): additive `AsyncBroker` trait + `AsyncPaper` reference impl. Motivated by downstream pbot (`github.com/wangschien/pbot`) — every real prediction-market SDK in scope (Polymarket `rs-clob-client`, Kalshi `kalshi-rs`) is async, and routing them through the sync `Broker` trait forces a `block_on` bridge per adapter. v0.2 is **non-breaking**: the v0.1.0 237-item parity gate passes unchanged; sync `Broker` / `Paper` / `VirtualBroker` / `ReplicaBroker` / `CompoundOrder` / `OrderStrategy` are byte-identical. Two R11 phases (R11.1 trait + R11.2 AsyncPaper + 10-item async parity) codex-audited with ACK; see `docs/audit-R11.{1,2,3}-codex-result.md`.
 
 | phase | items | surface |
 |---|---:|---|
@@ -55,11 +57,35 @@ order.execute(&broker, None, HashMap::new());
 
 `CompoundOrder` and `OrderStrategy` give you basket / strategy-level aggregates (positions, MTM, net_value, average_buy/sell_price). `OrderLock` throttles modify/cancel with an injected `Clock`. Persistence goes through `PersistenceHandle` (SQLite reference impl behind the `persistence` feature).
 
+## Async venue adapters (v0.2)
+
+If your venue SDK is async — which every real prediction-market SDK we've seen is — implement `AsyncBroker` instead. Same method surface as `Broker`, async throughout:
+
+```rust
+use async_trait::async_trait;
+use std::collections::HashMap;
+use omsrs::AsyncBroker;
+use serde_json::Value;
+
+pub struct PolymarketBroker { /* reqwest client, credentials, ... */ }
+
+#[async_trait]
+impl AsyncBroker for PolymarketBroker {
+    async fn order_place(&self, args: HashMap<String, Value>) -> Option<String> {
+        // .await into your async venue SDK directly — no block_on bridge
+    }
+    async fn order_modify(&self, args: HashMap<String, Value>) { /* ... */ }
+    async fn order_cancel(&self, args: HashMap<String, Value>) { /* ... */ }
+}
+```
+
+v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics) and a 10-item async parity harness at `tests/parity_async.rs` that mirrors the sync R4 base tests 1:1. If `AsyncPaper` passes an assertion, sync `Paper` passes the same assertion with the same inputs.
+
 ## Features
 
 ```toml
 [dependencies]
-omsrs = "0.1"
+omsrs = "0.2"
 
 # persistence = ["dep:rusqlite"]  — off by default (§7 "MSRV-minimum build")
 # statistical-tests — test-only, gates tests/statistical
@@ -69,6 +95,7 @@ omsrs = "0.1"
 
 - `scripts/parity_gate.sh` — release-mode full sweep, exits 0 on 237-item manifest
 - `cargo test --test parity --all-features` — 237 / 236 pass / 1 excused, exit 0
+- `cargo test --test parity_async` — 10-item async parity (v0.2 AsyncPaper), all pass
 - `cargo test --test parity_runner_smoke` — 13-row exit-code smoke matrix
 - `cargo test --no-default-features` — 222-item effective manifest, all pass
 - `cargo test --test statistical --features statistical-tests --release` — Z-mean / Z-std bounds on Ticker RNG path
@@ -80,6 +107,7 @@ omsrs = "0.1"
 **In MVP** (10 phases complete):
 - `Order` lifecycle (R3): ~40 fields, update / execute / modify / cancel / save / clone / add_lock
 - `Broker` trait (R3/R4): object-safe, `Paper` reference impl
+- `AsyncBroker` trait + `AsyncPaper` (v0.2 / R11): additive async surface for async venue SDKs
 - `PersistenceHandle` trait (R3): SQLite backend behind `persistence` feature
 - Simulation (R5-R7): `VirtualBroker`, `ReplicaBroker`, `Ticker`, fill engine
 - Aggregates (R8/R9): `CompoundOrder` / `OrderStrategy`
