@@ -68,6 +68,17 @@ register_parity_tests!(
     test_basic_position,
     test_basic_position_calculations,
     test_basic_position_zero_quantity,
+    // R2
+    test_order_book,
+    test_orderbook_is_bid_ask,
+    test_orderbook_spread,
+    test_orderbook_total_bid_ask_quantity,
+    test_order_lock_defaults,
+    test_order_lock_methods,
+    test_order_lock_methods_max_duration,
+    test_order_lock_can_methods_can_create,
+    test_order_lock_can_methods_can_modify,
+    test_order_lock_can_methods_can_cancel,
 );
 
 static PASSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());

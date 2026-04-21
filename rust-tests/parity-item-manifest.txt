@@ -2,7 +2,7 @@
 # stripped and blank lines ignored at load time. Phase gates extend this
 # file monotonically; §4.1.1 of PORT-PLAN pins the R10 length at 237.
 #
-# Current phase gate: R1 (20 items = 17 utils + 3 BasicPosition).
+# Current phase gate: R2 (cumulative 30 = R1 20 + R2 10).
 
 # --- R1: tests/test_utils.py (17) ---
 test_create_basic_positions_from_orders_dict_keys
@@ -27,3 +27,15 @@ test_update_quantity_case5
 test_basic_position
 test_basic_position_calculations
 test_basic_position_zero_quantity
+
+# --- R2: tests/test_models.py (10) = 1 Quote + 3 OrderBook + 6 OrderLock ---
+test_order_book
+test_orderbook_is_bid_ask
+test_orderbook_spread
+test_orderbook_total_bid_ask_quantity
+test_order_lock_defaults
+test_order_lock_methods
+test_order_lock_methods_max_duration
+test_order_lock_can_methods_can_create
+test_order_lock_can_methods_can_modify
+test_order_lock_can_methods_can_cancel
