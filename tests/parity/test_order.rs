@@ -1256,15 +1256,19 @@ pub fn test_order_save_to_db_dont_update_order_no_connection() {
     assert!(!order.save_to_db());
 }
 
-// ── R3.b: SQLite-backed tests ───────────────────────────────────────────
+// ── R3.b: SQLite-backed tests (persistence feature only) ────────────────
 
+#[cfg(feature = "persistence")]
 use omsrs::persistence::SqlitePersistenceHandle;
+#[cfg(feature = "persistence")]
 use omsrs::PersistenceError;
 
+#[cfg(feature = "persistence")]
 fn new_db() -> Arc<SqlitePersistenceHandle> {
     Arc::new(SqlitePersistenceHandle::in_memory().expect("sqlite in-memory"))
 }
 
+#[cfg(feature = "persistence")]
 fn order_with_conn(
     symbol: &str,
     quantity: i64,
@@ -1284,6 +1288,7 @@ fn order_with_conn(
     )
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_create_db() {
     let _order = Order::from_init_with_clock(
         OrderInit {
@@ -1307,6 +1312,7 @@ pub fn test_order_create_db() {
     assert_eq!(con.count().unwrap(), 10);
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_create_db_primary_key_duplicate_error() {
     let order = Order::from_init_with_clock(
         OrderInit {
@@ -1333,6 +1339,7 @@ pub fn test_order_create_db_primary_key_duplicate_error() {
     }
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_save_to_db() {
     let con = new_db();
     let order = order_with_conn("aapl", 10, con.clone());
@@ -1342,6 +1349,7 @@ pub fn test_order_save_to_db() {
     assert_eq!(rows[0].get("symbol"), Some(&json!("aapl")));
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_save_to_db_update() {
     let con = new_db();
     let mut order = order_with_conn("aapl", 10, con.clone());
@@ -1355,6 +1363,7 @@ pub fn test_order_save_to_db_update() {
     assert_eq!(rows[0].get("filled_quantity"), Some(&json!(7)));
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_save_to_db_multiple_orders() {
     let con = new_db();
     let order1 = order_with_conn("aapl", 10, con.clone());
@@ -1394,6 +1403,7 @@ pub fn test_order_save_to_db_multiple_orders() {
     }
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_order_save_to_db_update_order() {
     let con = new_db();
     let mut order = order_with_conn("aapl", 10, con.clone());
@@ -1409,6 +1419,7 @@ pub fn test_order_save_to_db_update_order() {
     assert_eq!(rows[0].get("average_price"), Some(&json!(780.0)));
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_new_db() {
     let con = new_db();
     let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
@@ -1432,6 +1443,7 @@ pub fn test_new_db() {
     }
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_new_db_with_values() {
     let con = new_db();
     let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();
@@ -1471,6 +1483,7 @@ pub fn test_new_db_with_values() {
     }
 }
 
+#[cfg(feature = "persistence")]
 pub fn test_new_db_all_values() {
     let con = new_db();
     let handle: Arc<dyn omsrs::PersistenceHandle> = con.clone();

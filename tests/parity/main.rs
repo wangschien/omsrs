@@ -36,15 +36,18 @@ const MANIFEST: &str = include_str!(concat!(
 
 /// Register a flat list of `fn()` parity tests by their *leaf* identifier
 /// (must match the pytest-id mapped into `rust-tests/parity-item-manifest.txt`).
-/// The macro emits:
-///  - `PARITY_TEST_NAMES: &[&str]` — for manifest cross-check
-///  - `build_parity_trials() -> Vec<Trial>` — wraps each fn with pass/fail
+/// Emits:
+///  - `BASE_PARITY_NAMES: &[&str]` — for manifest cross-check
+///  - `build_base_trials() -> Vec<Trial>` — wrapper trials with pass/fail
 ///    tracking via the static registries in this module.
+///
+/// R3.b SQLite-backed trials live outside this list so they can be
+/// `#[cfg(feature = "persistence")]`-gated — see [`persistence_trials`].
 macro_rules! register_parity_tests {
     ($($name:ident),* $(,)?) => {
-        const PARITY_TEST_NAMES: &[&str] = &[ $( stringify!($name) ),* ];
+        const BASE_PARITY_NAMES: &[&str] = &[ $( stringify!($name) ),* ];
 
-        fn build_parity_trials() -> Vec<Trial> {
+        fn build_base_trials() -> Vec<Trial> {
             vec![ $( wrap_trial(stringify!($name), $name) ),* ]
         }
     };
@@ -138,17 +141,54 @@ register_parity_tests!(
     test_order_cancel_attribs_to_copy_broker,
     test_order_do_not_save_to_db_if_no_connection,
     test_order_save_to_db_dont_update_order_no_connection,
-    // R3.b — SQLite-backed
-    test_order_create_db,
-    test_order_create_db_primary_key_duplicate_error,
-    test_order_save_to_db,
-    test_order_save_to_db_update,
-    test_order_save_to_db_multiple_orders,
-    test_order_save_to_db_update_order,
-    test_new_db,
-    test_new_db_with_values,
-    test_new_db_all_values,
 );
+
+/// R3.b SQLite-backed trial names — surfaced unconditionally so the
+/// parity-item manifest's persistence section can be cross-checked even
+/// when the target is compiled without the feature. At compile-time when
+/// the feature is off we drop these ids from the effective manifest in
+/// [`parse_manifest`] and skip their registration in
+/// [`persistence_trials`].
+const PERSISTENCE_PARITY_NAMES: &[&str] = &[
+    "test_order_create_db",
+    "test_order_create_db_primary_key_duplicate_error",
+    "test_order_save_to_db",
+    "test_order_save_to_db_update",
+    "test_order_save_to_db_multiple_orders",
+    "test_order_save_to_db_update_order",
+    "test_new_db",
+    "test_new_db_with_values",
+    "test_new_db_all_values",
+];
+
+#[cfg(feature = "persistence")]
+fn persistence_trials() -> Vec<Trial> {
+    vec![
+        wrap_trial("test_order_create_db", test_order_create_db),
+        wrap_trial(
+            "test_order_create_db_primary_key_duplicate_error",
+            test_order_create_db_primary_key_duplicate_error,
+        ),
+        wrap_trial("test_order_save_to_db", test_order_save_to_db),
+        wrap_trial("test_order_save_to_db_update", test_order_save_to_db_update),
+        wrap_trial(
+            "test_order_save_to_db_multiple_orders",
+            test_order_save_to_db_multiple_orders,
+        ),
+        wrap_trial(
+            "test_order_save_to_db_update_order",
+            test_order_save_to_db_update_order,
+        ),
+        wrap_trial("test_new_db", test_new_db),
+        wrap_trial("test_new_db_with_values", test_new_db_with_values),
+        wrap_trial("test_new_db_all_values", test_new_db_all_values),
+    ]
+}
+
+#[cfg(not(feature = "persistence"))]
+fn persistence_trials() -> Vec<Trial> {
+    Vec::new()
+}
 
 static PASSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 static FAILED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -185,16 +225,24 @@ fn main() -> ExitCode {
     let manifest_set: HashSet<&str> = manifest_ids.iter().copied().collect();
 
     // Cross-check: every registered trial must appear in the manifest, and
-    // every manifest id must map to a registered trial.
-    for name in PARITY_TEST_NAMES {
+    // every manifest id must map to a registered trial. With the
+    // `persistence` feature off, the effective manifest drops the R3.b
+    // ids (see `parse_manifest`) and `persistence_trials()` returns empty.
+    let registered: Vec<&str> = BASE_PARITY_NAMES
+        .iter()
+        .copied()
+        .chain(effective_persistence_names().iter().copied())
+        .collect();
+    let registered_set: HashSet<&str> = registered.iter().copied().collect();
+    for name in &registered {
         assert!(
-            manifest_set.contains(*name),
+            manifest_set.contains(name),
             "trial `{name}` registered but missing from parity-item-manifest.txt"
         );
     }
     for id in &manifest_ids {
         assert!(
-            PARITY_TEST_NAMES.contains(id),
+            registered_set.contains(id),
             "manifest id `{id}` has no registered trial"
         );
     }
@@ -203,7 +251,8 @@ fn main() -> ExitCode {
     let r0_gate = std::env::var("OMSRS_R0_GATE").ok().as_deref() == Some("1");
 
     let args = Arguments::from_args();
-    let trials = build_parity_trials();
+    let mut trials = build_base_trials();
+    trials.extend(persistence_trials());
     let conclusion = libtest_mimic::run(&args, trials);
 
     // `libtest-mimic` may short-circuit on `--list`; in that case skip the gate.
@@ -264,10 +313,26 @@ fn parse_excused_toml(src: Option<&str>) -> Result<Vec<ExcusedRow>, GateExit> {
 }
 
 fn parse_manifest(body: &str) -> Vec<&str> {
-    body.lines()
+    let all: Vec<&str> = body
+        .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
+        .collect();
+    if cfg!(feature = "persistence") {
+        all
+    } else {
+        all.into_iter()
+            .filter(|id| !PERSISTENCE_PARITY_NAMES.contains(id))
+            .collect()
+    }
+}
+
+fn effective_persistence_names() -> &'static [&'static str] {
+    if cfg!(feature = "persistence") {
+        PERSISTENCE_PARITY_NAMES
+    } else {
+        &[]
+    }
 }
 
 /// Reads `tests/parity/excused.toml` if present. Returns `None` on absent,
