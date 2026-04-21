@@ -286,7 +286,14 @@ impl Order {
             Some(v) => v.abs(),
         };
 
-        let pending_quantity = Some(init.pending_quantity.unwrap_or(quantity));
+        // Upstream `Order.__init__` unconditionally sets
+        // `self.pending_quantity = self.quantity` after validation
+        // (`order.py:224`), ignoring any caller-provided value. Match that
+        // to close R3.b audit P2.1 — preserves the invariant that
+        // `Order(**row)` round-trips through a freshly-saved row and
+        // ignores stored `pending_quantity` on partially-updated loads.
+        let _unused_init_pending = init.pending_quantity;
+        let pending_quantity = Some(quantity);
 
         let lock = OrderLock::unlocked_with_clock(clock.clone()).with_timezone(timezone.clone());
 
