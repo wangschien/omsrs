@@ -206,6 +206,30 @@ impl OrderLock {
         }
     }
 
+    /// Lock constructed in an "unlocked" state — `*_lock_till` = epoch so
+    /// `can_*` is trivially true until `create/modify/cancel` engages a
+    /// lock. Used by `Order::from_init_with_clock`: upstream relies on
+    /// real-pendulum microsecond advance between `OrderLock.__init__` and
+    /// the first `can_modify` check to flip False→True; with a frozen
+    /// `MockClock` that advance doesn't happen, so we start unlocked and
+    /// let the first explicit `lock.modify()/cancel()` bring the lock
+    /// forward. Observable behaviour matches upstream (fresh orders let
+    /// through modify/cancel); only the internal `lock_till` snapshot
+    /// differs from the `with_clock` variant.
+    pub fn unlocked_with_clock(clock: Arc<dyn Clock + Send + Sync>) -> Self {
+        let epoch = DateTime::<Utc>::UNIX_EPOCH;
+        Self {
+            max_order_creation_lock_time: 60.0,
+            max_order_modification_lock_time: 60.0,
+            max_order_cancellation_lock_time: 60.0,
+            timezone: None,
+            creation_lock_till: epoch,
+            modification_lock_till: epoch,
+            cancellation_lock_till: epoch,
+            clock,
+        }
+    }
+
     pub fn with_timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = Some(tz.into());
         self

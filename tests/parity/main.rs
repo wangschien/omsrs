@@ -20,10 +20,13 @@ use omsrs::parity_gate::{
 use serde::Deserialize;
 
 mod fixtures;
+mod mock_broker;
 mod test_models;
+mod test_order;
 mod test_utils;
 
 use test_models::*;
+use test_order::*;
 use test_utils::*;
 
 const MANIFEST: &str = include_str!(concat!(
@@ -79,6 +82,62 @@ register_parity_tests!(
     test_order_lock_can_methods_can_create,
     test_order_lock_can_methods_can_modify,
     test_order_lock_can_methods_can_cancel,
+    // R3.a
+    test_order_simple,
+    test_order_id_custom,
+    test_order_is_complete,
+    test_order_is_complete_other_cases,
+    test_order_is_pending,
+    test_order_is_pending_canceled,
+    test_order_is_pending_rejected,
+    test_order_is_done,
+    test_order_is_done_not_complete,
+    test_order_has_parent,
+    test_order_update_simple,
+    test_order_update_timestamp,
+    test_order_update_non_attribute,
+    test_order_update_do_not_update_when_complete,
+    test_order_update_do_not_update_rejected_order,
+    test_order_update_do_not_update_cancelled_order,
+    test_order_update_do_not_update_timestamp_for_completed_orders,
+    test_order_update_pending_quantity,
+    test_order_update_pending_quantity_in_data,
+    test_order_expires,
+    test_order_expiry_times,
+    test_order_has_expired,
+    test_simple_order_execute,
+    test_simple_order_execute_kwargs,
+    test_simple_order_execute_do_not_update_existing_kwargs,
+    test_simple_order_do_not_execute_more_than_once,
+    test_simple_order_do_not_execute_completed_order,
+    test_simple_order_modify,
+    test_simple_order_cancel,
+    test_simple_order_cancel_none,
+    test_order_modify_quantity,
+    test_order_modify_by_attribute,
+    test_order_modify_extra_attributes,
+    test_order_modify_frozen,
+    test_order_max_modifications,
+    test_order_max_modifications_change_default,
+    test_order_clone,
+    test_order_clone_new_timestamp,
+    test_order_timezone,
+    test_order_lock_no_lock,
+    test_order_lock_modify_and_cancel,
+    test_order_lock_cancel,
+    test_order_modify_args_to_add,
+    test_order_modify_args_to_add_no_args,
+    test_order_modify_args_to_add_override,
+    test_order_modify_args_dont_modify_frozen,
+    test_order_execute_attribs_to_copy,
+    test_order_execute_attribs_to_copy_broker,
+    test_order_execute_attribs_to_copy_broker2,
+    test_order_execute_attribs_to_copy_override,
+    test_get_other_args_from_attribs,
+    test_order_modify_attribs_to_copy_broker,
+    test_order_cancel_attribs_to_copy_broker,
+    test_order_do_not_save_to_db_if_no_connection,
+    test_order_save_to_db_dont_update_order_no_connection,
 );
 
 static PASSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
