@@ -7,6 +7,7 @@ pub mod models;
 pub mod order;
 pub mod parity_gate;
 pub mod persistence;
+pub mod replica_broker;
 pub mod simulation;
 pub mod utils;
 pub mod virtual_broker;

@@ -24,6 +24,7 @@ mod mock_broker;
 mod test_base;
 mod test_models;
 mod test_order;
+mod test_replica_broker;
 mod test_simulation_models;
 mod test_utils;
 mod test_virtual_broker;
@@ -31,6 +32,7 @@ mod test_virtual_broker;
 use test_base::*;
 use test_models::*;
 use test_order::*;
+use test_replica_broker::*;
 use test_simulation_models::*;
 use test_utils::*;
 use test_virtual_broker::*;
@@ -236,6 +238,17 @@ register_parity_tests!(
     test_virtual_broker_update_ticker,
     test_virtual_broker_ltp,
     test_virtual_broker_ohlc,
+    // R7 — tests/simulation/test_virtual.py ReplicaBroker subset (10)
+    test_replica_broker_defaults,
+    test_replica_broker_update,
+    test_replica_broker_order_place,
+    test_replica_broker_order_place_multiple_users,
+    test_replica_order_fill,
+    test_replica_broker_order_modify,
+    test_replica_broker_order_modify_market,
+    test_replica_broker_order_cancel,
+    test_replica_broker_order_cancel_multiple_times,
+    test_replica_broker_no_symbol,
 );
 
 /// R3.b SQLite-backed trial names — surfaced unconditionally so the
