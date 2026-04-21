@@ -139,3 +139,73 @@ impl OrderStrategy {
         self.orders.iter().map(|co| co.save()).sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::clock::MockClock;
+    use crate::order::{Order, OrderInit};
+
+    #[test]
+    fn add_cascades_strategy_clock_to_prepopulated_compound_orders() {
+        let strategy_clock: Arc<dyn Clock + Send + Sync> = Arc::new(MockClock::new(
+            Utc.with_ymd_and_hms(2023, 1, 1, 9, 15, 0).unwrap(),
+        ));
+        let old_clock: Arc<dyn Clock + Send + Sync> = Arc::new(MockClock::new(
+            Utc.with_ymd_and_hms(2022, 12, 31, 15, 30, 0).unwrap(),
+        ));
+
+        let mut compound = CompoundOrder::with_clock(old_clock.clone());
+        compound
+            .add(
+                Order::from_init_with_clock(
+                    OrderInit {
+                        symbol: "aapl".into(),
+                        side: "buy".into(),
+                        quantity: 1,
+                        ..Default::default()
+                    },
+                    old_clock.clone(),
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        compound
+            .add(
+                Order::from_init_with_clock(
+                    OrderInit {
+                        symbol: "msft".into(),
+                        side: "sell".into(),
+                        quantity: 2,
+                        ..Default::default()
+                    },
+                    old_clock.clone(),
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(compound.clock(), &old_clock));
+        assert!(compound
+            .orders
+            .iter()
+            .all(|order| Arc::ptr_eq(order.clock(), &old_clock)));
+
+        let mut strategy = OrderStrategy::with_clock(strategy_clock.clone());
+        strategy.add(compound);
+
+        let added = &strategy.orders[0];
+        assert!(Arc::ptr_eq(strategy.clock(), &strategy_clock));
+        assert!(Arc::ptr_eq(added.clock(), &strategy_clock));
+        assert!(added
+            .orders
+            .iter()
+            .all(|order| Arc::ptr_eq(order.clock(), &strategy_clock)));
+    }
+}

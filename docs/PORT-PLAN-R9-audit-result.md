@@ -95,3 +95,49 @@ is not gate arithmetic; it is the unresolved `OrderStrategy.clock` /
 `OrderStrategy::add` cascade contract in the current plan. If that contract is
 fixed or formally removed before R10, the R10 sweep can start from a clean
 237 / 236 / 1 gate shape.
+
+## Re-audit (post-fix)
+
+Post-fix verdict: ACK. R10 may start.
+
+The prior P1.1 blocker is closed. `OrderStrategy` now carries
+`Arc<dyn Clock + Send + Sync>` and `OrderStrategy::add(compound)` calls
+`compound.set_clock(self.clock.clone())` before insertion, so the strategy
+clock overwrites the compound clock and immediately cascades into every
+already-contained child order. `CompoundOrder::clock()` and
+`CompoundOrder::set_clock()` expose the compound clock and cascade setter, and
+`Order::set_clock()` rebuilds the embedded `OrderLock` with the replacement
+clock.
+
+I added a focused non-parity regression test,
+`order_strategy::tests::add_cascades_strategy_clock_to_prepopulated_compound_orders`,
+which constructs an `OrderStrategy` with a `MockClock` at `2023-01-01
+09:15:00 UTC`, adds a `CompoundOrder` whose pre-existing orders were built
+under a different `MockClock`, and asserts via `Arc::ptr_eq` that the compound
+and every child order now point at the strategy clock.
+
+Verification:
+
+- `cargo test -p omsrs --lib add_cascades_strategy_clock_to_prepopulated_compound_orders`
+  exited 0; the cascade regression test passed.
+- `cargo test -p omsrs --test parity --all-features` exited 0 via the parity
+  gate: manifest 237, passed 236, failed 1, failing id
+  `test_order_timezone`, gate `Pass`.
+- `scripts/parity_gate.sh` exited 0 in release/all-features mode with the same
+  237 / 236 / 1 shape and gate `Pass`.
+- `cargo test -p omsrs --no-default-features` exited 0. Effective manifest
+  222, passed 221, failed 1 (`test_order_timezone`), gate `Pass`; the new
+  library regression test and `parity_runner_smoke` 13/13 also passed.
+- `cargo test -p omsrs --test statistical --release --features statistical-tests`
+  exited 0.
+- `cargo build -p omsrs --no-default-features` exited 0.
+- `cargo clippy -p omsrs --all-features -- -D warnings` exited 0.
+- `cargo clippy -p omsrs --no-default-features -- -D warnings` exited 0.
+- `cargo clippy -p omsrs --all-targets --all-features -- -D warnings`
+  exited 0.
+- `cargo clippy -p omsrs --all-targets --no-default-features -- -D warnings`
+  exited 0.
+- Active manifest count remains 237:
+  `rg -v '^\\s*(#|$)' rust-tests/parity-item-manifest.txt | wc -l`.
+- `tests/parity/excused.toml` still has exactly one `[[excused]]` row.
+- `rg -n '#\\[ignore\\]' src tests rust-tests` returned no hits.
