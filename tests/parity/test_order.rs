@@ -808,12 +808,17 @@ pub fn test_order_clone_new_timestamp() {
 // ── timezone ────────────────────────────────────────────────────────────
 
 pub fn test_order_timezone() {
-    // Upstream asserts `order.timezone == "local"` (default) and
-    // `order.timestamp.timezone.name == pendulum.now("local").timezone_name`.
-    // The Rust port stores `timezone` as a String label only (UTC-normalised
-    // instants), so we assert the label default directly.
     let order = new_order();
     assert_eq!(order.timezone, "local");
+    // Upstream additionally asserts
+    //   order.timestamp.timezone.name == pendulum.now("local").timezone_name
+    // Pendulum's `DateTime` carries a named tz object; our
+    // `DateTime<Utc>` does not. Expressing the assertion faithfully
+    // requires a tz-aware timestamp type — out of R3 scope.
+    //
+    // Registered as §14(B) in `tests/parity/excused.toml`; the panic
+    // here is the intended signal to the parity gate.
+    panic!("§14B: pendulum DateTime.timezone.name parity not portable to chrono DateTime<Utc>");
 }
 
 // ── order-lock interaction ──────────────────────────────────────────────
@@ -1092,9 +1097,8 @@ pub fn test_order_execute_attribs_to_copy_broker() {
     let mut order = simple_order_arc(default_mock_clock());
     order.order_id = None;
     order.exchange = Some("nyse".into());
-    let Some(args) = order.execute(&broker, None, HashMap::new()) else {
-        panic!("expected Some args");
-    };
+    order.execute(&broker, None, HashMap::new());
+    let args = &broker.place_calls()[0];
     let expected: HashMap<String, Value> = [
         ("symbol", json!("AAPL")),
         ("side", json!("BUY")),
@@ -1108,7 +1112,7 @@ pub fn test_order_execute_attribs_to_copy_broker() {
     .iter()
     .map(|(k, v)| ((*k).to_string(), v.clone()))
     .collect();
-    assert_eq!(args, expected);
+    assert_eq!(args, &expected);
 }
 
 pub fn test_order_execute_attribs_to_copy_broker2() {
@@ -1118,9 +1122,8 @@ pub fn test_order_execute_attribs_to_copy_broker2() {
     order.order_id = None;
     order.exchange = Some("nyse".into());
     order.client_id = Some("abcd1234".into());
-    let Some(args) = order.execute(&broker, None, HashMap::new()) else {
-        panic!("expected Some args");
-    };
+    order.execute(&broker, None, HashMap::new());
+    let args = &broker.place_calls()[0];
     let expected: HashMap<String, Value> = [
         ("symbol", json!("AAPL")),
         ("side", json!("BUY")),
@@ -1135,25 +1138,28 @@ pub fn test_order_execute_attribs_to_copy_broker2() {
     .iter()
     .map(|(k, v)| ((*k).to_string(), v.clone()))
     .collect();
-    assert_eq!(args, expected);
+    assert_eq!(args, &expected);
 }
 
 pub fn test_order_execute_attribs_to_copy_override() {
+    // Tests kwargs-override-other_args precedence: exchange + client_id
+    // live on the Order AND the attribs_to_copy set (via broker's default
+    // nothing — set explicitly here), AND in kwargs. Upstream kwargs win.
     let broker = MockBroker::new();
+    broker.set_attribs_to_copy_execute(Some(vec!["exchange".into(), "client_id".into()]));
     let mut order = simple_order_arc(default_mock_clock());
     order.order_id = None;
     order.exchange = Some("nyse".into());
     order.client_id = Some("abcd1234".into());
-    let Some(args) = order.execute(
+    order.execute(
         &broker,
         None,
         kwargs(&[
             ("exchange", json!("nasdaq")),
             ("client_id", json!("xyz12345")),
         ]),
-    ) else {
-        panic!("expected Some args");
-    };
+    );
+    let args = &broker.place_calls()[0];
     let expected: HashMap<String, Value> = [
         ("symbol", json!("AAPL")),
         ("side", json!("BUY")),
@@ -1168,8 +1174,9 @@ pub fn test_order_execute_attribs_to_copy_override() {
     .iter()
     .map(|(k, v)| ((*k).to_string(), v.clone()))
     .collect();
-    assert_eq!(args, expected);
+    assert_eq!(args, &expected);
 }
+
 
 pub fn test_get_other_args_from_attribs() {
     let broker = MockBroker::new();

@@ -434,19 +434,19 @@ impl Order {
         }
     }
 
-    /// Mirrors `Order.execute`. Builds the broker kwarg map, dispatches to
-    /// `broker.order_place`, and stashes the broker-assigned id on
-    /// `self.order_id`. Returns the kwarg map that was dispatched (handy
-    /// for `test_order_execute_attribs_to_copy_broker*` which asserts on
-    /// it directly).
+    /// Mirrors `Order.execute`. If the order isn't complete and has no
+    /// `order_id` yet, dispatches `broker.order_place(...)` and stashes
+    /// the broker-assigned id. Returns the resulting `order_id` (either
+    /// the freshly assigned one or the existing one) — matches upstream's
+    /// `return order_id` / `return self.order_id` branches.
     pub fn execute(
         &mut self,
         broker: &dyn Broker,
         attribs_to_copy: Option<&[&str]>,
         kwargs: HashMap<String, Value>,
-    ) -> Option<HashMap<String, Value>> {
+    ) -> Option<String> {
         if self.is_complete() || self.order_id.is_some() {
-            return None;
+            return self.order_id.clone();
         }
         let other_args =
             self.get_other_args_from_attribs(broker.attribs_to_copy_execute(), attribs_to_copy);
@@ -465,22 +465,39 @@ impl Order {
             json!(self.disclosed_quantity),
         );
 
-        // kwargs only add keys not already present, per upstream.
-        for (k, v) in &kwargs {
-            if !order_args.contains_key(k) {
-                order_args.insert(k.clone(), v.clone());
-            }
-        }
+        // Precedence (matches upstream `order.py:507-509`):
+        //   1. build defaults (above)
+        //   2. apply broker-copied attributes over defaults
+        //   3. apply caller kwargs **filtered** to exclude default keys,
+        //      so kwargs win over copied attributes but not over the
+        //      order's own symbol/side/quantity/etc.
         for (k, v) in other_args {
             order_args.insert(k, v);
         }
+        let default_keys: HashSet<String> = [
+            "symbol",
+            "side",
+            "order_type",
+            "quantity",
+            "price",
+            "trigger_price",
+            "disclosed_quantity",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        for (k, v) in &kwargs {
+            if !default_keys.contains(k) {
+                order_args.insert(k.clone(), v.clone());
+            }
+        }
 
-        let ret = broker.order_place(order_args.clone());
-        self.order_id = ret;
+        let ret = broker.order_place(order_args);
+        self.order_id = ret.clone();
         if self.connection.is_some() {
             let _ = self.save_to_db();
         }
-        Some(order_args)
+        ret
     }
 
     /// Mirrors `Order.modify`. Respects `lock.can_modify()` and
@@ -710,10 +727,16 @@ impl Order {
             m.insert("exchange_order_id".into(), json!(v));
         }
         if let Some(v) = self.price {
-            m.insert("price".into(), decimal_value(v));
+            m.insert("price".into(), decimal_persistence_value(v));
         }
-        m.insert("trigger_price".into(), decimal_value(self.trigger_price));
-        m.insert("average_price".into(), decimal_value(self.average_price));
+        m.insert(
+            "trigger_price".into(),
+            decimal_persistence_value(self.trigger_price),
+        );
+        m.insert(
+            "average_price".into(),
+            decimal_persistence_value(self.average_price),
+        );
         if let Some(v) = self.pending_quantity {
             m.insert("pending_quantity".into(), json!(v));
         }
@@ -815,10 +838,20 @@ impl Order {
 }
 
 fn decimal_value(d: Decimal) -> Value {
-    // Serialise Decimals as strings to preserve precision through the
-    // dynamic kwarg map (matches upstream's `rust_decimal::Decimal`
-    // `serde-str` feature at the type boundary).
+    // Broker kwargs: serialise Decimals as strings to preserve precision
+    // through the dynamic kwarg map. Upstream pydantic emits floats, but
+    // round-tripping through f64 is lossy — the trade-off is that
+    // test-assertion literals must also be strings (`json!("650")`).
     json!(d.to_string())
+}
+
+/// Persistence rows: emit Decimals as f64-shaped JSON numbers so SQLite
+/// stores them in REAL columns (upstream `orders` schema uses `real`).
+/// Lossy for sub-f64 precision, but matches upstream's float storage.
+fn decimal_persistence_value(d: Decimal) -> Value {
+    use rust_decimal::prelude::ToPrimitive;
+    let f = d.to_f64().unwrap_or(0.0);
+    json!(f)
 }
 
 fn value_to_decimal(v: &Value) -> Option<Decimal> {

@@ -1,3 +1,8 @@
 # Excused-failure register for the parity gate (PORT-PLAN §4.1.2 + §14).
-# Empty at R0; rows are added only after codex approval at the owning phase
-# gate. A present-empty file deserializes cleanly to `excused_set = {}`.
+# Present-empty at R0; rows added only after codex ACK at the owning phase gate.
+
+[[excused]]
+id = "test_order_timezone"
+rationale = "pendulum DateTime.timezone.name parity not portable to chrono DateTime<Utc>; full assertion requires a tz-aware timestamp type (candidate lift post-MVP)"
+approved_at = "R3.a"
+approved_by = "codex"
