@@ -11,7 +11,7 @@ This is a ground-up Rust implementation of omspy's core (Order lifecycle + Broke
 - **Scope**: Indian-broker adapters (Zerodha / ICICI / Finvasia / Neo / Noren) are **not ported**. omsrs targets prediction-market venues.
 - **License**: MIT, matching omspy upstream.
 
-See `~/poly/docs/omsrs-port-plan-v1.md` for the port plan and phase schedule.
+See `~/omsrs/docs/omsrs-port-plan-v1.md` for the port plan and phase schedule.
 
 ## Status
 
@@ -20,7 +20,7 @@ Early — scaffolding only. Port plan under codex review.
 ## Upstream reference
 
 - omspy (upstream): https://github.com/uberdeveloper/omspy
-- omspy local: `~/refs/omspy/`
+- omspy local: `~/omspy/`
 
 ## License
 
