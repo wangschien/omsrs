@@ -92,3 +92,37 @@ upstream assertions.
 - Active manifest count was verified with comment/blank-line stripping:
   `awk 'NF && $1 !~ /^#/ {n++} END {print n}' rust-tests/parity-item-manifest.txt`
   returned 230.
+
+## Re-audit (post-fix)
+
+ACK. R8 is ACKed after the P1.1 and P1.2 fixes.
+
+### Fix verification
+
+- P1.1 is fixed: `test_compound_order_completed_orders` now mutates the last
+  order to `status = "COMPLETE"` and `filled_quantity = 12`, then asserts
+  `completed_orders().len() == 3`, matching the upstream post-mutation check.
+- P1.2 is fixed: `test_compound_order_save_to_db` now uses the concrete
+  `SqlitePersistenceHandle` Arc/upcast pattern, verifies `count() == 3`,
+  inspects saved DB rows, and asserts the persisted quantities are 10, 12, and
+  20 before asserting `com.save() == 3`. The Rust trial checks quantity set
+  equality rather than row order; upstream uses `SELECT *` without `ORDER BY`,
+  so this covers the material persisted-row/quantity assertion.
+
+### Verification
+
+- `cargo test --all-features` exited 0. Parity gate shape: manifest 230, passed
+  229, failed 1, failing id `test_order_timezone`, gate `Pass`. Parity runner
+  smoke tests passed 13/13; statistical tests and doc-tests passed.
+- `cargo test --no-default-features` exited 0. Effective no-persistence parity
+  shape: manifest 215, passed 214, failed 1, failing id
+  `test_order_timezone`, gate `Pass`. Parity runner smoke tests passed 13/13;
+  doc-tests passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo clippy --all-targets --no-default-features -- -D warnings` passed.
+- `scripts/parity_gate.sh` exited 0 in release mode with the expected
+  230 / 229 / 1 excused gate shape.
+- Active manifest count remains 230:
+  `awk 'NF && $1 !~ /^#/ {n++} END {print n}' rust-tests/parity-item-manifest.txt`.
+- `tests/parity/excused.toml` has exactly one `[[excused]]` row:
+  `test_order_timezone`.
