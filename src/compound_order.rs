@@ -96,6 +96,20 @@ impl CompoundOrder {
         self
     }
 
+    pub fn clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+
+    /// Overwrite the compound's clock AND cascade to every child order
+    /// (PORT-PLAN §6 D4 — "immediately cascades to every already-contained
+    /// child order within the same call"). Used by `OrderStrategy::add`.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock + Send + Sync>) {
+        self.clock = clock.clone();
+        for o in &mut self.orders {
+            o.set_clock(clock.clone());
+        }
+    }
+
     pub fn with_orders(mut self, orders: Vec<Order>) -> Self {
         for (i, o) in orders.into_iter().enumerate() {
             self.orders.push(o);

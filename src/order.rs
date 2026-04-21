@@ -354,6 +354,15 @@ impl Order {
         &self.clock
     }
 
+    /// Overwrite the injected clock. Used by `CompoundOrder::add` and
+    /// `OrderStrategy::add` to cascade a parent clock down the tree
+    /// (PORT-PLAN §6 D4). Also updates the embedded `OrderLock`'s clock
+    /// so `can_modify` / `can_cancel` see the new timeline.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock + Send + Sync>) {
+        self.clock = clock.clone();
+        self.lock = OrderLock::unlocked_with_clock(clock).with_timezone(self.timezone.clone());
+    }
+
     pub fn is_complete(&self) -> bool {
         if self.quantity == self.filled_quantity {
             return true;

@@ -2,9 +2,14 @@
 //!
 //! A thin wrapper around `Vec<CompoundOrder>` with aggregate views
 //! (`positions`, `mtm`, `total_mtm`) and fan-out methods (`update_ltp`,
-//! `update_orders`, `run`, `save`). Each child `CompoundOrder` can opt
-//! into strategy-level `run` by setting its `run_fn` (Rust analogue of
-//! upstream's `CompoundOrderRun.run(self, data)` subclassing).
+//! `update_orders`, `run`, `save`). Carries an injected
+//! `Arc<dyn Clock + Send + Sync>` (PORT-PLAN §6 D4); `add(compound)`
+//! overwrites the child's clock AND immediately cascades that clock to
+//! every already-contained child order.
+//!
+//! Each child `CompoundOrder` can opt into strategy-level `run` by
+//! setting its `run_fn` (Rust analogue of upstream's
+//! `CompoundOrderRun.run(self, data)` subclassing).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +17,7 @@ use std::sync::Arc;
 use rust_decimal::Decimal;
 
 use crate::broker::Broker;
+use crate::clock::{clock_system_default, Clock};
 use crate::compound_order::CompoundOrder;
 
 pub struct OrderStrategy {
@@ -19,6 +25,7 @@ pub struct OrderStrategy {
     pub id: String,
     pub ltp: HashMap<String, f64>,
     pub orders: Vec<CompoundOrder>,
+    clock: Arc<dyn Clock + Send + Sync>,
 }
 
 impl Default for OrderStrategy {
@@ -29,11 +36,16 @@ impl Default for OrderStrategy {
 
 impl OrderStrategy {
     pub fn new() -> Self {
+        Self::with_clock(clock_system_default())
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock + Send + Sync>) -> Self {
         Self {
             broker: None,
             id: uuid::Uuid::new_v4().simple().to_string(),
             ltp: HashMap::new(),
             orders: Vec::new(),
+            clock,
         }
     }
 
@@ -42,9 +54,18 @@ impl OrderStrategy {
         self
     }
 
-    pub fn with_orders(mut self, orders: Vec<CompoundOrder>) -> Self {
+    /// Set `orders` in bulk — cascade the strategy clock to each compound
+    /// immediately (matches `add` semantics but batched).
+    pub fn with_orders(mut self, mut orders: Vec<CompoundOrder>) -> Self {
+        for co in &mut orders {
+            co.set_clock(self.clock.clone());
+        }
         self.orders = orders;
         self
+    }
+
+    pub fn clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
     }
 
     pub fn positions(&self) -> HashMap<String, i64> {
@@ -102,7 +123,11 @@ impl OrderStrategy {
         }
     }
 
+    /// Upstream `add(compound)` — our Rust version additionally cascades
+    /// the strategy clock to the compound AND to every already-contained
+    /// child order (PORT-PLAN §6 D4).
     pub fn add(&mut self, mut compound: CompoundOrder) {
+        compound.set_clock(self.clock.clone());
         if self.broker.is_some() && compound.broker.is_none() {
             compound.broker = self.broker.clone();
         }
