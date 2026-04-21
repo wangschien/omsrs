@@ -25,10 +25,15 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 /// Shorthand for the symbol-transformer closure type used by
-/// [`AsyncBroker::close_all_positions`]. Wrapped in `Arc` rather than
-/// borrowed because `async_trait` produces a `'static` future boundary
-/// that can't hold a `&dyn Fn` with a caller-scoped lifetime without
-/// infecting the whole trait's lifetimes.
+/// [`AsyncBroker::close_all_positions`].
+///
+/// Wrapped in `Arc` rather than borrowed because `async_trait` boxes
+/// the method body into a future with a generated `'async_trait`
+/// lifetime. A `&dyn Fn(&str) -> String + Send + Sync` **can** be
+/// passed through that future in principle, but routing its
+/// anonymous caller-scoped lifetime all the way into the trait
+/// signature and its implementations is cumbersome compared to
+/// paying one `Arc::clone` at the call site.
 pub type AsyncSymbolTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 use crate::models::BasicPosition;
@@ -40,6 +45,27 @@ use crate::utils::{create_basic_positions_from_orders_dict, dict_filter, OrderRe
 ///
 /// Implementations must be `Send + Sync + 'static` to support
 /// `Arc<dyn AsyncBroker>` usage in multi-threaded tokio runtimes.
+///
+/// # Implementor note
+///
+/// Like all `#[async_trait]`-annotated traits, implementors **must**
+/// place `#[async_trait]` on their `impl` block as well:
+///
+/// ```ignore
+/// use async_trait::async_trait;
+/// use omsrs::AsyncBroker;
+///
+/// struct MyBroker;
+///
+/// #[async_trait]
+/// impl AsyncBroker for MyBroker {
+///     async fn order_place(&self, _args: std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
+///         None
+///     }
+///     async fn order_modify(&self, _args: std::collections::HashMap<String, serde_json::Value>) {}
+///     async fn order_cancel(&self, _args: std::collections::HashMap<String, serde_json::Value>) {}
+/// }
+/// ```
 #[async_trait]
 pub trait AsyncBroker: Send + Sync {
     async fn order_place(&self, args: HashMap<String, Value>) -> Option<String>;

@@ -15,9 +15,9 @@ pub mod simulation;
 pub mod utils;
 pub mod virtual_broker;
 
-pub use async_broker::AsyncBroker;
+pub use async_broker::{AsyncBroker, AsyncSymbolTransformer};
 pub use broker::{rename, Broker};
-pub use brokers::Paper;
+pub use brokers::{AsyncPaper, Paper};
 pub use clock::{clock_system_default, Clock, MockClock, SystemClock};
 pub use models::{BasicPosition, OrderBook, OrderLock, QuantityMatch, Quote};
 pub use order::{Order, OrderInit};
