@@ -436,27 +436,93 @@ async fn add_user_is_idempotent_on_duplicate() {
 
 // ─────────────────────────────────────────────────────────────
 // R12.1.async_virtual.15 — order_place attaches to matching user
+// (mirror of sync test_virtual_broker_order_place_users, strengthened
+// after R12.1 audit item 3 — previously only asserted reply.status)
 // ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn order_place_attaches_to_userid_when_registered() {
     let b = basic_broker_with_users();
-    let uid = "ABCD1234".to_string();
-    let reply = b
-        .place(kwargs(&[
+
+    // Two un-attributed places (no userid kwarg) — these don't
+    // attach to any VUser but do land on `orders`.
+    b.place(kwargs(&[
+        ("symbol", json!("aapl")),
+        ("quantity", json!(10)),
+        ("side", json!(1)),
+    ]))
+    .await;
+    b.place(kwargs(&[
+        ("symbol", json!("goog")),
+        ("quantity", json!(10)),
+        ("side", json!(1)),
+    ]))
+    .await;
+
+    // One attributed place per registered userid.
+    let clients: Vec<String> = b.clients().iter().cloned().collect();
+    for c in &clients {
+        b.place(kwargs(&[
             ("symbol", json!("aapl")),
-            ("side", json!(1)),
-            ("quantity", json!(10)),
-            ("userid", json!(uid.clone())),
+            ("quantity", json!(20)),
+            ("side", json!(-1)),
+            ("userid", json!(c.clone())),
         ]))
         .await;
-    assert_eq!(
-        reply.as_order().unwrap().status,
-        ResponseStatus::Success
-    );
-    assert_eq!(b.orders().len(), 1);
-    // User attach path wired (the clients set is unchanged;
-    // orders show up as the user's own via the sync API).
+    }
+
+    // A place with userid="unknown" attaches to no user.
+    b.place(kwargs(&[
+        ("symbol", json!("goog")),
+        ("quantity", json!(10)),
+        ("side", json!(1)),
+        ("userid", json!("unknown")),
+    ]))
+    .await;
+
+    assert_eq!(b.orders().len(), 6);
+    // Every registered user has exactly one order attached.
+    for c in &clients {
+        assert_eq!(b.user_order_count(c), Some(1));
+    }
+    // "unknown" userid not registered → None.
+    assert_eq!(b.user_order_count("UNKNOWN"), None);
+    assert_eq!(b.clients().len(), 3);
+    assert_eq!(b.users_count(), 3);
+}
+
+// ─────────────────────────────────────────────────────────────
+// R12.1.async_virtual.19 — delay kwarg preserved in orders()
+// snapshot (R12.1 audit item 2 closeout — regression guard for
+// `cloned_clone_weak` now preserving `delay`).
+// ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn order_place_delay_kwarg_survives_orders_snapshot() {
+    let b = basic_broker_with_users();
+    b.place(kwargs(&[
+        ("symbol", json!("aapl")),
+        ("quantity", json!(10)),
+        ("side", json!(1)),
+    ]))
+    .await;
+    b.place(kwargs(&[
+        ("symbol", json!("goog")),
+        ("quantity", json!(10)),
+        ("side", json!(1)),
+        ("delay", json!(5_000_000_i64)),
+    ]))
+    .await;
+
+    let mut delays_by_symbol = HashMap::new();
+    for order in b.orders().values() {
+        delays_by_symbol.insert(
+            order.symbol.clone(),
+            order.delay.num_microseconds().unwrap(),
+        );
+    }
+    assert_eq!(delays_by_symbol.get("aapl"), Some(&1_000_000));
+    assert_eq!(delays_by_symbol.get("goog"), Some(&5_000_000));
 }
 
 // ─────────────────────────────────────────────────────────────

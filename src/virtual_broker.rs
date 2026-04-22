@@ -428,8 +428,17 @@ impl VOrder {
     /// holds a `Mutex<SmallRng>`), so we construct a fresh shell with the
     /// same public fields + a new RNG-seeded helper. The response doesn't
     /// need to mutate the RNG, so a seed=0 fresh RNG is fine.
+    ///
+    /// R12.1 audit closeout: `VOrder::from_init` hard-codes
+    /// `delay = 1_000_000 μs` (see `simulation.rs:375`), so we copy the
+    /// source's `delay` onto the clone afterwards. Without this the
+    /// `AsyncVirtualBroker::orders()` snapshot silently resets delays
+    /// placed via the `delay` kwarg to the default — and the parity test
+    /// for custom delays would never catch it on the clone path.
+    /// Sync `OrderResponse.data` consumers don't inspect `delay`, so
+    /// widening here is backwards-compatible.
     pub fn cloned_clone_weak(&self) -> Option<VOrder> {
-        VOrder::from_init(VOrderInit {
+        let mut cloned = VOrder::from_init(VOrderInit {
             order_id: self.order_id.clone(),
             symbol: self.symbol.clone(),
             quantity: self.quantity,
@@ -448,6 +457,8 @@ impl VOrder {
             now_override: self.timestamp,
             ..Default::default()
         })
-        .ok()
+        .ok()?;
+        cloned.delay = self.delay;
+        Some(cloned)
     }
 }

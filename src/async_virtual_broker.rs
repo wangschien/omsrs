@@ -157,6 +157,30 @@ impl AsyncVirtualBroker {
         self.inner.lock().clients.clone()
     }
 
+    /// Count of registered users. Sync exposes `VirtualBroker.users`
+    /// as a `pub Vec<VUser>`; async can't hand out the vec (each
+    /// `VUser.orders: Vec<VOrder>` has `VOrder` with interior RNG,
+    /// so cloning the whole tree is expensive and rarely what the
+    /// caller wants). For parity-test needs, `users_count` +
+    /// `user_order_count` are enough.
+    pub fn users_count(&self) -> usize {
+        self.inner.lock().users.len()
+    }
+
+    /// Orders attached to a specific user. Returns `None` if the
+    /// user isn't registered. Userid comparison is case-sensitive
+    /// against the stored value (sync uppercases at attach time —
+    /// R12.1 test helpers pass already-uppercased ids so this is
+    /// consistent).
+    pub fn user_order_count(&self, userid: &str) -> Option<usize> {
+        let inner = self.inner.lock();
+        inner
+            .users
+            .iter()
+            .find(|u| u.userid == userid)
+            .map(|u| u.orders.len())
+    }
+
     /// `Arc` clone of the clock. Cheap.
     pub fn clock(&self) -> Arc<dyn Clock + Send + Sync> {
         self.clock.clone()
