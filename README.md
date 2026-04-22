@@ -1,5 +1,10 @@
 # omsrs
 
+[![crates.io](https://img.shields.io/crates/v/omsrs.svg)](https://crates.io/crates/omsrs)
+[![docs.rs](https://img.shields.io/docsrs/omsrs)](https://docs.rs/omsrs)
+[![CI](https://github.com/wangschien/omsrs/actions/workflows/ci.yml/badge.svg)](https://github.com/wangschien/omsrs/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/omsrs.svg)](https://github.com/wangschien/omsrs/blob/main/LICENSE)
+
 **Rust port of [omspy](https://github.com/uberdeveloper/omspy)** — a broker-agnostic OMS for trading.
 
 Pure-Rust re-implementation of omspy's MVP order-management core: `Order` lifecycle, `Broker` trait, paper-simulation engine, and virtual-broker matching engine. Built to host venue adapters for prediction-market exchanges (Polymarket, Kalshi) and anything else that fits the `Broker` shape.
@@ -9,6 +14,13 @@ Pure-Rust re-implementation of omspy's MVP order-management core: `Order` lifecy
 **v0.1.0** (2026-04-21): all 10 implementation phases complete. Parity gate: 237 upstream pytest items, 236 pass + 1 excused (`test_order_timezone` — pendulum tz-name not expressible in `chrono::DateTime<Utc>`, §14B). Every phase codex-audited individually; see `docs/PORT-PLAN-R{1..10}-audit-result.md`.
 
 **v0.2.0** (2026-04-21): additive `AsyncBroker` trait + `AsyncPaper` reference impl. Motivated by downstream pbot (`github.com/wangschien/pbot`) — every real prediction-market SDK in scope (Polymarket `rs-clob-client`, Kalshi `kalshi-rs`) is async, and routing them through the sync `Broker` trait forces a `block_on` bridge per adapter. v0.2 is **non-breaking**: the v0.1.0 237-item parity gate passes unchanged; sync `Broker` / `Paper` / `VirtualBroker` / `ReplicaBroker` / `CompoundOrder` / `OrderStrategy` are byte-identical. Two R11 phases (R11.1 trait + R11.2 AsyncPaper + 10-item async parity) codex-audited with ACK; see `docs/audit-R11.{1,2,3}-codex-result.md`.
+
+**v0.3.0** (2026-04-22): **async coverage completion**. Adds `AsyncVirtualBroker`, `AsyncReplicaBroker`, async `Order::execute_async` / `modify_async` / `cancel_async`, `AsyncCompoundOrder`, `AsyncOrderStrategy`. All five sub-phases (R12.1–R12.3b) codex-audited with ACK; see `docs/audit-R12.{1,2,3a,3b}-codex-result.md`. **Non-breaking**: every v0.2.0 public signature is unchanged; the v0.1.0 237-item parity sweep still passes. Async additions use a consistent pattern:
+- Inherent methods return the rich sync shape (`BrokerReply`, `OrderHandle`) for callers that want it
+- `impl AsyncBroker` provides a lossy `Option<String>` adapter for trait-object use
+- No `tokio` dependency in production — `parking_lot::Mutex` with no await-while-locked, matching `AsyncPaper`'s existing pattern
+- Shared-identity invariants (`Arc::ptr_eq` across matching-engine collections) preserved
+- Order's async lifecycle methods are siblings, not replacements — sync `execute` / `modify` / `cancel` still compile and work
 
 | phase | items | surface |
 |---|---:|---|
@@ -81,15 +93,70 @@ impl AsyncBroker for PolymarketBroker {
 
 v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics) and a 10-item async parity harness at `tests/parity_async.rs` that mirrors the sync R4 base tests 1:1. If `AsyncPaper` passes an assertion, sync `Paper` passes the same assertion with the same inputs.
 
+### v0.3 async matching engines + order lifecycle
+
+```rust
+use std::sync::Arc;
+use omsrs::{AsyncVirtualBroker, AsyncCompoundOrder, AsyncOrderStrategy};
+use omsrs::clock::MockClock;
+use omsrs::simulation::Ticker;
+use omsrs::order::OrderInit;
+use std::collections::HashMap;
+use chrono::Utc;
+
+#[tokio::main]
+async fn main() {
+    // Multi-user virtual matching engine. Inherent `place` / `modify` /
+    // `cancel` return the full `BrokerReply` (rich surface); the
+    // `impl AsyncBroker` adapter collapses to `Option<String>` for
+    // dyn-dispatch consumers.
+    let mut tickers = HashMap::new();
+    tickers.insert(
+        "aapl".into(),
+        Ticker::with_initial_price("aapl", 100.0),
+    );
+    let broker = Arc::new(
+        AsyncVirtualBroker::with_clock(Arc::new(MockClock::new(Utc::now())))
+            .with_tickers(tickers),
+    );
+    broker.set_failure_rate(0.0).unwrap();
+
+    // Compose into CompoundOrder → OrderStrategy (basket / strategy
+    // aggregates, same as sync).
+    let mut compound = AsyncCompoundOrder::new()
+        .with_broker(broker.clone());
+    compound.add_order(
+        OrderInit { symbol: "aapl".into(), side: "buy".into(), quantity: 10, ..Default::default() },
+        None,
+        None,
+    ).unwrap();
+    compound.execute_all_async(HashMap::new()).await;
+
+    let mut strategy = AsyncOrderStrategy::new();
+    strategy.add(compound);
+    let positions = strategy.positions();  // sync — no I/O
+    println!("{positions:?}");
+}
+```
+
+Order lifecycle siblings (`execute_async` / `modify_async` / `cancel_async`) let existing patterns reach an async broker without a `block_on` bridge.
+
 ## Features
 
 ```toml
 [dependencies]
-omsrs = "0.2"
+omsrs = "0.3"
 
 # persistence = ["dep:rusqlite"]  — off by default (§7 "MSRV-minimum build")
 # statistical-tests — test-only, gates tests/statistical
 ```
+
+### Feature flags
+
+| Feature | Default | Enables |
+| --- | --- | --- |
+| `persistence` | off | SQLite-backed `PersistenceHandle` — pulls in `rusqlite` (bundled build). Off at MSRV-minimum build. |
+| `statistical-tests` | off | `tests/statistical/*` — Z-mean / Z-std bounds on Ticker RNG path. Test-only. |
 
 ## Verification
 

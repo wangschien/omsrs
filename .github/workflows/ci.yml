@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - stable
+          - 1.78  # MSRV, per Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: build (all features)
+        run: cargo build --all-features --locked
+
+      - name: test (all features)
+        run: cargo test --all-features --locked
+
+      - name: clippy (all features, all targets)
+        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+
+      - name: doc (all features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --lib --all-features --locked
+
+      - name: publish dry-run (all features)
+        if: matrix.toolchain == 'stable'
+        run: cargo publish --dry-run --all-features --locked

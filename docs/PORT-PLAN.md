@@ -314,8 +314,8 @@ Non-normative: this section summarises which Rust strengths each decision relies
 
 **Explicitly NOT used** (scope guardrails; adding any of these changes MVP scope):
 
-- `tokio` / any async runtime — omspy is fully synchronous; the 237-item parity denominator assumes sync call chains. Downstream consumers that want async can wrap `Broker` behind their own runtime.
-- `sqlx` / async persistence — same reason; `rusqlite` sync-only.
+- ~~`tokio` / any async runtime~~ — **superseded by R11 (2026-04-21) + R12 (2026-04-22).** Original v11 scope was fully synchronous. R11 added the additive `AsyncBroker` trait + `async_trait` procedural macro (zero-runtime) + `AsyncPaper` reference impl. R12 completed async coverage with `AsyncVirtualBroker` / `AsyncReplicaBroker` / `Order::execute_async` + siblings / `AsyncCompoundOrder` / `AsyncOrderStrategy`. `tokio` remains a **dev-only** dependency (used by test harnesses + one deadlock regression test); production surface carries `async_trait` only. All R11/R12 additions are non-breaking — the 237-item sync parity gate still passes unchanged. Full rationale: `docs/R12-async-complete-plan.md` + `docs/audit-R12.{1,2,3a,3b}-codex-result.md`.
+- `sqlx` / async persistence — same reason; `rusqlite` sync-only. (R12 note: `Order::execute_async` / `modify_async` call `save_to_db()` synchronously when the `persistence` feature is on — documented caveat; spawn_blocking at caller boundary is the migration path. Full async persistence is R13 scope.)
 - `dashmap` — `parking_lot::Mutex<HashMap<…>>` is sufficient for `VirtualBroker`'s contention profile (test-harness load, not production traffic). Can revisit post-MVP if a real downstream hits hot-path contention.
 - HTTP / WebSocket client crates — broker adapters are out of MVP.
 - `serde_yaml` — `Broker.yaml_load`/`yaml_save` dropped for MVP.
