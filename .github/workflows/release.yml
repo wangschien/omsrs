@@ -25,10 +25,13 @@ jobs:
             exit 1
           fi
 
+      # `--locked` intentionally omitted — `/Cargo.lock` is
+      # `.gitignore`d (library-crate convention, see ci.yml
+      # header note).
       - name: cargo publish dry-run
-        run: cargo publish --dry-run --all-features --locked
+        run: cargo publish --dry-run --all-features
 
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --all-features --locked
+        run: cargo publish --all-features

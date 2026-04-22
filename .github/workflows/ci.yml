@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Note on `--locked`: intentionally omitted. `omsrs` is a library
+# crate; following Rust convention we don't commit `Cargo.lock`
+# (see `.gitignore:2`). Each CI run resolves deps fresh against
+# current Cargo.toml ranges, which is what library consumers
+# experience. If we later add a `Cargo.lock` for reproducibility,
+# re-add `--locked` here.
 jobs:
   test:
     name: test ${{ matrix.toolchain }}
@@ -38,19 +44,19 @@ jobs:
         run: cargo fmt --all --check
 
       - name: build (all features)
-        run: cargo build --all-features --locked
+        run: cargo build --all-features
 
       - name: test (all features)
-        run: cargo test --all-features --locked
+        run: cargo test --all-features
 
       - name: clippy (all features, all targets)
-        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: doc (all features)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --lib --all-features --locked
+        run: cargo doc --no-deps --lib --all-features
 
       - name: publish dry-run (all features)
         if: matrix.toolchain == 'stable'
-        run: cargo publish --dry-run --all-features --locked
+        run: cargo publish --dry-run --all-features

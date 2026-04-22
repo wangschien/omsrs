@@ -95,6 +95,16 @@ v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics) and a 10
 
 ### v0.3 async matching engines + order lifecycle
 
+The quickstart below uses `#[tokio::main]` so the async APIs can
+`.await`. `tokio` is **not** an `omsrs` production dependency —
+consumers bring their own runtime:
+
+```toml
+[dependencies]
+omsrs = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
 ```rust
 use std::sync::Arc;
 use omsrs::{AsyncVirtualBroker, AsyncCompoundOrder, AsyncOrderStrategy};
