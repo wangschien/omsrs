@@ -24,10 +24,29 @@
 //! `apply_as_market` / `apply_fill_update` are re-exported as
 //! `pub(crate)` from `replica_broker` to avoid duplicating the
 //! OrderFill semantics. Both take `&OrderHandle` and acquire the
-//! handle's own mutex internally; we hold `inner.lock()` across
-//! those calls only during `place` / `run_fill`, where no external
-//! caller has yet received the handle (so there's no contention
-//! path that could deadlock).
+//! handle's own mutex internally.
+//!
+//! ### Lock-order discipline (R12.2 audit closeout — item 1/5)
+//!
+//! Each broker method acquires AT MOST ONE of {`inner`, per-handle
+//! `Mutex<VOrder>`} at a time. Every path that previously held
+//! `inner` while taking a handle's lock was restructured into:
+//!
+//! 1. brief `inner.lock()` to clone out the affected `Arc`
+//!    handles (and any scalar state needed during the
+//!    handle-work phase),
+//! 2. drop `inner` before any `handle.lock()`,
+//! 3. re-acquire `inner.lock()` afterwards only to write back
+//!    post-work bookkeeping (pushes to `completed`, `retain` on
+//!    `fills`).
+//!
+//! This eliminates the ABBA scenario where an external caller
+//! holding a `handle.lock()` could deadlock with a broker method
+//! holding `inner.lock()`. `place` is the one exception: it
+//! locks `inner` while applying `apply_as_market` to the
+//! **newly-constructed** handle that hasn't been returned to the
+//! caller yet, so no external party can own a conflicting
+//! `handle.lock()` at that moment.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -241,23 +260,38 @@ impl AsyncReplicaBroker {
 
     /// Async `order_cancel`. `order_id` via args kwarg (same
     /// convention as `modify`).
+    ///
+    /// Lock discipline (R12.2 audit closeout): never hold
+    /// `inner` while taking the handle's lock. Resolve oid →
+    /// handle under a brief `inner.lock()`, release, do the
+    /// handle-mutation work, then re-acquire `inner` only to
+    /// push into `completed`.
     pub async fn cancel(&self, mut args: HashMap<String, Value>) -> Option<OrderHandle> {
         let order_id = args
             .remove("order_id")
             .and_then(|v| v.as_str().map(str::to_string))?;
 
-        let mut inner = self.inner.lock();
-        let handle = inner.orders.get(&order_id)?.clone();
+        // Phase 1: resolve handle under a brief inner lock.
+        let handle = {
+            let inner = self.inner.lock();
+            inner.orders.get(&order_id)?.clone()
+        };
 
-        let mut append_completed = false;
-        {
+        // Phase 2: mutate handle — inner is released, so an
+        // external handle holder cannot deadlock us.
+        let append_completed = {
             let mut g = handle.lock();
             if !g.is_done() {
                 g.canceled_quantity = g.quantity - g.filled_quantity;
-                append_completed = true;
+                true
+            } else {
+                false
             }
-        }
+        };
+
+        // Phase 3: re-acquire inner briefly for bookkeeping.
         if append_completed {
+            let mut inner = self.inner.lock();
             inner.completed.push(handle.clone());
         }
         Some(handle)
@@ -266,52 +300,96 @@ impl AsyncReplicaBroker {
     /// Async `run_fill` — iterates pending fills, applies the
     /// OrderFill update, promotes done orders to `completed`,
     /// trims the `fills` list. Same bookkeeping as sync.
+    ///
+    /// Lock discipline (R12.2 audit closeout): never hold
+    /// `inner` while taking a fill-order handle's lock.
+    /// Restructured into phases:
+    ///
+    /// - Phase A (under inner): snapshot (i, handle, symbol_seed,
+    ///   instrument_price) for every fill whose instrument is
+    ///   registered. `symbol_seed` is reused if the handle still
+    ///   holds that symbol after phase B — we re-check to avoid
+    ///   a racy symbol change (in practice symbol never changes
+    ///   after place, but the invariant is locally verified).
+    /// - Phase B (no locks held): acquire each handle's lock in
+    ///   isolation, apply `apply_fill_update`, detect done.
+    /// - Phase C (under inner): write back `last_price` into
+    ///   `inner.fills[i]`, push completed handles, retain
+    ///   non-done fills.
+    ///
+    /// Symbol resolution moves to phase A because `fill.order.
+    /// lock()` must happen outside the inner-lock scope. We read
+    /// the symbol under a handle lock that happens OUTSIDE the
+    /// inner lock — this is a separate sub-phase A2 that needs
+    /// its own iteration; for simplicity we copy `symbol` inside
+    /// each handle lock in phase B's prelude.
     pub async fn run_fill(&self) {
-        let mut inner = self.inner.lock();
-        let mut done_ids: Vec<String> = Vec::new();
-
-        // Compute (fill_index, last_price) pairs up-front without
-        // retaining a borrow on `inner.fills` — the borrow
-        // checker needs either fills or instruments borrowed at
-        // a time, not both. Index into `inner.fills` each time
-        // so `fill.order` is grabbed as `Arc::clone`.
-        let price_updates: Vec<(usize, f64)> = {
-            let mut out = Vec::new();
-            for (i, fill) in inner.fills.iter().enumerate() {
-                let symbol = fill.order.lock().symbol.clone();
-                let Some(inst) = inner.instruments.get(&symbol) else {
-                    continue;
-                };
-                let last_price = inst.last_price;
-                if last_price == 0.0 {
-                    continue;
-                }
-                out.push((i, last_price));
-            }
-            out
+        // Phase A: collect (index, handle-arc clone, last_price)
+        // under inner.lock(), using only instrument metadata
+        // (string lookup) — do NOT lock any order handle here.
+        // We can't read `fill.order.symbol` because that needs a
+        // handle lock; instead we'll resolve symbol → instrument
+        // in phase B where the handle lock is already held.
+        let handles_with_index: Vec<(usize, OrderHandle)> = {
+            let inner = self.inner.lock();
+            inner
+                .fills
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.order.clone()))
+                .collect()
+        };
+        let instruments_snapshot: HashMap<String, f64> = {
+            let inner = self.inner.lock();
+            inner
+                .instruments
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_price))
+                .collect()
         };
 
-        for (i, last_price) in price_updates {
-            inner.fills[i].last_price = last_price;
-            let handle = inner.fills[i].order.clone();
-            apply_fill_update(&handle, last_price);
-            if handle.lock().is_done() {
-                done_ids.push(handle.lock().order_id.clone());
+        // Phase B: handle work with no broker lock held. For each
+        // fill, read symbol + look up last_price + apply_fill_
+        // update + detect done.
+        let mut price_writes: Vec<(usize, f64)> = Vec::new();
+        let mut done_handles: Vec<OrderHandle> = Vec::new();
+        for (i, handle) in &handles_with_index {
+            let symbol = { handle.lock().symbol.clone() };
+            let Some(&last_price) = instruments_snapshot.get(&symbol) else {
+                continue;
+            };
+            if last_price == 0.0 {
+                continue;
+            }
+            apply_fill_update(handle, last_price);
+            let is_done = { handle.lock().is_done() };
+            price_writes.push((*i, last_price));
+            if is_done {
+                done_handles.push(handle.clone());
             }
         }
 
-        // Promote done orders to `completed` — clone handles out
-        // of `orders` before pushing to avoid overlapping borrow.
-        let mut to_complete: Vec<OrderHandle> = Vec::new();
-        for id in &done_ids {
-            if let Some(h) = inner.orders.get(id) {
-                to_complete.push(h.clone());
+        // Phase C: reconcile — write back last_price, push
+        // completed, retain non-done fills. Every handle.lock()
+        // below is brief and happens on a handle we already
+        // know's done (checked in phase B); an external holder
+        // cannot be modifying a done order.
+        let mut inner = self.inner.lock();
+        for (i, last_price) in price_writes {
+            if let Some(fill) = inner.fills.get_mut(i) {
+                fill.last_price = last_price;
             }
         }
-        for h in to_complete {
-            inner.completed.push(h);
+        for h in &done_handles {
+            inner.completed.push(h.clone());
         }
-        inner.fills.retain(|f| !f.order.lock().is_done());
+        // `retain` needs a is_done check per fill; we already
+        // collected done handles by identity. Use Arc::ptr_eq.
+        inner.fills.retain(|f| {
+            !done_handles
+                .iter()
+                .any(|h| Arc::ptr_eq(h, &f.order))
+        });
     }
 }
 

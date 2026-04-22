@@ -37,7 +37,7 @@ libtest-mimic = "0.7"
 toml = "0.8"
 # R11.2: async parity harness uses #[tokio::test] to mirror the sync
 # R4 Paper test_base suite against AsyncPaper.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "rt"] }
 
 [[test]]
 name = "parity"

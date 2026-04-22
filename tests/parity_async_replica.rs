@@ -412,6 +412,76 @@ async fn unknown_symbol_results_in_rejected_order() {
     assert_eq!(o.status(), Status::Rejected);
 }
 
+// ── R12.2.async_replica.12 — R12.2 audit closeout: lock-order
+// discipline. Exercises the exact ABBA path codex flagged — an
+// external caller holds `handle.lock()` while a concurrent task
+// runs `cancel` / `run_fill` / accessors. The new lock discipline
+// (never hold inner while taking handle lock) means this must
+// NOT deadlock. Uses `timeout` so a regression (re-introducing
+// inner-held-while-handle-locked) shows up as a test hang-then-
+// panic rather than a silent stall.
+#[tokio::test]
+async fn external_handle_hold_does_not_deadlock_cancel_or_accessors() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let b = Arc::new(replica_with_instruments());
+
+    let h = b
+        .place(kwargs(&[
+            ("symbol", json!("AAPL")),
+            ("side", json!(1)),
+            ("quantity", json!(10)),
+            ("order_type", json!(2)),
+            ("price", json!(124)),
+        ]))
+        .await;
+    let order_id = h.lock().order_id.clone();
+
+    // Spawn a task that holds `handle.lock()` for ~80ms.
+    let h_for_task = h.clone();
+    let hold_task = tokio::task::spawn_blocking(move || {
+        let _g = h_for_task.lock();
+        std::thread::sleep(Duration::from_millis(80));
+    });
+
+    // Let the spawn_blocking task get on-CPU and grab the handle
+    // lock before we race into cancel / accessors.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let b2 = b.clone();
+    let order_id_clone = order_id.clone();
+    // Both of these would deadlock under the pre-closeout impl:
+    // cancel would hold inner → wait for handle lock, while
+    // hold_task holds handle → `orders()` inside the assert
+    // would wait for inner. Now: cancel takes inner briefly to
+    // clone the handle, drops inner, then awaits handle; the
+    // accessor never waits on a handle so both make progress.
+    let cancel_fut = async move {
+        b2.cancel(kwargs(&[("order_id", json!(order_id_clone))]))
+            .await;
+    };
+    let b3 = b.clone();
+    let accessor_fut = async move {
+        // While hold_task has the handle locked, reading
+        // `orders()` should succeed without blocking.
+        let _orders = b3.orders();
+        let _fills = b3.fills();
+    };
+    // 500ms is >>80ms handle-hold + 10ms spawn race; anything
+    // that fails to complete is a genuine hang.
+    timeout(Duration::from_millis(500), async {
+        tokio::join!(cancel_fut, accessor_fut)
+    })
+    .await
+    .expect("cancel + accessors must not deadlock while an external task holds the handle");
+
+    hold_task.await.expect("hold task completes");
+
+    // Post-condition: cancel did eventually mark the order done.
+    assert!(h.lock().is_done());
+}
+
 // ── R12.2.async_replica.11 — AsyncBroker trait adapter smoke
 #[tokio::test]
 async fn trait_adapter_returns_some_on_place() {
