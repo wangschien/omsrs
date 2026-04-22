@@ -8,7 +8,16 @@ Status: PROPOSED — awaiting codex v2 audit before kickoff.
 - **v1 (2026-04-22 initial)**: NACKed by codex plan audit
   (`docs/audit-R12-plan-codex-result.md`) for factual errors
   about the current codebase.
-- **v2 (2026-04-22 this doc)**: addresses every codex concern.
+- **v3 (2026-04-22 this doc)**: v2 audit returned narrow NACK
+  on two CI-coverage / publish-hygiene items. Added:
+  1. `--all-targets` to clippy, `--all-features` to `cargo doc`
+     in §R12.4 CI block
+  2. Explicit "clean registry consumer check" as §R12.5 step 3,
+     before pbot migration. Risk table + acceptance gate
+     updated.
+  No technical disagreement with v2 audit — both items were
+  real gaps, fixed as requested.
+- **v2 (2026-04-22)**: addresses every codex round-1 concern.
   Key deltas from v1:
   1. R12.2 is now "async port of the standalone
      `ReplicaBroker` matching engine" — not a primary/replica
@@ -363,12 +372,19 @@ cargo search omsrs
   ```yaml
   - run: cargo build --all-features
   - run: cargo test --all-features
-  - run: cargo clippy --all-features -- -D warnings
+  - run: cargo clippy --all-features --all-targets -- -D warnings
   - run: cargo fmt --check
-  - run: cargo doc --no-deps --lib
+  - run: cargo doc --no-deps --lib --all-features
     env:
       RUSTDOCFLAGS: "-D warnings"
   ```
+  Flag rationale (v2 audit closeout):
+  - `--all-targets` on clippy so test / bench / example
+    warnings are caught alongside lib warnings (without it,
+    `#[cfg(test)]` modules get a pass).
+  - `--all-features` on `cargo doc` so feature-gated items
+    (`persistence`) render; otherwise docs.rs could build
+    fine and still miss links the published docs will show.
   Matrix: stable + MSRV (1.78).
 - `release.yml`: on tag push `v*`, `cargo publish` using
   `CRATES_IO_TOKEN` secret.
@@ -402,7 +418,33 @@ additions.)
      `cargo publish`.
    - Verify docs.rs.
 
-3. **pbot migration** (depends on BOTH 1 and 2):
+3. **Clean registry consumer check** (v2 audit closeout — hard
+   predecessor to pbot migration):
+
+   Publish-success on crates.io does not prove the
+   published manifest is complete. A path dep can silently
+   satisfy deps that the registry version omits (forgotten
+   `pub use`, a feature gate wired only in the workspace
+   `Cargo.toml`, an accidentally unpublished sibling crate).
+   Catch this before touching pbot.
+
+   Steps:
+   - In a throwaway directory, `cargo new --bin registry-check
+     && cd registry-check`.
+   - `Cargo.toml` declares `omsrs = "0.3"` +
+     `polymarket-kernel = "<pub-version>"` from the registry
+     (no `[patch]`, no `path =`).
+   - `src/main.rs` imports every top-level type pbot actually
+     uses: `omsrs::{AsyncBroker, AsyncPaper, Paper}`,
+     `polymarket_kernel::{calculate_quotes_logit, logit,
+     sigmoid}` (list mirrors pbot's `use` statements).
+   - `cargo build` must succeed. Any failure (missing export,
+     missing feature, missing transitive dep) is a
+     publish-regression that blocks the pbot commit — fix
+     omsrs or polymarket-kernel in a patch release, then
+     re-run this step.
+
+4. **pbot migration** (depends on 1, 2, AND 3):
    - `Cargo.toml`:
      ```diff
      - omsrs = { path = "../omsrs" }
@@ -438,6 +480,7 @@ additions.)
 | Shared-identity (`Arc::ptr_eq`) lost in AsyncReplicaBroker | `parking_lot::Mutex<Inner>` with Inner holding the shared HashMap<String, Arc<OrderHandle>>. Test pins `Arc::ptr_eq` exactly as sync does. |
 | crates.io name `omsrs` squatted | Check **before** writing R12.4 docs / README badges / pbot Cargo.toml. If squatted, fallback to `omsrs-core`; name change propagates to all downstream docs. |
 | `polymarket-kernel` docs.rs build fails on non-AVX-512 pool | Pre-test on a container with `target-feature=-avx512f`. Hard predecessor to pbot migration — if docs.rs fails, hold pbot. |
+| Registry build succeeds but a consumer build fails (forgotten `pub use`, feature wired only in workspace) | Clean-registry consumer check (§R12.5 step 3) — throwaway crate that depends on `omsrs = "0.3"` + `polymarket-kernel = "<ver>"` from registry and imports every type pbot uses. Must `cargo build` clean before the pbot migration commit. |
 | `save_to_db` blocks async runtime if `persistence` feature enabled | Documented caveat; pbot not affected. Future `spawn_blocking` wrapper is R13 scope. |
 
 ## Timing
@@ -480,6 +523,9 @@ Python codex; R12 is not blocked on anything.
 - [ ] R12.4 codex ACK
 - [ ] polymarket-kernel on crates.io + docs.rs builds
 - [ ] omsrs 0.3.0 on crates.io + docs.rs builds
+- [ ] Clean-registry consumer check passes (`cargo build` in
+      a throwaway crate using published `omsrs` +
+      `polymarket-kernel`, importing every type pbot uses)
 - [ ] pbot migration commit lands + 305-test suite green
 - [ ] No pre-R12 sync method signature changed (semver guard)
 
