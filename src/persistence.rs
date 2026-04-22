@@ -3,7 +3,8 @@
 //! `PersistenceHandle` + `Option<Arc<dyn PersistenceHandle>>` on `Order` and
 //! `CompoundOrder` are declared **unconditionally** so every call site on
 //! the Order lifecycle can no-op when `None`. The SQLite implementation
-//! lives behind `#[cfg(feature = "persistence")]` in [`sqlite`].
+//! lives behind `#[cfg(feature = "persistence")]` in the `sqlite`
+//! submodule (only visible when that feature is enabled).
 
 use std::collections::HashMap;
 
