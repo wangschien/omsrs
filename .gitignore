@@ -2,3 +2,5 @@
 /Cargo.lock
 *.swp
 .DS_Store
+# codex runtime scratch — created by codex:codex-rescue agents.
+.codex
