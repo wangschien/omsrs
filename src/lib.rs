@@ -1,6 +1,8 @@
 //! omsrs — Rust port of omspy's order-management core.
 
 pub mod async_broker;
+pub mod async_compound_order;
+pub mod async_order_strategy;
 pub mod async_replica_broker;
 pub mod async_virtual_broker;
 pub mod broker;
@@ -18,6 +20,8 @@ pub mod utils;
 pub mod virtual_broker;
 
 pub use async_broker::{AsyncBroker, AsyncSymbolTransformer};
+pub use async_compound_order::{AsyncCompoundOrder, AsyncRunFn};
+pub use async_order_strategy::AsyncOrderStrategy;
 pub use async_replica_broker::AsyncReplicaBroker;
 pub use async_virtual_broker::AsyncVirtualBroker;
 pub use broker::{rename, Broker};
