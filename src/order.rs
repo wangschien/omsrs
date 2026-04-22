@@ -948,6 +948,188 @@ impl Order {
     }
 }
 
+// ── R12.3a — async siblings of execute / modify / cancel ──────
+//
+// These are **new** methods. The existing sync `execute` / `modify`
+// / `cancel` signatures (`src/order.rs:559`, `:619`, `:775`) are
+// unchanged — see the R12 plan's "Hard constraint" block.
+//
+// Structural parity with sync: same field precedence, same
+// `attribs_to_copy` merge logic, same `lock.can_*` gates, same
+// `num_modifications` bookkeeping. The only differences are:
+//
+// 1. Broker handle is `&(dyn AsyncBroker + Send + Sync)` instead
+//    of `&dyn Broker`.
+// 2. `attribs_to_copy_<phase>()` and `order_place/modify/cancel`
+//    are `.await`ed.
+// 3. `save_to_db()` stays **sync** (it calls `rusqlite` under
+//    the persistence feature). Callers that enable persistence
+//    on the async path should wrap `execute_async` /
+//    `modify_async` in `tokio::task::spawn_blocking` or live
+//    with the blocking write; this is documented in the R12
+//    plan as an explicit non-goal (R13 would add async
+//    persistence). pbot does not enable persistence, so the
+//    caveat doesn't apply.
+impl Order {
+    /// Async sibling of [`Order::execute`]. Same semantics, same
+    /// early-return-if-completed-or-already-placed guard, same
+    /// kwarg precedence over defaults (default keys still win
+    /// over caller kwargs). Returns the resulting `order_id`.
+    pub async fn execute_async(
+        &mut self,
+        broker: &(dyn crate::async_broker::AsyncBroker + Send + Sync),
+        attribs_to_copy: Option<&[&str]>,
+        kwargs: HashMap<String, Value>,
+    ) -> Option<String> {
+        if self.is_complete() || self.order_id.is_some() {
+            return self.order_id.clone();
+        }
+        let broker_attribs = broker.attribs_to_copy_execute().await;
+        let other_args = self.get_other_args_from_attribs(broker_attribs, attribs_to_copy);
+
+        let mut order_args: HashMap<String, Value> = HashMap::new();
+        order_args.insert("symbol".into(), json!(self.symbol.to_uppercase()));
+        order_args.insert("side".into(), json!(self.side.to_uppercase()));
+        order_args.insert("order_type".into(), json!(self.order_type.to_uppercase()));
+        order_args.insert("quantity".into(), json!(self.quantity));
+        if let Some(p) = self.price {
+            order_args.insert("price".into(), decimal_value(p));
+        }
+        order_args.insert("trigger_price".into(), decimal_value(self.trigger_price));
+        order_args.insert("disclosed_quantity".into(), json!(self.disclosed_quantity));
+
+        for (k, v) in other_args {
+            order_args.insert(k, v);
+        }
+        let default_keys: HashSet<String> = [
+            "symbol",
+            "side",
+            "order_type",
+            "quantity",
+            "price",
+            "trigger_price",
+            "disclosed_quantity",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        for (k, v) in &kwargs {
+            if !default_keys.contains(k) {
+                order_args.insert(k.clone(), v.clone());
+            }
+        }
+
+        let ret = broker.order_place(order_args).await;
+        self.order_id = ret.clone();
+        if self.connection.is_some() {
+            // Sync persistence call — see module note above.
+            let _ = self.save_to_db();
+        }
+        ret
+    }
+
+    /// Async sibling of [`Order::modify`]. Same `lock.can_modify`
+    /// + `max_modifications` gates.
+    pub async fn modify_async(
+        &mut self,
+        broker: &(dyn crate::async_broker::AsyncBroker + Send + Sync),
+        attribs_to_copy: Option<&[&str]>,
+        kwargs: HashMap<String, Value>,
+    ) {
+        if !self.lock.can_modify() {
+            return;
+        }
+        let broker_attribs = broker.attribs_to_copy_modify().await;
+        let other_args = self.get_other_args_from_attribs(broker_attribs, attribs_to_copy);
+
+        let keys_for_broker: HashSet<&str> = [
+            "order_id",
+            "quantity",
+            "price",
+            "trigger_price",
+            "order_type",
+            "disclosed_quantity",
+        ]
+        .into_iter()
+        .collect();
+
+        let frozen = Self::frozen_attrs();
+        let mut args_to_add: HashMap<String, Value> = HashMap::new();
+        for (k, v) in &kwargs {
+            if frozen.contains(k.as_str()) {
+                continue;
+            }
+            let is_known = self.get_attr(k).is_some();
+            if is_known {
+                self.set_local_field(k, v);
+                if !keys_for_broker.contains(k.as_str()) {
+                    args_to_add.insert(k.clone(), v.clone());
+                }
+            } else {
+                args_to_add.insert(k.clone(), v.clone());
+            }
+        }
+
+        let mut order_args: HashMap<String, Value> = HashMap::new();
+        if let Some(ref oid) = self.order_id {
+            order_args.insert("order_id".into(), json!(oid));
+        }
+        order_args.insert("quantity".into(), json!(self.quantity));
+        if let Some(p) = self.price {
+            order_args.insert("price".into(), decimal_value(p));
+        }
+        order_args.insert("trigger_price".into(), decimal_value(self.trigger_price));
+        order_args.insert("order_type".into(), json!(self.order_type.to_uppercase()));
+        order_args.insert("disclosed_quantity".into(), json!(self.disclosed_quantity));
+
+        for (k, v) in other_args {
+            order_args.insert(k, v);
+        }
+        for (k, v) in &args_to_add {
+            order_args.insert(k.clone(), v.clone());
+        }
+        for key in &keys_for_broker {
+            if let Some(v) = kwargs.get(*key) {
+                order_args.insert((*key).to_string(), v.clone());
+            }
+        }
+
+        if self.num_modifications < self.max_modifications {
+            if self.order_id.is_none() {
+                return;
+            }
+            broker.order_modify(order_args).await;
+            self.num_modifications += 1;
+            if self.connection.is_some() {
+                let _ = self.save_to_db();
+            }
+        }
+    }
+
+    /// Async sibling of [`Order::cancel`]. Same `lock.can_cancel`
+    /// + `order_id.is_some()` gates.
+    pub async fn cancel_async(
+        &mut self,
+        broker: &(dyn crate::async_broker::AsyncBroker + Send + Sync),
+        attribs_to_copy: Option<&[&str]>,
+    ) {
+        if !self.lock.can_cancel() {
+            return;
+        }
+        if self.order_id.is_none() {
+            return;
+        }
+        let broker_attribs = broker.attribs_to_copy_cancel().await;
+        let other_args = self.get_other_args_from_attribs(broker_attribs, attribs_to_copy);
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert("order_id".into(), json!(self.order_id.clone().unwrap()));
+        for (k, v) in other_args {
+            args.insert(k, v);
+        }
+        broker.order_cancel(args).await;
+    }
+}
+
 fn decimal_value(d: Decimal) -> Value {
     // Broker kwargs: serialise Decimals as strings to preserve precision
     // through the dynamic kwarg map. Upstream pydantic emits floats, but
