@@ -19,7 +19,11 @@ use crate::simulation::{Instrument, OrderType, Side, VOrder, VOrderInit};
 
 pub type OrderHandle = Arc<Mutex<VOrder>>;
 
-#[derive(Debug)]
+/// R12.2 widens from bare `Debug` to `Clone`. `ReplicaFill` holds
+/// an `Arc<Mutex<VOrder>>` (cloneable) + an `f64`; cloning preserves
+/// shared identity exactly as the sync collections rely on. Needed
+/// for `AsyncReplicaBroker::fills()` owned-snapshot accessor.
+#[derive(Debug, Clone)]
 pub struct ReplicaFill {
     pub order: OrderHandle,
     pub last_price: f64,
@@ -217,7 +221,7 @@ impl ReplicaBroker {
     }
 }
 
-fn value_to_side(v: &Value) -> Option<Side> {
+pub(crate) fn value_to_side(v: &Value) -> Option<Side> {
     if let Some(n) = v.as_i64() {
         return match n {
             1 => Some(Side::Buy),
@@ -230,7 +234,7 @@ fn value_to_side(v: &Value) -> Option<Side> {
 
 /// `order_type` in the upstream `order_inputs` fixture is sent as an
 /// integer enum literal (1 / 2 / 3) — match those.
-fn value_to_order_type(v: &Value) -> Option<OrderType> {
+pub(crate) fn value_to_order_type(v: &Value) -> Option<OrderType> {
     if let Some(n) = v.as_i64() {
         return match n {
             1 => Some(OrderType::Market),
@@ -244,7 +248,7 @@ fn value_to_order_type(v: &Value) -> Option<OrderType> {
 
 /// Mirrors `OrderFill._as_market` on a shared order handle. LIMIT /
 /// STOP only — MARKET is a no-op until `apply_fill_update`.
-fn apply_as_market(handle: &OrderHandle, last_price: f64) {
+pub(crate) fn apply_as_market(handle: &OrderHandle, last_price: f64) {
     let mut g = handle.lock();
     match g.order_type {
         OrderType::Limit => {
@@ -277,7 +281,7 @@ fn apply_as_market(handle: &OrderHandle, last_price: f64) {
 }
 
 /// Mirrors `OrderFill.update()` on a shared order handle.
-fn apply_fill_update(handle: &OrderHandle, last_price: f64) {
+pub(crate) fn apply_fill_update(handle: &OrderHandle, last_price: f64) {
     let mut g = handle.lock();
     if g.is_done() {
         return;
