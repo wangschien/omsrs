@@ -531,14 +531,25 @@ impl Order {
                 if let Some(n) = v.as_i64() {
                     // Monotonic guard against out-of-order WS / poll
                     // events: cumulative `filled_quantity` must never
-                    // decrease, and never exceed `quantity`. Mirrors
-                    // omspy `ManagedOrder.update`
-                    // (`bot/execution/orders.py:96-119`) which clamps
-                    // delta = capped - filled_qty and only applies
-                    // positive deltas. Without this guard, a delayed
-                    // lower-numbered fill arriving after a higher one
-                    // corrupts cumulative state and produces phantom
-                    // inventory.
+                    // decrease, and never exceed `quantity`. Without
+                    // this, a delayed lower-numbered fill arriving
+                    // after a higher one rolls cumulative state
+                    // backwards and produces phantom inventory in
+                    // consumers that trust the post-update value.
+                    //
+                    // Note: this is a defense-in-depth STRICTER than
+                    // upstream omspy's contract. Upstream's
+                    // `Order.update` (`refs/omspy/omspy/order.py:
+                    // 446-458` in v0.16) is a plain `setattr` loop
+                    // with no clamp, so an out-of-order WS event
+                    // would silently regress its cumulative count.
+                    // omsrs adopts the bot/execution-side guard
+                    // (the `ManagedOrder.update` clamp at
+                    // `bot/execution/orders.py:96-119` is the
+                    // closest production reference) to make the
+                    // crate safe to drop into a maker bot without
+                    // re-implementing the same guard at every
+                    // consumer site.
                     let clamped = n.clamp(self.filled_quantity, self.quantity);
                     if clamped > self.filled_quantity {
                         self.filled_quantity = clamped;
@@ -760,14 +771,25 @@ impl Order {
                 if let Some(n) = v.as_i64() {
                     // Monotonic guard against out-of-order WS / poll
                     // events: cumulative `filled_quantity` must never
-                    // decrease, and never exceed `quantity`. Mirrors
-                    // omspy `ManagedOrder.update`
-                    // (`bot/execution/orders.py:96-119`) which clamps
-                    // delta = capped - filled_qty and only applies
-                    // positive deltas. Without this guard, a delayed
-                    // lower-numbered fill arriving after a higher one
-                    // corrupts cumulative state and produces phantom
-                    // inventory.
+                    // decrease, and never exceed `quantity`. Without
+                    // this, a delayed lower-numbered fill arriving
+                    // after a higher one rolls cumulative state
+                    // backwards and produces phantom inventory in
+                    // consumers that trust the post-update value.
+                    //
+                    // Note: this is a defense-in-depth STRICTER than
+                    // upstream omspy's contract. Upstream's
+                    // `Order.update` (`refs/omspy/omspy/order.py:
+                    // 446-458` in v0.16) is a plain `setattr` loop
+                    // with no clamp, so an out-of-order WS event
+                    // would silently regress its cumulative count.
+                    // omsrs adopts the bot/execution-side guard
+                    // (the `ManagedOrder.update` clamp at
+                    // `bot/execution/orders.py:96-119` is the
+                    // closest production reference) to make the
+                    // crate safe to drop into a maker bot without
+                    // re-implementing the same guard at every
+                    // consumer site.
                     let clamped = n.clamp(self.filled_quantity, self.quantity);
                     if clamped > self.filled_quantity {
                         self.filled_quantity = clamped;
