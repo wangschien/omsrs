@@ -529,7 +529,20 @@ impl Order {
             }
             "filled_quantity" => {
                 if let Some(n) = v.as_i64() {
-                    self.filled_quantity = n;
+                    // Monotonic guard against out-of-order WS / poll
+                    // events: cumulative `filled_quantity` must never
+                    // decrease, and never exceed `quantity`. Mirrors
+                    // omspy `ManagedOrder.update`
+                    // (`bot/execution/orders.py:96-119`) which clamps
+                    // delta = capped - filled_qty and only applies
+                    // positive deltas. Without this guard, a delayed
+                    // lower-numbered fill arriving after a higher one
+                    // corrupts cumulative state and produces phantom
+                    // inventory.
+                    let clamped = n.clamp(self.filled_quantity, self.quantity);
+                    if clamped > self.filled_quantity {
+                        self.filled_quantity = clamped;
+                    }
                 }
             }
             "pending_quantity" => {
@@ -745,7 +758,20 @@ impl Order {
             }
             "filled_quantity" => {
                 if let Some(n) = v.as_i64() {
-                    self.filled_quantity = n;
+                    // Monotonic guard against out-of-order WS / poll
+                    // events: cumulative `filled_quantity` must never
+                    // decrease, and never exceed `quantity`. Mirrors
+                    // omspy `ManagedOrder.update`
+                    // (`bot/execution/orders.py:96-119`) which clamps
+                    // delta = capped - filled_qty and only applies
+                    // positive deltas. Without this guard, a delayed
+                    // lower-numbered fill arriving after a higher one
+                    // corrupts cumulative state and produces phantom
+                    // inventory.
+                    let clamped = n.clamp(self.filled_quantity, self.quantity);
+                    if clamped > self.filled_quantity {
+                        self.filled_quantity = clamped;
+                    }
                 }
             }
             "pending_quantity" => {
@@ -807,7 +833,52 @@ impl Order {
             return false;
         };
         let row = self.to_row();
-        handle.upsert_order(row).is_ok()
+        match handle.upsert_order(row) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[omsrs::order::save_to_db] persistence upsert failed: \
+                     order_id={:?} symbol={} err={:?}",
+                    self.order_id, self.symbol, e
+                );
+                false
+            }
+        }
+    }
+
+    /// Async wrapper for [`save_to_db`] that runs the (sync, blocking)
+    /// rusqlite call on a `tokio::task::spawn_blocking` worker so it
+    /// does not stall the runtime's I/O reactor.
+    ///
+    /// Use this from `execute_async` / `modify_async` / `update_async`
+    /// (any path called from inside a Tokio task). The sync
+    /// `save_to_db` remains the right call from non-async paths.
+    pub async fn save_to_db_async(&self) -> bool {
+        let Some(handle) = self.connection.clone() else {
+            return false;
+        };
+        let row = self.to_row();
+        let order_id = self.order_id.clone();
+        let symbol = self.symbol.clone();
+        match tokio::task::spawn_blocking(move || handle.upsert_order(row)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[omsrs::order::save_to_db_async] persistence upsert \
+                     failed: order_id={:?} symbol={} err={:?}",
+                    order_id, symbol, e
+                );
+                false
+            }
+            Err(join_err) => {
+                eprintln!(
+                    "[omsrs::order::save_to_db_async] spawn_blocking worker \
+                     panicked / canceled: order_id={:?} symbol={} err={}",
+                    order_id, symbol, join_err
+                );
+                false
+            }
+        }
     }
 
     fn to_row(&self) -> HashMap<String, Value> {
@@ -1022,8 +1093,13 @@ impl Order {
         let ret = broker.order_place(order_args).await;
         self.order_id = ret.clone();
         if self.connection.is_some() {
-            // Sync persistence call — see module note above.
-            let _ = self.save_to_db();
+            // Async persistence wrapper — runs the rusqlite call on
+            // `spawn_blocking` so the Tokio reactor isn't stalled.
+            // Errors are surfaced by `save_to_db_async` itself; the
+            // ack we don't actually consume right now (matches sync
+            // `execute()`'s behaviour for back-compat) but at least
+            // failures land on stderr instead of silently dropping.
+            let _ = self.save_to_db_async().await;
         }
         ret
     }
@@ -1101,7 +1177,8 @@ impl Order {
             broker.order_modify(order_args).await;
             self.num_modifications += 1;
             if self.connection.is_some() {
-                let _ = self.save_to_db();
+                // Async persistence wrapper — see `execute_async`.
+                let _ = self.save_to_db_async().await;
             }
         }
     }

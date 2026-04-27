@@ -292,7 +292,12 @@ impl AsyncReplicaBroker {
         // Phase 3: re-acquire inner briefly for bookkeeping.
         if append_completed {
             let mut inner = self.inner.lock();
-            inner.completed.push(handle.clone());
+            // Idempotent push — `run_fill` may have raced with this
+            // cancel and already promoted the same handle to
+            // `completed`. Without this guard, both code paths push
+            // the same `Arc<Mutex<VOrder>>` and downstream consumers
+            // see a duplicate completion. Match by Arc identity.
+            push_completed_unique(&mut inner.completed, &handle);
         }
         Some(handle)
     }
@@ -381,7 +386,12 @@ impl AsyncReplicaBroker {
             }
         }
         for h in &done_handles {
-            inner.completed.push(h.clone());
+            // Idempotent push — a concurrent `cancel` running
+            // between Phase A's release and Phase C's acquisition
+            // may have already pushed the same handle. Without the
+            // dedupe, downstream consumers see double-completed
+            // orders. Match by Arc identity.
+            push_completed_unique(&mut inner.completed, h);
         }
         // `retain` needs a is_done check per fill; we already
         // collected done handles by identity. Use Arc::ptr_eq.
@@ -390,6 +400,22 @@ impl AsyncReplicaBroker {
                 .iter()
                 .any(|h| Arc::ptr_eq(h, &f.order))
         });
+    }
+}
+
+/// Push `handle` into `completed` only if no existing entry shares
+/// the same Arc identity. Used by both `cancel` (Phase 3) and
+/// `run_fill` (Phase C) so a race between them — where one path's
+/// inner-lock release window overlaps the other's apply-and-promote
+/// — does not produce a duplicate completed entry.
+///
+/// The cost is `O(n)` per push, with `n = inner.completed.len()`.
+/// Acceptable because the broker is single-account paper-trading;
+/// sustained completed lists are short-lived (the consumer drains
+/// them per tick).
+fn push_completed_unique(completed: &mut Vec<OrderHandle>, handle: &OrderHandle) {
+    if !completed.iter().any(|c| Arc::ptr_eq(c, handle)) {
+        completed.push(handle.clone());
     }
 }
 

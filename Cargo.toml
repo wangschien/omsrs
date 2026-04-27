@@ -29,6 +29,12 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # Tiny, zero-runtime crate; added unconditionally so no feature gate is
 # required at consumer sites.
 async-trait = "0.1"
+# R12.5+ (deepseek F2 fix): `Order::save_to_db_async` uses
+# `tokio::task::spawn_blocking` to keep sync rusqlite calls off the
+# Tokio reactor thread. Only the `rt` feature is needed (no
+# multi-thread runtime spawn required for the helper itself —
+# consumers bring their own runtime). Kept narrow on purpose.
+tokio = { version = "1", features = ["rt"], default-features = false }
 
 [dev-dependencies]
 proptest = "1.4"
