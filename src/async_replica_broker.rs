@@ -199,7 +199,13 @@ impl AsyncReplicaBroker {
             g.canceled_quantity = g.quantity;
             g.pending_quantity = 0.0;
             drop(g);
-            inner.completed.push(handle.clone());
+            // Route through the dedupe helper for consistency with
+            // the cancel + run_fill paths. The unknown-symbol reject
+            // path is the only other place that promotes an order
+            // straight to `completed` — keep all promotions going
+            // through one chokepoint so future race scenarios can't
+            // silently bypass the Arc::ptr_eq check.
+            push_completed_unique(&mut inner.completed, &handle);
             return handle;
         }
 

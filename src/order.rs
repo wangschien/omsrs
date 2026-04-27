@@ -875,6 +875,15 @@ impl Order {
     /// Use this from `execute_async` / `modify_async` / `update_async`
     /// (any path called from inside a Tokio task). The sync
     /// `save_to_db` remains the right call from non-async paths.
+    ///
+    /// Failure modes (all return `false`, none panic):
+    ///   - no `connection` configured → no-op false (legacy parity).
+    ///   - no Tokio runtime detected → log + return false. Without
+    ///     this guard, `spawn_blocking` would call `Handle::current()`
+    ///     and panic synchronously on a non-runtime caller.
+    ///   - `JoinError` (panic / cancel inside the spawned worker) →
+    ///     log + return false.
+    ///   - `upsert_order` returned `Err` → log + return false.
     pub async fn save_to_db_async(&self) -> bool {
         let Some(handle) = self.connection.clone() else {
             return false;
@@ -882,6 +891,23 @@ impl Order {
         let row = self.to_row();
         let order_id = self.order_id.clone();
         let symbol = self.symbol.clone();
+
+        // Guard against missing runtime. `tokio::task::spawn_blocking`
+        // requires `Handle::current()` and panics synchronously if
+        // called outside a Tokio context. A consumer who imports omsrs
+        // without standing up a runtime would crash on the first
+        // async-path place — surface a clean false + log instead.
+        if tokio::runtime::Handle::try_current().is_err() {
+            eprintln!(
+                "[omsrs::order::save_to_db_async] no Tokio runtime in \
+                 scope — cannot offload sync rusqlite call. order_id={:?} \
+                 symbol={}. Caller must construct a Tokio runtime before \
+                 invoking async OMS paths.",
+                order_id, symbol,
+            );
+            return false;
+        }
+
         match tokio::task::spawn_blocking(move || handle.upsert_order(row)).await {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
