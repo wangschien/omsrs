@@ -4,6 +4,62 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-04-27
+
+**Correctness round** triggered by an independent OMS-layer
+audit. Four omsrs-internal fixes (F1, F2, F4, F6) plus two
+follow-up fixes from the codex re-audit (Q4, Q6).
+
+### Fixed
+
+- **F1 — `AsyncReplicaBroker::run_fill` × cancel race
+  (BLOCKING).** Phase B (no locks held) released the broker
+  inner-lock between `apply_fill_update` and Phase C's
+  promote-to-`completed`. A concurrent `cancel(oid)` could push
+  the same `Arc<Mutex<VOrder>>` into `inner.completed` twice.
+  Fix: new `push_completed_unique` helper using `Arc::ptr_eq`
+  for dedupe; every `completed` promotion routes through it
+  (cancel Phase 3, run_fill Phase C, and the unknown-symbol
+  reject path in `place`).
+- **F2 — sync `save_to_db` on Tokio worker (BLOCKING).**
+  `Order::execute_async` and `modify_async` called sync
+  rusqlite `save_to_db()` directly, stalling Tokio worker
+  threads on disk I/O. New `save_to_db_async` wraps
+  `upsert_order` in `tokio::task::spawn_blocking`. Guarded by
+  `Handle::try_current()` so consumers without a runtime get a
+  clean `false + log` instead of a synchronous panic. `tokio`
+  promoted from dev-dep to a regular dep with the narrow `rt`
+  feature only.
+- **F4 — silently swallowed persistence errors (HIGH).** Both
+  `save_to_db` (sync) and `save_to_db_async` now log to stderr
+  on `upsert_order` Err, on JoinError (panic / cancel), and on
+  missing-runtime. Caller contract still returns `bool` — but
+  failures are no longer invisible.
+- **F6 — non-monotonic `filled_quantity` on out-of-order
+  events (HIGH).** `Order.update`'s `set_from_value` /
+  `set_local_field` blindly assigned the incoming
+  `filled_quantity`, so a stale lower-numbered WS / poll
+  redelivery rolled cumulative state backwards. Fix: clamp to
+  `[self.filled_quantity, self.quantity]` and only write on
+  strict increase. NOTE: this is **stricter than upstream
+  omspy** — `refs/omspy/omspy/order.py:446-458` has no such
+  guard, but the unguarded behaviour is a real foot-gun for
+  any consumer ingesting concurrent fill streams.
+
+### Changed
+
+- `tokio` moved from `[dev-dependencies]` to `[dependencies]`
+  with `features = ["rt"], default-features = false`. Surface
+  is intentionally narrow; consumers bring their own runtime
+  as before.
+
+### Audit trail
+
+- Audit docs in `bot/docs/oms-deep-audit-2026-04-27-deepseek.md`
+  and `bot/docs/oms-3way-parity-2026-04-27-deepseek.md`.
+- Codex audit ACK'd `5e0fc8a + fb84c1f` round-1 (4 PASS,
+  Q4 + Q6 NACK) and `019a8ab` round-2 (7 PASS, ACK).
+
 ## [0.3.0] — 2026-04-22
 
 **R12 — async coverage completion.** Five sub-phases, each
