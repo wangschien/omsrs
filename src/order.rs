@@ -868,7 +868,7 @@ impl Order {
         }
     }
 
-    /// Async wrapper for [`save_to_db`] that runs the (sync, blocking)
+    /// Async wrapper for [`Self::save_to_db`] that runs the (sync, blocking)
     /// rusqlite call on a `tokio::task::spawn_blocking` worker so it
     /// does not stall the runtime's I/O reactor.
     ///

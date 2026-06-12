@@ -4,6 +4,16 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] — 2026-06-12
+
+### Fixed
+
+- Restore the declared Rust 1.78 MSRV by pinning dependencies away
+  from transitive edition-2024 crates and checking in `Cargo.lock`
+  for CI reproducibility.
+- Fix a broken rustdoc intra-doc link in `Order::save_to_db_async`
+  under `RUSTDOCFLAGS=-D warnings`.
+
 ## [0.3.2] — 2026-06-12
 
 ### Added
