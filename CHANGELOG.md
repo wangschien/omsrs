@@ -4,6 +4,25 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] — 2026-06-12
+
+### Added
+
+- `AsyncBroker::order_cancel_outcome` returns a typed
+  `CancelOutcome`, allowing async OMS callers to distinguish
+  confirmed cancels, accepted-but-unsettled paper cancels,
+  missing orders, terminal orders, venue rejections, transport
+  unknowns, and legacy opaque outcomes.
+
+### Fixed
+
+- `AsyncReplicaBroker` now reports cancel outcomes under the same
+  per-order lock that mutates cancellation state, closing the
+  cancel-vs-fill race where a filled order could be misreported as
+  canceled.
+- `AsyncVirtualBroker` now maps typed cancel outcomes structurally
+  instead of parsing its own error strings.
+
 ## [0.3.1] — 2026-04-27
 
 **Correctness round** triggered by an independent OMS-layer
