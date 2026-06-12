@@ -530,7 +530,7 @@ fn read_excused() -> Option<String> {
     ]
     .iter()
     .collect();
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => panic!("excused.toml read error: {e}"),

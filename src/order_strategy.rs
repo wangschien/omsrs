@@ -126,7 +126,7 @@ impl OrderStrategy {
     pub fn add(&mut self, mut compound: CompoundOrder) {
         compound.set_clock(self.clock.clone());
         if self.broker.is_some() && compound.broker.is_none() {
-            compound.broker = self.broker.clone();
+            compound.broker.clone_from(&self.broker);
         }
         self.orders.push(compound);
     }

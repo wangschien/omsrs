@@ -307,7 +307,7 @@ impl CompoundOrder {
     ) -> Result<String, CompoundError> {
         init.parent_id = Some(self.id.clone());
         if init.connection.is_none() {
-            init.connection = self.connection.clone();
+            init.connection.clone_from(&self.connection);
         }
         let idx = index.unwrap_or_else(|| self.get_next_index());
         if self.index.contains_key(&idx) {
@@ -341,7 +341,7 @@ impl CompoundOrder {
     ) -> Result<String, CompoundError> {
         order.parent_id = Some(self.id.clone());
         if order.connection.is_none() {
-            order.connection = self.connection.clone();
+            order.connection.clone_from(&self.connection);
         }
         if order.id.is_none() {
             order.id = Some(uuid::Uuid::new_v4().simple().to_string());

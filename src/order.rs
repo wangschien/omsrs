@@ -631,7 +631,7 @@ impl Order {
         }
 
         let ret = broker.order_place(order_args);
-        self.order_id = ret.clone();
+        self.order_id.clone_from(&ret);
         if self.connection.is_some() {
             let _ = self.save_to_db();
         }
@@ -1139,7 +1139,7 @@ impl Order {
         }
 
         let ret = broker.order_place(order_args).await;
-        self.order_id = ret.clone();
+        self.order_id.clone_from(&ret);
         if self.connection.is_some() {
             // Async persistence wrapper — runs the rusqlite call on
             // `spawn_blocking` so the Tokio reactor isn't stalled.
