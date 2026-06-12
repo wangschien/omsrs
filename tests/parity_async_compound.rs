@@ -57,10 +57,7 @@ impl AsyncMockBroker {
 impl AsyncBroker for AsyncMockBroker {
     async fn order_place(&self, args: HashMap<String, Value>) -> Option<String> {
         self.place_calls.lock().unwrap().push(args);
-        Some(format!(
-            "MOCK-{}",
-            self.place_calls.lock().unwrap().len()
-        ))
+        Some(format!("MOCK-{}", self.place_calls.lock().unwrap().len()))
     }
     async fn order_modify(&self, args: HashMap<String, Value>) {
         self.modify_calls.lock().unwrap().push(args);
@@ -169,7 +166,10 @@ async fn add_order_rejects_duplicate_index() {
             None,
         )
         .unwrap_err();
-    assert!(matches!(err, omsrs::compound_order::CompoundError::IndexAlreadyUsed(5)));
+    assert!(matches!(
+        err,
+        omsrs::compound_order::CompoundError::IndexAlreadyUsed(5)
+    ));
 }
 
 // ── R12.3b.async_compound.4 — positions / buy_qty / sell_qty

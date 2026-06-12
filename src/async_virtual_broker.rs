@@ -365,7 +365,9 @@ impl AsyncVirtualBroker {
             return BrokerReply::Order(Box::new(OrderResponse {
                 status: ResponseStatus::Failure,
                 timestamp: Some(now),
-                error_msg: Some("Found 1 validation errors; in field order_id Field required".into()),
+                error_msg: Some(
+                    "Found 1 validation errors; in field order_id Field required".into(),
+                ),
                 data: None,
             }));
         };
@@ -424,7 +426,9 @@ impl AsyncVirtualBroker {
             return BrokerReply::Order(Box::new(OrderResponse {
                 status: ResponseStatus::Failure,
                 timestamp: Some(now),
-                error_msg: Some("Found 1 validation errors; in field order_id Field required".into()),
+                error_msg: Some(
+                    "Found 1 validation errors; in field order_id Field required".into(),
+                ),
                 data: None,
             }));
         };

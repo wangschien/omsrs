@@ -38,8 +38,7 @@ use crate::persistence::PersistenceHandle;
 /// Analogue of sync `RunFn`. Strategy callbacks are kept **sync**
 /// (no I/O in the closure) per R12 plan's open-question #1
 /// resolution.
-pub type AsyncRunFn =
-    Arc<dyn Fn(&mut AsyncCompoundOrder, &HashMap<String, f64>) + Send + Sync>;
+pub type AsyncRunFn = Arc<dyn Fn(&mut AsyncCompoundOrder, &HashMap<String, f64>) + Send + Sync>;
 
 pub struct AsyncCompoundOrder {
     pub broker: Option<Arc<dyn AsyncBroker + Send + Sync>>,
@@ -422,7 +421,9 @@ impl AsyncCompoundOrder {
                     order.order_type = "MARKET".into();
                     order.price = None;
                     order.trigger_price = Decimal::ZERO;
-                    order.modify_async(broker.as_ref(), None, HashMap::new()).await;
+                    order
+                        .modify_async(broker.as_ref(), None, HashMap::new())
+                        .await;
                 } else if order.cancel_after_expiry {
                     order.cancel_async(broker.as_ref(), None).await;
                 }

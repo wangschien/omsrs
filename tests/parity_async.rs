@@ -382,8 +382,7 @@ async fn async_test_close_all_positions_symbol_transfomer() {
         ]),
     ]);
     let add: HashMap<String, Value> = kwargs(&[("variety", json!("regular"))]);
-    let transform: AsyncSymbolTransformer =
-        Arc::new(|s: &str| format!("nyse:{s}"));
+    let transform: AsyncSymbolTransformer = Arc::new(|s: &str| format!("nyse:{s}"));
     broker
         .close_all_positions(None, None, Some(&add), Some(transform))
         .await;

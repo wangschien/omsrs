@@ -341,10 +341,7 @@ async fn order_modify_failure_unknown_oid_and_failure_rate() {
     // order lookup.
     b.set_failure_rate(1.0).unwrap();
     let resp = b
-        .modify(kwargs(&[
-            ("order_id", json!(oid)),
-            ("price", json!(100)),
-        ]))
+        .modify(kwargs(&[("order_id", json!(oid)), ("price", json!(100))]))
         .await;
     assert_eq!(resp.as_order().unwrap().status, ResponseStatus::Failure);
 }
@@ -390,9 +387,7 @@ async fn order_cancel_success() {
         .order_id
         .clone();
 
-    let resp = b
-        .cancel(kwargs(&[("order_id", json!(oid))]))
-        .await;
+    let resp = b.cancel(kwargs(&[("order_id", json!(oid))])).await;
     let r = resp.as_order().unwrap();
     assert_eq!(r.status, ResponseStatus::Success);
     let d = r.data.as_ref().unwrap();
@@ -694,9 +689,7 @@ async fn trait_adapter_loses_rich_reply_but_preserves_semantics() {
     assert!(none_1.is_none());
 
     // Passthrough → None (no order_id on a passthrough reply).
-    let none_2 = broker
-        .order_place(kwargs(&[("response", json!({}))]))
-        .await;
+    let none_2 = broker.order_place(kwargs(&[("response", json!({}))])).await;
     assert!(none_2.is_none());
 }
 
@@ -748,7 +741,7 @@ async fn sync_async_reply_sequence_parity() {
             ("side", json!(-1)),
             ("price", json!(100)),
         ]),
-        HashMap::new(), // validation failure
+        HashMap::new(),                                 // validation failure
         kwargs(&[("response", json!({"echo": true}))]), // passthrough
         kwargs(&[
             ("symbol", json!("amzn")),

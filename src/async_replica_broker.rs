@@ -401,11 +401,9 @@ impl AsyncReplicaBroker {
         }
         // `retain` needs a is_done check per fill; we already
         // collected done handles by identity. Use Arc::ptr_eq.
-        inner.fills.retain(|f| {
-            !done_handles
-                .iter()
-                .any(|h| Arc::ptr_eq(h, &f.order))
-        });
+        inner
+            .fills
+            .retain(|f| !done_handles.iter().any(|h| Arc::ptr_eq(h, &f.order)));
     }
 }
 
