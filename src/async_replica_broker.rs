@@ -55,7 +55,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::async_broker::AsyncBroker;
+use crate::async_broker::{order_id_from_args, AsyncBroker, CancelOutcome};
 use crate::replica_broker::{
     apply_as_market, apply_fill_update, value_to_order_type, value_to_side, OrderHandle,
     ReplicaFill,
@@ -445,5 +445,37 @@ impl AsyncBroker for AsyncReplicaBroker {
 
     async fn order_cancel(&self, args: HashMap<String, Value>) {
         let _ = self.cancel(args).await;
+    }
+
+    async fn order_cancel_outcome(&self, args: HashMap<String, Value>) -> CancelOutcome {
+        let requested_order_id = order_id_from_args(&args);
+        let Some(order_id) = args
+            .get("order_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return CancelOutcome::rejected(requested_order_id, "order_id field required");
+        };
+
+        let handle = {
+            let inner = self.inner.lock();
+            match inner.orders.get(&order_id) {
+                Some(handle) => handle.clone(),
+                None => return CancelOutcome::not_found(Some(order_id)),
+            }
+        };
+
+        let canceled_order_id = {
+            let mut g = handle.lock();
+            if g.is_done() {
+                return CancelOutcome::already_terminal(Some(g.order_id.clone()));
+            }
+            g.canceled_quantity = g.quantity - g.filled_quantity;
+            g.order_id.clone()
+        };
+
+        let mut inner = self.inner.lock();
+        push_completed_unique(&mut inner.completed, &handle);
+        CancelOutcome::canceled(Some(canceled_order_id))
     }
 }

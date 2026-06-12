@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use omsrs::async_broker::{AsyncBroker, AsyncSymbolTransformer};
+use omsrs::async_broker::{AsyncBroker, AsyncSymbolTransformer, CancelStatus};
 use omsrs::broker::rename;
 use omsrs::AsyncPaper;
 use serde_json::{json, Value};
@@ -163,6 +163,35 @@ async fn async_test_dummy_broker_values() {
     broker
         .order_cancel(kwargs(&[("order_id", json!(1234))]))
         .await;
+}
+
+#[tokio::test]
+async fn async_test_default_cancel_outcome_is_unknown_after_legacy_cancel() {
+    let broker = AsyncDummyBroker::new();
+    let outcome = broker
+        .order_cancel_outcome(kwargs(&[("order_id", json!(1234))]))
+        .await;
+
+    assert_eq!(broker.cancel_calls().len(), 1);
+    assert_eq!(outcome.status, CancelStatus::Unknown);
+    assert_eq!(outcome.order_id.as_deref(), Some("1234"));
+}
+
+#[tokio::test]
+async fn async_test_paper_cancel_outcome_is_accepted() {
+    let broker = AsyncPaper::new();
+    let outcome = broker
+        .order_cancel_outcome(kwargs(&[("order_id", json!("paper-1"))]))
+        .await;
+
+    assert_eq!(broker.cancel_call_count(), 1);
+    assert_eq!(outcome.status, CancelStatus::Accepted);
+    assert_eq!(outcome.order_id.as_deref(), Some("paper-1"));
+
+    let invalid = broker.order_cancel_outcome(HashMap::new()).await;
+    assert_eq!(broker.cancel_call_count(), 2);
+    assert_eq!(invalid.status, CancelStatus::Rejected);
+    assert_eq!(invalid.order_id, None);
 }
 
 #[tokio::test]

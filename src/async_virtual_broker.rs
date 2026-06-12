@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde_json::Value;
 
-use crate::async_broker::AsyncBroker;
+use crate::async_broker::{order_id_from_args, AsyncBroker, CancelOutcome};
 use crate::clock::{clock_system_default, Clock};
 use crate::simulation::{
     OrderResponse, OrderType, ResponseStatus, Side, Status, Ticker, VOrder, VOrderInit, VUser, OHLC,
@@ -530,6 +530,47 @@ impl AsyncBroker for AsyncVirtualBroker {
 
     async fn order_cancel(&self, args: HashMap<String, Value>) {
         let _ = self.cancel(args).await;
+    }
+
+    async fn order_cancel_outcome(&self, args: HashMap<String, Value>) -> CancelOutcome {
+        let mut args = args;
+        let requested_order_id = order_id_from_args(&args);
+        if let Some(raw) = args.remove("response") {
+            return CancelOutcome::unknown(requested_order_id, "passthrough cancel response")
+                .with_raw(raw);
+        }
+
+        let Some(order_id) = args
+            .get("order_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return CancelOutcome::rejected(
+                requested_order_id,
+                "Found 1 validation errors; in field order_id Field required",
+            );
+        };
+
+        let mut inner = self.inner.lock();
+        let fr = inner.failure_rate;
+        let r: f64 = inner.rng.gen();
+        if r < fr {
+            return CancelOutcome::rejected(Some(order_id), "Unexpected error");
+        }
+
+        let Some(order) = inner.orders.get_mut(&order_id) else {
+            return CancelOutcome::not_found(Some(order_id));
+        };
+        // The typed OMS API treats any terminal state as terminal,
+        // including orders that legacy `cancel` would accept again
+        // for upstream parity.
+        if order.is_done() {
+            return CancelOutcome::already_terminal(Some(order.order_id.clone()));
+        }
+
+        order.canceled_quantity = order.quantity - order.filled_quantity;
+        order.pending_quantity = 0.0;
+        CancelOutcome::canceled(Some(order.order_id.clone()))
     }
 }
 

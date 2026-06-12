@@ -19,7 +19,9 @@ pub mod simulation;
 pub mod utils;
 pub mod virtual_broker;
 
-pub use async_broker::{AsyncBroker, AsyncSymbolTransformer};
+pub use async_broker::{
+    order_id_from_args, AsyncBroker, AsyncSymbolTransformer, CancelOutcome, CancelStatus,
+};
 pub use async_compound_order::{AsyncCompoundOrder, AsyncRunFn};
 pub use async_order_strategy::AsyncOrderStrategy;
 pub use async_replica_broker::AsyncReplicaBroker;

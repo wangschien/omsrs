@@ -39,6 +39,104 @@ pub type AsyncSymbolTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 use crate::models::BasicPosition;
 use crate::utils::{create_basic_positions_from_orders_dict, dict_filter, OrderRecord};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CancelStatus {
+    /// Venue confirmed the order is canceled / cancel took effect.
+    Canceled,
+    /// Venue accepted the cancel request, but final order state still
+    /// needs follow-up reconciliation.
+    Accepted,
+    /// Venue reports no live or known order for the supplied id.
+    NotFound,
+    /// Venue reports the order was already in a terminal state.
+    AlreadyTerminal,
+    /// Venue rejected the cancel request; caller should assume the
+    /// order may still be live unless another source proves terminal.
+    Rejected,
+    /// Transport failed before the venue outcome was known.
+    TransportUnknown,
+    /// Legacy adapter or opaque response; caller must reconcile.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct CancelOutcome {
+    pub status: CancelStatus,
+    pub order_id: Option<String>,
+    pub message: Option<String>,
+    pub raw: Option<Value>,
+}
+
+impl CancelOutcome {
+    pub fn new(status: CancelStatus) -> Self {
+        Self {
+            status,
+            order_id: None,
+            message: None,
+            raw: None,
+        }
+    }
+
+    pub fn with_order_id(mut self, order_id: Option<String>) -> Self {
+        self.order_id = order_id;
+        self
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    pub fn with_raw(mut self, raw: Value) -> Self {
+        self.raw = Some(raw);
+        self
+    }
+
+    pub fn canceled(order_id: Option<String>) -> Self {
+        Self::new(CancelStatus::Canceled).with_order_id(order_id)
+    }
+
+    pub fn accepted(order_id: Option<String>) -> Self {
+        Self::new(CancelStatus::Accepted).with_order_id(order_id)
+    }
+
+    pub fn not_found(order_id: Option<String>) -> Self {
+        Self::new(CancelStatus::NotFound).with_order_id(order_id)
+    }
+
+    pub fn already_terminal(order_id: Option<String>) -> Self {
+        Self::new(CancelStatus::AlreadyTerminal).with_order_id(order_id)
+    }
+
+    pub fn rejected(order_id: Option<String>, message: impl Into<String>) -> Self {
+        Self::new(CancelStatus::Rejected)
+            .with_order_id(order_id)
+            .with_message(message)
+    }
+
+    pub fn transport_unknown(order_id: Option<String>, message: impl Into<String>) -> Self {
+        Self::new(CancelStatus::TransportUnknown)
+            .with_order_id(order_id)
+            .with_message(message)
+    }
+
+    pub fn unknown(order_id: Option<String>, message: impl Into<String>) -> Self {
+        Self::new(CancelStatus::Unknown)
+            .with_order_id(order_id)
+            .with_message(message)
+    }
+}
+
+pub fn order_id_from_args(args: &HashMap<String, Value>) -> Option<String> {
+    match args.get("order_id")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Async market-maker / order broker surface. Semantically identical
 /// to [`crate::Broker`]; methods are `async fn` so implementations can
 /// call async venue SDKs without a sync-over-async bridge.
@@ -71,6 +169,21 @@ pub trait AsyncBroker: Send + Sync {
     async fn order_place(&self, args: HashMap<String, Value>) -> Option<String>;
     async fn order_modify(&self, args: HashMap<String, Value>);
     async fn order_cancel(&self, args: HashMap<String, Value>);
+
+    /// Typed cancellation outcome for live OMS callers that must
+    /// distinguish confirmed cancel, venue rejection, not-found, and
+    /// transport-unknown states. This is additive over the legacy
+    /// `order_cancel` method: old implementors remain source-compatible,
+    /// but the default result is intentionally `Unknown` after delegating
+    /// to `order_cancel`, so fail-closed consumers can trigger reconcile.
+    async fn order_cancel_outcome(&self, args: HashMap<String, Value>) -> CancelOutcome {
+        let order_id = order_id_from_args(&args);
+        self.order_cancel(args).await;
+        CancelOutcome::unknown(
+            order_id,
+            "legacy AsyncBroker::order_cancel does not report cancel outcome",
+        )
+    }
 
     async fn attribs_to_copy_execute(&self) -> Option<Vec<String>> {
         None

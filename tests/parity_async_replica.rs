@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use omsrs::async_broker::AsyncBroker;
+use omsrs::async_broker::{AsyncBroker, CancelStatus};
 use omsrs::async_replica_broker::AsyncReplicaBroker;
 use omsrs::replica_broker::OrderHandle;
 use omsrs::simulation::{Instrument, Status};
@@ -371,6 +371,57 @@ async fn order_cancel_is_idempotent() {
     assert_eq!(b.fills().len(), 1);
     b.run_fill().await;
     assert_eq!(b.fills().len(), 0);
+}
+
+#[tokio::test]
+async fn order_cancel_outcome_maps_replica_states() {
+    let b = replica_with_instruments();
+    let order = b
+        .place(kwargs(&[
+            ("symbol", json!("AAPL")),
+            ("side", json!(1)),
+            ("quantity", json!(10)),
+            ("order_type", json!(2)),
+            ("price", json!(124)),
+        ]))
+        .await;
+    let order_id = order.lock().order_id.clone();
+
+    let outcome = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(order_id.clone()))]))
+        .await;
+    assert_eq!(outcome.status, CancelStatus::Canceled);
+    assert_eq!(outcome.order_id.as_deref(), Some(order_id.as_str()));
+
+    let missing = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!("missing"))]))
+        .await;
+    assert_eq!(missing.status, CancelStatus::NotFound);
+    assert_eq!(missing.order_id.as_deref(), Some("missing"));
+
+    let terminal = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(order_id.clone()))]))
+        .await;
+    assert_eq!(terminal.status, CancelStatus::AlreadyTerminal);
+    assert_eq!(terminal.order_id.as_deref(), Some(order_id.as_str()));
+
+    let invalid = b.order_cancel_outcome(HashMap::new()).await;
+    assert_eq!(invalid.status, CancelStatus::Rejected);
+    assert_eq!(invalid.order_id, None);
+}
+
+#[tokio::test]
+async fn order_cancel_outcome_reports_filled_order_as_terminal() {
+    let (b, handles) = replica_with_orders().await;
+    let filled_order_id = handles[0].lock().order_id.clone();
+
+    b.run_fill().await;
+
+    let outcome = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(filled_order_id.clone()))]))
+        .await;
+    assert_eq!(outcome.status, CancelStatus::AlreadyTerminal);
+    assert_eq!(outcome.order_id.as_deref(), Some(filled_order_id.as_str()));
 }
 
 // ── R12.2.async_replica.10 — unknown symbol → REJECTED

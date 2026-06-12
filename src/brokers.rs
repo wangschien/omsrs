@@ -121,7 +121,7 @@ impl Broker for Paper {
 
 use async_trait::async_trait;
 
-use crate::async_broker::AsyncBroker;
+use crate::async_broker::{order_id_from_args, AsyncBroker, CancelOutcome};
 
 /// Async counterpart to [`Paper`] that implements
 /// [`crate::AsyncBroker`]. Call bodies are sync (lock + push); the
@@ -196,6 +196,15 @@ impl AsyncBroker for AsyncPaper {
 
     async fn order_cancel(&self, args: HashMap<String, Value>) {
         self.cancel_calls.lock().unwrap().push(args);
+    }
+
+    async fn order_cancel_outcome(&self, args: HashMap<String, Value>) -> CancelOutcome {
+        let order_id = order_id_from_args(&args);
+        self.order_cancel(args).await;
+        match order_id {
+            Some(order_id) => CancelOutcome::accepted(Some(order_id)),
+            None => CancelOutcome::rejected(None, "order_id field required"),
+        }
     }
 
     async fn orders(&self) -> Vec<HashMap<String, Value>> {

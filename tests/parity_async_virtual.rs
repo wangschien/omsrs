@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use omsrs::async_broker::AsyncBroker;
+use omsrs::async_broker::{AsyncBroker, CancelStatus};
 use omsrs::async_virtual_broker::AsyncVirtualBroker;
 use omsrs::clock::{Clock, MockClock};
 use omsrs::simulation::{ResponseStatus, Side, Status, Ticker, VUser};
@@ -400,6 +400,112 @@ async fn order_cancel_success() {
     assert_eq!(d.filled_quantity, 0.0);
     assert_eq!(d.pending_quantity, 0.0);
     assert_eq!(d.status(), Status::Canceled);
+}
+
+#[tokio::test]
+async fn order_cancel_outcome_success_maps_to_canceled() {
+    let b = basic_broker();
+    b.set_failure_rate(0.0).unwrap();
+    let reply = b
+        .place(kwargs(&[
+            ("symbol", json!("dow")),
+            ("side", json!(1)),
+            ("quantity", json!(50)),
+        ]))
+        .await;
+    let oid = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
+
+    let outcome = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(oid.clone()))]))
+        .await;
+    assert_eq!(outcome.status, CancelStatus::Canceled);
+    assert_eq!(outcome.order_id.as_deref(), Some(oid.as_str()));
+
+    let terminal = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(oid.clone()))]))
+        .await;
+    assert_eq!(terminal.status, CancelStatus::AlreadyTerminal);
+    assert_eq!(terminal.order_id.as_deref(), Some(oid.as_str()));
+}
+
+#[tokio::test]
+async fn order_cancel_outcome_failure_maps_to_not_found() {
+    let b = basic_broker();
+    b.set_failure_rate(0.0).unwrap();
+    let outcome = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!("missing"))]))
+        .await;
+    assert_eq!(outcome.status, CancelStatus::NotFound);
+    assert_eq!(outcome.order_id.as_deref(), Some("missing"));
+
+    let invalid = b.order_cancel_outcome(HashMap::new()).await;
+    assert_eq!(invalid.status, CancelStatus::Rejected);
+    assert_eq!(invalid.order_id, None);
+
+    let passthrough = b
+        .order_cancel_outcome(kwargs(&[("response", json!({"echo": true}))]))
+        .await;
+    assert_eq!(passthrough.status, CancelStatus::Unknown);
+    assert_eq!(passthrough.raw, Some(json!({"echo": true})));
+}
+
+#[tokio::test]
+async fn order_cancel_outcome_maps_virtual_terminal_and_rejected() {
+    let b = basic_broker();
+    b.set_failure_rate(0.0).unwrap();
+    let reply = b
+        .place(kwargs(&[
+            ("symbol", json!("dow")),
+            ("side", json!(1)),
+            ("quantity", json!(50)),
+            ("delay", json!(-1_i64)),
+        ]))
+        .await;
+    let oid = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
+    b.get_default(&oid).unwrap();
+
+    let terminal = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(oid.clone()))]))
+        .await;
+    assert_eq!(terminal.status, CancelStatus::AlreadyTerminal);
+    assert_eq!(terminal.order_id.as_deref(), Some(oid.as_str()));
+
+    let reply = b
+        .place(kwargs(&[
+            ("symbol", json!("dow")),
+            ("side", json!(1)),
+            ("quantity", json!(50)),
+        ]))
+        .await;
+    let oid = reply
+        .as_order()
+        .unwrap()
+        .data
+        .as_ref()
+        .unwrap()
+        .order_id
+        .clone();
+    b.set_failure_rate(1.0).unwrap();
+
+    let rejected = b
+        .order_cancel_outcome(kwargs(&[("order_id", json!(oid.clone()))]))
+        .await;
+    assert_eq!(rejected.status, CancelStatus::Rejected);
+    assert_eq!(rejected.order_id.as_deref(), Some(oid.as_str()));
 }
 
 // ─────────────────────────────────────────────────────────────
