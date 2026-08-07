@@ -11,6 +11,8 @@ pub mod clock;
 pub mod compound_order;
 pub mod models;
 pub mod order;
+pub mod lifecycle;
+pub mod yes_inventory;
 pub mod order_strategy;
 pub mod parity_gate;
 pub mod persistence;
@@ -30,8 +32,12 @@ pub use broker::{rename, Broker};
 pub use brokers::{AsyncPaper, Paper};
 pub use clock::{clock_system_default, Clock, MockClock, SystemClock};
 pub use models::{BasicPosition, OrderBook, OrderLock, QuantityMatch, Quote};
+pub use yes_inventory::YesInventory;
 pub use order::{Order, OrderInit};
 pub use persistence::{PersistenceError, PersistenceHandle};
 pub use utils::{
     create_basic_positions_from_orders_dict, dict_filter, update_quantity, OrderRecord, UQty,
 };
+
+// Lifecycle / true-money OMS core (moved from kbot oms_state). Use
+// `omsrs::lifecycle::*` — not aliased over async_broker names.
