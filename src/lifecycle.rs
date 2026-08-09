@@ -9374,3 +9374,47 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cancel_retry_idempotency_pins {
+    use super::*;
+
+    /// ★ C2b 活性钉（复审 R2 MEDIUM：删幂等 arm 两仓全绿 = 零钉）：
+    /// CancelPending + CancelRequested = **Accept、state 不变、effects 空**。
+    /// 此前是 reject_illegal ⇒ 宿主一次 cancel HTTP 失败后重试 ⇒ reject ⇒
+    /// bail ⇒ 进程死、场上单无人管（真钱前双审 C2 死亡链 A）。
+    /// 变异：删掉该 arm（回落 reject_illegal）⇒ 本测试红。
+    #[test]
+    fn cancel_requested_on_cancel_pending_is_idempotent_noop() {
+        let state = OrderState::CancelPending {
+            venue_order_id: VenueOrderId("w1".into()),
+            filled_qty: 0,
+            remaining_qty: 500,
+            response_fill_count: None,
+            response_avg_price_cents: None,
+            response_fee_cents: None,
+            reconcile_target: None,
+        };
+        let mut ctx = OrderCtx::new(
+            derive_client_order_id("KXBTC-M", "hoff-mm", 1),
+            "KXBTC-M",
+            "hoff-mm",
+            Side::BuyYes,
+            50,
+            500,
+        );
+        let out = apply_event(&state, &mut ctx, &OrderEvent::CancelRequested);
+        match out {
+            TransitionOutcome::Accept { new_state, effects } => {
+                assert!(
+                    matches!(new_state, OrderState::CancelPending { ref venue_order_id, .. }
+                        if venue_order_id.0 == "w1"),
+                    "state 必须原样保持 CancelPending"
+                );
+                assert!(effects.is_empty(), "重试不许重复记 journal（零 effect）");
+            }
+            other => panic!("cancel 重试必须 Accept(no-op)，实际 {other:?} —— \
+                reject 会让宿主 bail 进程死"),
+        }
+    }
+}
