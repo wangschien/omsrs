@@ -1148,6 +1148,14 @@ pub fn apply_event(
             )
             .prepend_effects(prefix)
         }
+        // ★ 2026-08-09（真钱前双审 C2 死亡链 A）：cancel 重试必须幂等。
+        //   此前 CancelPending + CancelRequested = reject ⇒ 宿主一次 cancel
+        //   HTTP 失败后重试 ⇒ reject ⇒ bail ⇒ 进程死、场上单无人管。
+        //   重试同一意图不是非法转移，是网络现实。no-op 保持 CancelPending。
+        (OrderState::CancelPending { .. }, OrderEvent::CancelRequested) => {
+            // no-op：状态不变、零 effect（重试不重复记 journal）。
+            accept(state.clone(), vec![])
+        }
         (OrderState::CancelPending { .. }, _) => reject_illegal(state, event),
 
         // ── E5 ReconcilePending ───────────────────────────────────────────
