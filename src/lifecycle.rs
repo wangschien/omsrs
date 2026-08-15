@@ -2891,13 +2891,33 @@ fn finalize_reconcile_target(
     // Attribution caught target — finalize via choke point.
     // F1/Med2: never hardcode authority; gate reads ctx.authority_is_fresh() only.
     match target.terminal {
-        ReconcileTerminal::Canceled => try_finalize_terminal(
-            ctx,
-            ProposedTerminal::Canceled,
-            venue_order_id,
-            effects,
-            ReconcileTerminal::Canceled,
-        ),
+        ReconcileTerminal::Canceled => {
+            // ★ 同上零踪迹门（HIGH 2026-08-15）：ReconcilePending 追认路径的 target
+            //   也不许对 filled=0 且已观测 remaining=Some(0) 的 qty>0 单放行终态。
+            //   remaining=None（未观测）不算——窄门只挡确证的 0/0。
+            if target.venue_filled_qty == 0
+                && target.venue_remaining_qty == Some(0)
+                && ctx.qty > 0
+            {
+                return halt_with_reason(
+                    HaltReason::CrossCheckMismatch {
+                        detail: format!(
+                            "canceled zero-trace (target): filled=0 remaining=0 qty={} — \
+                             拒绝终态",
+                            ctx.qty
+                        ),
+                    },
+                    effects,
+                );
+            }
+            try_finalize_terminal(
+                ctx,
+                ProposedTerminal::Canceled,
+                venue_order_id,
+                effects,
+                ReconcileTerminal::Canceled,
+            )
+        }
         ReconcileTerminal::Filled => {
             // G3: use persisted venue_remaining — never invent 0 when remaining was seen.
             let venue_remaining_qty = match target.venue_remaining_qty {
@@ -3158,6 +3178,27 @@ fn route_from_backfill_status(
 
     match status {
         BackfillOrderStatus::Canceled => {
+            // ★ HIGH（2026-08-15 审计，docs/OMSRS_AUDIT_2026_08_15.md）：Canceled 终态
+            //   零踪迹门——`filled==0 && remaining==0 && qty>0` 的权威快照与「订单存在
+            //   过」矛盾（Kalshi 实测：零成交撤恒报 remaining==qty 撤前剩余、满量成交
+            //   报 filled==qty/remaining=0；o2a live journal 全量普查 0/0 组合零出现），
+            //   与「撤成空成交、fill 未投影」不可区分 ⇒ 不得 latch/Release，按快照矛盾
+            //   同族（attributed>venue_filled 先例）halt 响亮。
+            //   全量 leftover 恒等（filled+remaining==qty）**不做**、此处宣告：实测存在
+            //   0/615 型行（journal 无 status 不可独判其合法性），全量门有误杀面；
+            //   零踪迹窄门已覆盖审计 HIGH 档。
+            if venue_filled_qty == 0 && venue_remaining_qty == 0 && ctx.qty > 0 {
+                return halt_with_reason(
+                    HaltReason::CrossCheckMismatch {
+                        detail: format!(
+                            "canceled zero-trace: filled=0 remaining=0 qty={} — \
+                             撤成空成交与成交未投影不可区分，拒绝终态",
+                            ctx.qty
+                        ),
+                    },
+                    effects,
+                );
+            }
             // Attempt terminal via choke point (reads ctx.authority_is_fresh()).
             let o = try_finalize_terminal(
                 ctx,
@@ -4120,6 +4161,50 @@ mod tests {
             ctx,
             &authority_reconcile_canceled(ctx.attributed_fill_qty, ctx.remaining_qty()),
         )
+    }
+
+    /// ★ HIGH 钉（2026-08-15 审计 docs/OMSRS_AUDIT_2026_08_15.md）：权威报
+    /// `Canceled + filled=0 + remaining=0 + qty>0`（零踪迹）必须 **halt**，不得
+    /// latch Canceled / Release——该快照与「撤成空成交、fill 未投影」不可区分
+    /// （Kalshi 实测零成交撤恒报 remaining==qty；0/0 组合 live journal 零出现 =
+    /// 病态）。现有 cancel 权威测试全是 remaining==qty 有剩余档，绿不到这条。
+    /// 变异：删零踪迹门 ⇒ 本测红（直接 Canceled + ReleaseReservation）。
+    #[test]
+    fn inv_canceled_zero_trace_halts_not_releases() {
+        let mut ctx = ctx_default();
+        let s = to_cancel_pending(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CancelOutcome(CancelOutcome::Canceled),
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 0,
+                remaining_qty: 0,
+                fills: vec![],
+                authority_complete: true,
+            },
+        );
+        assert!(
+            matches!(
+                o.new_state(),
+                Some(OrderState::Halted {
+                    reason: HaltReason::CrossCheckMismatch { .. }
+                })
+            ),
+            "零踪迹 Canceled 必须 halt（CrossCheckMismatch），got {:?}",
+            o.new_state()
+        );
+        assert!(
+            !o.effects().iter().any(|e| matches!(e, Effect::ReleaseReservation)),
+            "零踪迹不得 Release（预留留住 = 迟到成交仍有账可对）"
+        );
     }
 
     #[test]
