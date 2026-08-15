@@ -55,7 +55,7 @@
 
 Canceled 立删 → fill `Ok(false)` 静默：kbot `da4ab86` 起已缓删 + off-book。规格 `kbot/docs/specs/OMS_CANCEL_FILL_RACE_2026_08_15.md`。
 
-### HIGH — `Canceled` 定终态不校验 filled+remaining（核，未修）
+### HIGH — `Canceled` 定终态不校验 filled+remaining（**已撤销,见 §6**——修法被真 REST 数据证伪,勿按本节实现）
 
 `lifecycle.rs` ~3159–3189：`BackfillOrderStatus::Canceled` 走 `try_finalize_terminal`，只看 `attributed == fill_obligation == venue_filled` 且 `authority_is_fresh()`。**没有** `venue_filled + venue_remaining == qty`。开仓零成交 submit 路径反倒要求 `remaining_count == qty`（~2371）。
 
@@ -65,7 +65,7 @@ Kalshi 撤完常报 `remaining=0`；若 `fill_count` 还是 0、宿主又标 `au
 
 现有 cancel 权威测试全是 `filled=0, remaining=10` 这种有剩余。**没有** `filled=0, remaining=0` 夹具。
 
-修法：Canceled 必须 leftover 恒等（`filled+remaining==qty`）；`remaining=0 && filled=0 && qty>0` 不得 latch/release。另开 omsrs PR，别和已并的 kbot 壳捆。
+~~修法：Canceled 必须 leftover 恒等（`filled+remaining==qty`）；`remaining=0 && filled=0 && qty>0` 不得 latch/release。~~ **已撤销(§6):真 REST 987/1000 canceled 报 0/0 常态,恒等 0/1000 成立——任何此类门都 false-halt 超时恢复流。**
 
 ### 核里已钉、要对齐的契约
 
@@ -115,7 +115,7 @@ Kalshi 撤完常报 `remaining=0`；若 `fill_count` 还是 0、宿主又标 `au
 | Canceled 缓删 + no-row 补记 | **kbot** | **已并** |
 | 策略净仓保持 `VenuePosition` | **kbot** | 保持 |
 | 冻态 Fill → `PostTerminalFill` | **omsrs** | 已有，别改软 |
-| Canceled 终态校验 `filled+remaining==qty` | **omsrs** | **未做**（深审 HIGH） |
+| Canceled 终态校验 `filled+remaining==qty` | **omsrs** | **撤销**（§6:被真 REST 证伪,正向钉防再加） |
 
 **不要：** 无行也当核入账；Canceled 默默吃 fill 且不 Halt；用 OMS `Fill` 张数当经济成交额。
 
@@ -123,7 +123,7 @@ Kalshi 撤完常报 `remaining=0`；若 `fill_count` 还是 0、宿主又标 `au
 
 ## 5. 一句话
 
-那 7 笔的 **壳已经修了**。omsrs 对「行还在的迟到成交」本来就会喊。还没修的是核里另一条：撤单权威若报 `filled=0, remaining=0` 仍会放行终态。和 hold-12 同族，不是同一 commit。
+那 7 笔的 **壳已经修了**。omsrs 对「行还在的迟到成交」本来就会喊。~~还没修的是核里另一条：撤单权威若报 `filled=0, remaining=0` 仍会放行终态。~~ **复核后撤销(§6):0/0 是 Kalshi canceled 常态表示,放行终态是正确行为;防线在 invariant 2/PostTerminalFill/壳 off-book。**
 
 ---
 
