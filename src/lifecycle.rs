@@ -1218,6 +1218,15 @@ pub fn apply_event(
             )
             .prepend_effects(prefix)
         }
+        // ★ A3（2026-08-15 四仓扫雷 HIGH，C2 死亡链同型）：ReconcilePending 是
+        //   cancel 意图的**直接延续态** —— 它仍在壳的 open 投影里，策略对不想要
+        //   的 open 单重发 cancel 不是非法转移。此前落 catch-all reject ⇒ 壳
+        //   `?` bail 杀 live loop。no-op 幂等放行后，壳照常发 cancel HTTP →
+        //   404/success 分类 → 重发 `ReconcileResult(authority_complete=true)`
+        //   →（上方已有的 ReconcileResult 臂）重供 authority ⇒ 卡死行自愈。
+        (OrderState::ReconcilePending { .. }, OrderEvent::CancelRequested) => {
+            accept(state.clone(), vec![])
+        }
         (OrderState::ReconcilePending { .. }, _) => reject_illegal(state, event),
 
         // ── §6.B2 ImmediateFillUnattributed ───────────────────────────────
@@ -2371,6 +2380,31 @@ fn apply_submit_response(
     if fill_count == 0 {
         // D4: must verify no prior WS fills before claiming Accepted zero-fill.
         if ctx.attributed_fill_qty != 0 {
+            // ★ A5（2026-08-15 四仓扫雷 LOW/D4）：response 是**建单时刻快照** ——
+            //   建单后 ε 秒抢跑到达的 WS fill 与 fill_count=0 不矛盾（域外新证据，
+            //   与 (SubmitStarted, Fill) 被显式支持自洽）。remaining 与 qty 一致
+            //   （venue 说全量驻留）时按 Partial 收（fill 已入账）；remaining 也
+            //   对不上（如 IOC 0/0 却有本地 fill）才是真矛盾，保持 halt。
+            if remaining_count == ctx.qty {
+                let Some(remaining) = ctx.remaining_qty_checked() else {
+                    return halt_with_reason(
+                        HaltReason::OverFill {
+                            attributed_fill_qty: ctx.attributed_fill_qty,
+                            fill_qty: 0,
+                            order_qty: ctx.qty,
+                        },
+                        effects,
+                    );
+                };
+                return accept(
+                    OrderState::Partial {
+                        venue_order_id,
+                        filled_qty: ctx.attributed_fill_qty,
+                        remaining_qty: remaining,
+                    },
+                    effects,
+                );
+            }
             let reason = HaltReason::ResponseZeroButLocalFills {
                 attributed_fill_qty: ctx.attributed_fill_qty,
                 remaining_count,
@@ -2378,6 +2412,24 @@ fn apply_submit_response(
             return halt_with_reason(reason, effects);
         }
         if remaining_count != ctx.qty {
+            // ★ A1（扫雷 HIGH）：`fill_count=0 && remaining_count=0` 是 IOC 全 miss
+            //   的**合法结局**（零成交、非驻留 —— 追砸时对手价撤走，恰是触发
+            //   flatten/止损的行情）。此前无此臂 ⇒ CrossCheckMismatch Halt ⇒ 壳
+            //   `?` bail 杀 live loop，进程死时手里正骑着逆向仓。create response
+            //   对 IOC 是 venue 权威原子结果 ⇒ 记 authority 证据走 Canceled 终局。
+            //   （post-only cross 被壳侧 HTTP 400 typed 挡在 DefiniteReject，不经
+            //   此路；attributed>0 已在上面分支处理。）
+            if remaining_count == 0 {
+                let mut effects = effects;
+                push_journal(&mut effects, note_authority_complete(ctx, true));
+                return try_finalize_terminal(
+                    ctx,
+                    ProposedTerminal::Canceled,
+                    venue_order_id,
+                    effects,
+                    ReconcileTerminal::Canceled,
+                );
+            }
             let reason = HaltReason::CrossCheckMismatch {
                 detail: format!(
                     "fill_count=0 remaining_count={remaining_count} != order_qty={}",
@@ -2789,6 +2841,24 @@ fn after_fill_cancel_or_reconcile(
             Err(reason) => return halt_with_reason(reason, effects),
         }
         if ctx.attributed_fill_qty > target.venue_filled_qty {
+            // ★ A4（2026-08-15 四仓扫雷 MED）：target.venue_filled_qty 的唯一产地
+            //   是 `not_ready_for_terminal` 的**本地合成地板**（max(obligation,
+            //   attributed)），不是 venue 上限 —— 撤单前已撮合、WS 晚到的合法
+            //   fill 越过地板不是 venue 矛盾。≤qty ⇒ 地板抬升重合成（保留
+            //   fallback terminal 与已观测 remaining）；>qty 的真 OverFill 已由
+            //   apply_fill 的 checked 路径在前面拦，此处兜底保持 halt。
+            if ctx.attributed_fill_qty <= ctx.qty {
+                let fallback = target.terminal;
+                let vr = target.venue_remaining_qty;
+                return not_ready_for_terminal(
+                    ctx,
+                    venue_order_id,
+                    effects,
+                    fallback,
+                    /* request_authority */ true,
+                    vr,
+                );
+            }
             return halt_with_reason(
                 HaltReason::CrossCheckMismatch {
                     detail: format!(
@@ -2802,7 +2872,17 @@ fn after_fill_cancel_or_reconcile(
         if ctx.attributed_fill_qty == target.venue_filled_qty
             && ctx.attributed_fill_qty == ctx.fill_obligation
         {
-            // F1/Med2: do NOT hardcode authority — latch must already be set.
+            // F1/Med2: do NOT hardcode authority *without evidence* — but full
+            // fill-id coverage IS evidence（route_live_or_filled 的 remaining==0
+            // 同规则，F1 latch）。
+            // ★ A2（扫雷 HIGH）：追平的最后一笔 fill 刚 invalidate 了 authority
+            //   （新 fill_id 必然 invalidate）——不补 latch 则 gate1 必败 ⇒ 行永
+            //   卡 ReconcilePending（资金锁死，且下一次撤单前 reject 杀 loop）。
+            //   全量覆盖（attributed==qty）时按自家规则补 latch；部分成交
+            //   canceled 情形不适用此证据，靠撤单重发重供 authority（A3 通链）。
+            if ctx.attributed_fill_qty == ctx.qty {
+                push_journal(&mut effects, note_authority_complete(ctx, true));
+            }
             // G5 enrichment may re-check (provenance unlock) but uses target remaining.
             return finalize_reconcile_target(ctx, target, effects, venue_order_id);
         }
@@ -5461,7 +5541,11 @@ mod tests {
         );
     }
 
-    /// D4: fill_count=0 but local WS fills already attributed → Halt.
+    /// D4（2026-08-15 A5 语义翻转）：fill_count=0 但本地 WS fill 已入账 ——
+    /// response 是建单时刻快照，抢跑 fill 是域外新证据非矛盾：remaining==qty
+    /// （venue 说全量驻留）⇒ **Partial** 而非 Halt（旧断言=接受 fill 又按矛盾
+    /// halt 的自相矛盾行为）。真矛盾对照（response 0/0+本地 fill ⇒ 仍 halt）
+    /// 见 `a5_ws_fill_before_zero_fill_response_is_partial_not_halt`。
     #[test]
     fn d4_zero_response_with_prior_ws_fills_halts() {
         let mut ctx = ctx_default();
@@ -5492,15 +5576,15 @@ mod tests {
                 snapshot_boundary: None,
             },
         );
-        assert!(o.is_halt());
-        assert!(matches!(
-            o,
-            TransitionOutcome::Halt {
-                reason: HaltReason::ResponseZeroButLocalFills { .. },
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                o.new_state(),
+                Some(OrderState::Partial { filled_qty: 4, remaining_qty: 6, .. })
+            ),
+            "A5：抢跑 fill + 全量驻留 response = Partial（domain 外新证据）: {o:?}"
+        );
         assert!(!matches!(o.new_state(), Some(OrderState::Accepted { .. })));
+        assert_eq!(ctx.attributed_fill_qty, 4, "fill 已入账不回滚");
     }
 
     /// D4: avg_price mismatch after fill aggregation → CrossCheckMismatch.
@@ -9450,6 +9534,291 @@ mod tests {
             ctx.attributed_fill_qty, 5,
             "late fill was applied before Halt"
         );
+    }
+    // ─── 2026-08-15 四仓扫雷修复夹具(A1-A5) ───────────────────────────────
+
+    /// ★ A1(HIGH):IOC 全 miss —— response(fill=0, remaining=0) 是合法终局
+    /// (零成交、非驻留),必须 Canceled+Release,不许 CrossCheckMismatch Halt
+    /// 杀 live loop(修前行为)。
+    #[test]
+    fn a1_ioc_full_miss_zero_zero_is_canceled_release() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("V1"),
+                fill_count: 0,
+                remaining_count: 0,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        assert_eq!(
+            o.new_state(),
+            Some(&OrderState::Canceled),
+            "IOC 全 miss 必须落 Canceled 终态(修前 Halt 杀 loop): {o:?}"
+        );
+        assert!(
+            o.effects()
+                .iter()
+                .any(|e| matches!(e, Effect::ReleaseReservation)),
+            "零成交终局必须放资金"
+        );
+    }
+
+    /// ★ A5(LOW/D4):WS fill 抢在零成交 response 前 —— response 是建单快照,
+    /// remaining==qty 时按 Partial 收(修前 ResponseZeroButLocalFills 假 halt);
+    /// 对照臂:response(0,0) 且有本地 fill = 真矛盾,保持 halt。
+    #[test]
+    fn a5_ws_fill_before_zero_fill_response_is_partial_not_halt() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 4,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("V1"),
+                fill_count: 0,
+                remaining_count: 10,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        assert!(
+            matches!(
+                o.new_state(),
+                Some(OrderState::Partial { filled_qty: 4, remaining_qty: 6, .. })
+            ),
+            "抢跑 fill + 全量驻留 response = Partial 非矛盾: {o:?}"
+        );
+        // 对照:response(0,0) 但本地有 fill = 真矛盾 ⇒ halt 保持。
+        let mut ctx2 = ctx_default();
+        let s2 = prepare_started(&mut ctx2);
+        let o2 = apply_event(
+            &s2,
+            &mut ctx2,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 4,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s2 = o2.new_state().unwrap().clone();
+        let o2 = apply_event(
+            &s2,
+            &mut ctx2,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("V1"),
+                fill_count: 0,
+                remaining_count: 0,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        assert!(
+            matches!(
+                o2.new_state(),
+                Some(OrderState::Halted { reason: HaltReason::ResponseZeroButLocalFills { .. } })
+            ),
+            "response(0,0)+本地 fill = 真矛盾必须保持 halt: {o2:?}"
+        );
+    }
+
+    /// ★ A3(HIGH,C2 同型):ReconcilePending + CancelRequested = 幂等 no-op
+    /// (修前 reject ⇒ 壳 bail 杀 loop)。
+    #[test]
+    fn a3_reconcile_pending_cancel_requested_is_idempotent() {
+        let mut ctx = ctx_default();
+        let s = to_cancel_pending(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 4,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CancelOutcome(CancelOutcome::NotFound),
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 4,
+                remaining_qty: 6,
+                fills: vec![],
+                authority_complete: false,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        assert!(matches!(s, OrderState::ReconcilePending { .. }));
+        let o = apply_event(&s, &mut ctx, &OrderEvent::CancelRequested);
+        assert!(!o.is_reject(), "ReconcilePending 重撤必须幂等放行(修前 reject 杀 loop): {o:?}");
+        assert_eq!(o.new_state(), Some(&s), "no-op 保持原态");
+        assert!(o.effects().is_empty(), "幂等重试零 effect");
+    }
+
+    /// ★ A2(HIGH):ReconcilePending 靠 WS fill 追平 —— 全量 fill_id 覆盖
+    /// (attributed==qty)= 权威证据,必须补 latch 并 finalize(修前:最后一笔
+    /// fill invalidate authority ⇒ gate1 必败 ⇒ 行永久卡死锁资金)。
+    #[test]
+    fn a2_late_fill_full_coverage_finalizes_from_reconcile_pending() {
+        let mut ctx = ctx_default();
+        let s = to_cancel_pending(&mut ctx);
+        // 壳 cancel HTTP 回包:venue 权威说 filled=10(全成)但 WS fill 尚未到。
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 10,
+                remaining_qty: 0,
+                fills: vec![],
+                authority_complete: true,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        assert!(
+            matches!(s, OrderState::ReconcilePending { .. }),
+            "attributed(0)<obligation(10) ⇒ 先挂 ReconcilePending: {s:?}"
+        );
+        // WS fill 迟到追平(一笔 10 张)——它会 invalidate authority(新 fill_id)。
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 10,
+                price_cents: 45,
+                ts_ns: 2,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let ns = o.new_state().unwrap().clone();
+        assert!(
+            !matches!(ns, OrderState::ReconcilePending { .. }),
+            "追平后必须离开 ReconcilePending(修前永卡=资金锁死): {ns:?}"
+        );
+        assert!(
+            ns.is_terminal_or_halt() && !matches!(ns, OrderState::Halted { .. }),
+            "全量覆盖 ⇒ 干净终态非 halt: {ns:?}"
+        );
+        assert!(
+            o.effects()
+                .iter()
+                .any(|e| matches!(e, Effect::ReleaseReservation)),
+            "终态必须放资金"
+        );
+    }
+
+    /// ★ A4(MED):迟到 fill 越过本地合成 target 地板(≤qty)= 域外新证据,
+    /// 地板抬升重合成,不许按 venue 矛盾 Halt(修前 CrossCheckMismatch)。
+    #[test]
+    fn a4_late_fill_beyond_target_floor_reraises_not_halt() {
+        let mut ctx = ctx_default();
+        let s = to_cancel_pending(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 3,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CancelOutcome(CancelOutcome::NotFound),
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 3,
+                remaining_qty: 7,
+                fills: vec![],
+                authority_complete: false,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        assert!(matches!(
+            s,
+            OrderState::ReconcilePending {
+                target: ReconcileTarget { venue_filled_qty: 3, .. },
+                ..
+            }
+        ));
+        // 撤前已撮合、WS 晚到的第 4 张(域外合法 fill)。
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F2"),
+                qty: 1,
+                price_cents: 45,
+                ts_ns: 2,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let ns = o.new_state().unwrap().clone();
+        assert!(
+            !matches!(ns, OrderState::Halted { .. }),
+            "越过本地地板 ≤qty 不是 venue 矛盾(修前假阳性 Halt): {ns:?}"
+        );
+        assert!(
+            matches!(
+                &ns,
+                OrderState::ReconcilePending {
+                    target: ReconcileTarget { venue_filled_qty: 4, .. },
+                    ..
+                }
+            ),
+            "地板抬升重合成 target=4: {ns:?}"
+        );
+        assert_eq!(ctx.attributed_fill_qty, 4);
     }
 }
 
