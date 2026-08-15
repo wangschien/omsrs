@@ -124,3 +124,17 @@ Kalshi 撤完常报 `remaining=0`；若 `fill_count` 还是 0、宿主又标 `au
 ## 5. 一句话
 
 那 7 笔的 **壳已经修了**。omsrs 对「行还在的迟到成交」本来就会喊。还没修的是核里另一条：撤单权威若报 `filled=0, remaining=0` 仍会放行终态。和 hold-12 同族，不是同一 commit。
+
+---
+
+## 6. 复核(2026-08-15 双审二轮,HIGH **撤销**)
+
+§2 的 HIGH(Canceled 定终态不校验 filled+remaining)修法在实现双审中被**真 REST 数据推翻**:
+
+- **判据来源错误**:journal 的 Canceled `ReconcileObserved` 几乎全部来自 `on_cancel_http_success` 的**壳自合成回显**(本地 attributed/remaining 算出),对场端语义零鉴别力;「零成交撤恒报 remaining==qty」是回显假象。
+- **真 REST 实测**(auditor o2a 只读探针,`GET /portfolio/orders?status=canceled` 1000 单,脚本留存 o2a `/data/tmp/audit_canceled_probe{,2}.py`):**987/1000 报 fill_count=0/remaining_count=0**(撤后清零=常态表示);13/1000 部分成交同样 remaining=0;恒等 `filled+remaining==qty` **0/1000** 成立。
+- **真 REST 进核的唯一路径** = SubmitUnknown 超时恢复 backfill——恒等门或 0/0 零踪迹门在此 **98.7% false-halt**(资金锁死,差分实跑坐实)。
+- **「撤成空成交」的真防线**(本就存在):fill 已投影 ⇒ `note_fill_evidence` 抬 obligation ⇒ invariant 2 挡;未投影且行在 ⇒ `PostTerminalFill`;行不在 ⇒ 壳 off-book(已修)。REST 瞬时少计 + WS 同丢 = 本地任何门不可见,无门可加。
+- **处置**:门撤销;正向钉 `inv_canceled_zero_zero_rest_is_normal_release`(两路径:ReconcileResult 0/0 与 backfill 0/0 必须正常 Canceled+Release)防将来再加守恒门。
+
+教训:[[只用实测值]] 的升级——**实测也要测对流**(壳回显 ≠ 场端观测)。
