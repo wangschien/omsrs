@@ -138,3 +138,8 @@ Kalshi 撤完常报 `remaining=0`；若 `fill_count` 还是 0、宿主又标 `au
 - **处置**:门撤销;正向钉 `inv_canceled_zero_zero_rest_is_normal_release`(两路径:ReconcileResult 0/0 与 backfill 0/0 必须正常 Canceled+Release)防将来再加守恒门。
 
 教训:[[只用实测值]] 的升级——**实测也要测对流**(壳回显 ≠ 场端观测)。
+
+## 7. 欠账(durable,末轮 auditor MED 落账)
+
+- **`Effect::BackfillFills` / `RequestAuthorityReconcile` 在 kbot 壳无处理者**(pre-existing):核在 `try_finalize_terminal` G2/H1 与 `continue_reconcile_pending` 发射,壳 `apply_effects` 堆进 `other_effects` 永不消费 ⇒ `ReconcilePending` 只能靠 WS fill 自然到达解套,核的「可恢复」承诺在壳侧半开路。影响面:not_ready 路径的滞留时长(窗尾清场兜)。归属 kbot 壳,另开一线,勿与本审计线捆绑。
+- site-2(`finalize_reconcile_target` Canceled 臂)无撤销注释、正向钉不覆盖该臂独活复活——该臂 `target.venue_filled==0` 的 finalize 形态经现路径不可达(fill 驱动必抬 attributed),记录即可。
