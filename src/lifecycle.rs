@@ -1227,6 +1227,14 @@ pub fn apply_event(
         (OrderState::ReconcilePending { .. }, OrderEvent::CancelRequested) => {
             accept(state.clone(), vec![])
         }
+        // ★ A3b（复审 HIGH：自愈链第二跳）：壳的 on_cancel_http_success 第一步是
+        //   apply CancelOutcome，然后才发 ReconcileResult —— ReconcilePending 对
+        //   CancelOutcome 无臂时死点只是从 CancelRequested 挪后一个 HTTP。
+        //   CancelOutcome 本就不供 authority（F1），容忍 no-op，让紧随的
+        //   ReconcileResult(authority_complete=true)（上方既有臂）完成自愈。
+        (OrderState::ReconcilePending { .. }, OrderEvent::CancelOutcome(_)) => {
+            accept(state.clone(), vec![])
+        }
         (OrderState::ReconcilePending { .. }, _) => reject_illegal(state, event),
 
         // ── §6.B2 ImmediateFillUnattributed ───────────────────────────────
@@ -2386,24 +2394,13 @@ fn apply_submit_response(
             //   （venue 说全量驻留）时按 Partial 收（fill 已入账）；remaining 也
             //   对不上（如 IOC 0/0 却有本地 fill）才是真矛盾，保持 halt。
             if remaining_count == ctx.qty {
-                let Some(remaining) = ctx.remaining_qty_checked() else {
-                    return halt_with_reason(
-                        HaltReason::OverFill {
-                            attributed_fill_qty: ctx.attributed_fill_qty,
-                            fill_qty: 0,
-                            order_qty: ctx.qty,
-                        },
-                        effects,
-                    );
-                };
-                return accept(
-                    OrderState::Partial {
-                        venue_order_id,
-                        filled_qty: ctx.attributed_fill_qty,
-                        remaining_qty: remaining,
-                    },
-                    effects,
-                );
+                // ★ A5b（复审 HIGH）：走 `route_live_or_filled` 而非手搓 Partial ——
+                //   全量抢跑（attributed==qty，小 clip 单笔打满是常态）手搓会落
+                //   Partial{qty, 0} 僵尸：非终态不放资金、且壳 open 投影要求
+                //   remaining>0 ⇒ 行对策略/cancel_all 全不可见。route 的
+                //   remaining==0 支走 F1 latch → Filled+Release；partial 支产物
+                //   与手搓逐字段相同。
+                return route_live_or_filled(ctx, venue_order_id, effects);
             }
             let reason = HaltReason::ResponseZeroButLocalFills {
                 attributed_fill_qty: ctx.attributed_fill_qty,
@@ -9742,6 +9739,149 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::ReleaseReservation)),
             "终态必须放资金"
+        );
+    }
+
+    /// ★ A3b(复审 HIGH):壳的真实撤单序列必须全程走通到终态 ——
+    /// CancelRequested(no-op)→ CancelOutcome(no-op)→ ReconcileResult(authority)
+    /// ⇒ 终态+Release。修前 CancelOutcome 落 catch-all reject = 死点只挪后一个 HTTP。
+    #[test]
+    fn a3b_shell_cancel_sequence_reaches_terminal_from_reconcile_pending() {
+        let mut ctx = ctx_default();
+        let s = to_cancel_pending(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 4,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(&s, &mut ctx, &OrderEvent::CancelOutcome(CancelOutcome::NotFound));
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 4,
+                remaining_qty: 6,
+                fills: vec![],
+                authority_complete: false,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        assert!(matches!(s, OrderState::ReconcilePending { .. }));
+        // 壳重发撤单:CancelRequested → HTTP → CancelOutcome → ReconcileResult。
+        let o = apply_event(&s, &mut ctx, &OrderEvent::CancelRequested);
+        assert!(!o.is_reject());
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(&s, &mut ctx, &OrderEvent::CancelOutcome(CancelOutcome::Canceled));
+        assert!(!o.is_reject(), "★ CancelOutcome 必须容忍(修前 reject=死点挪后一跳): {o:?}");
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::ReconcileResult {
+                status: BackfillOrderStatus::Canceled,
+                venue_order_id: Some(vid("V1")),
+                filled_qty: 4,
+                remaining_qty: 0,
+                fills: vec![],
+                authority_complete: true,
+            },
+        );
+        let ns = o.new_state().unwrap().clone();
+        assert!(
+            ns.is_terminal_or_halt() && !matches!(ns, OrderState::Halted { .. }),
+            "authority 重供后必须到干净终态: {ns:?}"
+        );
+        assert!(
+            o.effects().iter().any(|e| matches!(e, Effect::ReleaseReservation)),
+            "终态放资金"
+        );
+    }
+
+    /// ★ A5b(复审 HIGH):全量抢跑 fill + 零成交全量驻留 response ⇒ **Filled+
+    /// Release**(修前手搓 Partial{qty,0} 僵尸:不放资金+open 投影不可见)。
+    /// 第三臂(复审 LOW):response(0, 6)+attributed=4 ⇒ 仍 halt(中段矛盾面保钉)。
+    #[test]
+    fn a5b_full_preempt_fill_finalizes_filled_and_mid_mismatch_still_halts() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 10,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("V1"),
+                fill_count: 0,
+                remaining_count: 10,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        assert!(
+            matches!(o.new_state(), Some(OrderState::Filled { .. })),
+            "全量抢跑必须 Filled 非 Partial{{10,0}} 僵尸: {o:?}"
+        );
+        assert!(
+            o.effects().iter().any(|e| matches!(e, Effect::ReleaseReservation)),
+            "Filled 必须放资金"
+        );
+        // 第三臂:remaining 与 qty 不一致的中段矛盾仍 halt。
+        let mut ctx3 = ctx_default();
+        let s3 = prepare_started(&mut ctx3);
+        let o3 = apply_event(
+            &s3,
+            &mut ctx3,
+            &OrderEvent::Fill {
+                fill_id: fid("F1"),
+                qty: 4,
+                price_cents: 45,
+                ts_ns: 1,
+                venue_order_id: Some(vid("V1")),
+                fee_cents: None,
+            },
+        );
+        let s3 = o3.new_state().unwrap().clone();
+        let o3 = apply_event(
+            &s3,
+            &mut ctx3,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("V1"),
+                fill_count: 0,
+                remaining_count: 6,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        assert!(
+            matches!(
+                o3.new_state(),
+                Some(OrderState::Halted { reason: HaltReason::ResponseZeroButLocalFills { .. } })
+            ),
+            "response(0,6)+attributed=4 中段矛盾必须保钉 halt: {o3:?}"
         );
     }
 
