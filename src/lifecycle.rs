@@ -441,6 +441,17 @@ pub enum JournalRecord {
         /// Durable provenance for ownership rebuild.
         venue_order_id: Option<VenueOrderId>,
     },
+    /// ★ SIDE 票 A:带 cid 的成交——旧 Fill 永久保留(新读老)。
+    /// cid=入账时刻归属判定(apply 路径 ctx;迟到/retired 归谁写谁)。fold 只用 wire/量。
+    FillCid {
+        client_order_id: ClientOrderId,
+        fill_id: FillId,
+        qty: u64,
+        price_cents: u64,
+        ts_ns: i64,
+        fee_cents: Option<u64>,
+        venue_order_id: Option<VenueOrderId>,
+    },
     /// Fee enrichment after initial None→Some (F5); delta applied to attributed_fee.
     FeeCorrection {
         fill_id: FillId,
@@ -562,6 +573,27 @@ pub enum Effect {
     /// Block new exposure at account portfolio owner (HALT paths).
     HaltNewExposure,
     // Intentionally NO Resubmit / RetrySubmit effect.
+}
+
+/// ★ SIDE 票 A:Fill 落盘构造单点。cid=入账归属。旧 `Fill` 变体只用于新读老夹具。
+pub fn fill_journal_record(
+    client_order_id: ClientOrderId,
+    fill_id: FillId,
+    qty: u64,
+    price_cents: u64,
+    ts_ns: i64,
+    fee_cents: Option<u64>,
+    venue_order_id: Option<VenueOrderId>,
+) -> JournalRecord {
+    JournalRecord::FillCid {
+        client_order_id,
+        fill_id,
+        qty,
+        price_cents,
+        ts_ns,
+        fee_cents,
+        venue_order_id,
+    }
 }
 
 impl Effect {
@@ -1796,14 +1828,15 @@ fn account_fill_core(
         // Durable provenance/fee upgrade journal (re-state fill with upgraded fields).
         effects.insert(
             0,
-            Effect::AppendFsync(JournalRecord::Fill {
-                fill_id: fill_id.clone(),
+            Effect::AppendFsync(fill_journal_record(
+                ctx.client_order_id.clone(),
+                fill_id.clone(),
                 qty,
                 price_cents,
-                ts_ns: upgraded.ts_ns,
-                fee_cents: upgraded.fee,
-                venue_order_id: upgraded.venue_order_id.clone(),
-            }),
+                upgraded.ts_ns,
+                upgraded.fee,
+                upgraded.venue_order_id.clone(),
+            )),
         );
         // G5: enrichment only — no new qty, do not invalidate authority.
         return AccountAttempt::Enriched { effects };
@@ -1873,14 +1906,15 @@ fn account_fill_core(
         if let Err(reason) = ctx.raise_fill_obligation(new_attr) {
             // Ctx already holds attributed fill + epoch bump — durable records must
             // travel with Halt (never discard mutation without journal).
-            effects.push(Effect::AppendFsync(JournalRecord::Fill {
-                fill_id: fill_id.clone(),
+            effects.push(Effect::AppendFsync(fill_journal_record(
+                ctx.client_order_id.clone(),
+                fill_id.clone(),
                 qty,
                 price_cents,
                 ts_ns,
                 fee_cents,
-                venue_order_id: fill_venue.cloned(),
-            }));
+                fill_venue.cloned(),
+            )));
             effects.push(Effect::AccountFill {
                 fill_id: fill_id.clone(),
                 qty,
@@ -1898,14 +1932,15 @@ fn account_fill_core(
         }
         // A1 emit-before-Halt: all durable fill records before domain-overfill check
         // so contradiction Halt still carries Fill/AccountFill/Authority/Obligation.
-        effects.push(Effect::AppendFsync(JournalRecord::Fill {
-            fill_id: fill_id.clone(),
+        effects.push(Effect::AppendFsync(fill_journal_record(
+            ctx.client_order_id.clone(),
+            fill_id.clone(),
             qty,
             price_cents,
             ts_ns,
             fee_cents,
-            venue_order_id: fill_venue.cloned(),
-        }));
+            fill_venue.cloned(),
+        )));
         effects.push(Effect::AccountFill {
             fill_id: fill_id.clone(),
             qty,
@@ -3736,9 +3771,18 @@ pub fn rebuild_ctx_from_journal(
                 ts_ns,
                 fee_cents,
                 venue_order_id,
+            }
+            | JournalRecord::FillCid {
+                fill_id,
+                qty,
+                price_cents,
+                ts_ns,
+                fee_cents,
+                venue_order_id,
+                ..
             } => {
                 // M2: re-apply fill data only — do not re-run invalidate_authority bump.
-                // Epoch is restored from AuthorityInvalidated / ObligationRaised / latch records.
+                // cid 载荷仅离线;fold 与旧 Fill 同语义。
                 match try_account_fill_for_fold(
                     &mut ctx,
                     fill_id,
@@ -3950,6 +3994,138 @@ mod tests {
 
     /// 钉1:emit 零残留——push/构造形扫描(fold 臂是 match pattern、旧形夹具是裸构造,
     /// 天然不撞;pattern 用拼接防自匹配)。变异=留一处旧 push ⇒ 红。
+    #[test]
+    fn fillcid_no_bare_fill_emits_in_account_core() {
+        let src = include_str!("lifecycle.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("tests")];
+        let bare = format!("AppendFsync(JournalRecord::{} {{", "Fill");
+        assert_eq!(
+            prod.matches(&bare).count(),
+            0,
+            "产线区不得再 push 裸 Fill"
+        );
+        assert!(
+            prod.contains("fill_journal_record("),
+            "必须走构造单点 fill_journal_record"
+        );
+    }
+
+    #[test]
+    fn fillcid_kin_late_fill_stays_on_old_cid() {
+        // 共 wire:老 cid 先绑并终态,新 cid 后绑;迟到 fill 走老 ctx 入账 ⇒ FillCid=老 cid。
+        let mut old_ctx = ctx_default();
+        let old_cid = old_ctx.client_order_id.clone();
+        let s = prepare_started(&mut old_ctx);
+        let o = apply_event(
+            &s,
+            &mut old_ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("W-kin"),
+                fill_count: 0,
+                remaining_count: 10,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(&s, &mut old_ctx, &OrderEvent::CancelRequested);
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut old_ctx,
+            &OrderEvent::CancelOutcome(CancelOutcome::Canceled),
+        );
+        let canceled = o.new_state().unwrap().clone();
+        let mut new_ctx = OrderCtx::new(
+            ClientOrderId("new-kin-cid".into()),
+            "KXBTC-M",
+            "hoff-mm",
+            Side::BuyYes,
+            45,
+            10,
+        );
+        let ns = prepare_started(&mut new_ctx);
+        let _ = apply_event(
+            &ns,
+            &mut new_ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("W-kin"),
+                fill_count: 0,
+                remaining_count: 10,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        );
+        let o = apply_event(
+            &canceled,
+            &mut old_ctx,
+            &OrderEvent::Fill {
+                fill_id: fid("late-old"),
+                qty: 2,
+                price_cents: 40,
+                ts_ns: 9,
+                venue_order_id: Some(vid("W-kin")),
+                fee_cents: None,
+            },
+        );
+        assert!(
+            o.effects().iter().any(|e| matches!(
+                e,
+                Effect::AppendFsync(JournalRecord::FillCid {
+                    client_order_id,
+                    fill_id,
+                    ..
+                }) if client_order_id == &old_cid
+                    && fill_id == &fid("late-old")
+                    && client_order_id.0 != "new-kin-cid"
+            )),
+            "kin 迟到 fill 必须落老 cid,不得落新 cid: {:?}",
+            o.effects()
+        );
+    }
+
+    #[test]
+    fn fillcid_fold_old_and_cid_forms_equivalent() {
+        let cid = ctx_default().client_order_id.clone();
+        let old = vec![JournalRecord::Fill {
+            fill_id: fid("Ff"),
+            qty: 3,
+            price_cents: 41,
+            ts_ns: 7,
+            fee_cents: Some(2),
+            venue_order_id: Some(vid("W-f")),
+        }];
+        let new = vec![JournalRecord::FillCid {
+            client_order_id: cid,
+            fill_id: fid("Ff"),
+            qty: 3,
+            price_cents: 41,
+            ts_ns: 7,
+            fee_cents: Some(2),
+            venue_order_id: Some(vid("W-f")),
+        }];
+        let bind = |recs: &[JournalRecord]| {
+            let mut recs = recs.to_vec();
+            recs.insert(
+                0,
+                JournalRecord::VenueBound {
+                    venue_order_id: vid("W-f"),
+                },
+            );
+            let base = ctx_default();
+            rebuild_ctx_from_journal(base, &recs).expect("fold")
+        };
+        let a = bind(&old);
+        let b = bind(&new);
+        assert_eq!(a.attributed_fill_qty, b.attributed_fill_qty);
+        assert_eq!(a.attributed_fee_cents, b.attributed_fee_cents);
+        assert_eq!(a.applied_fills, b.applied_fills);
+        assert_eq!(a.fill_obligation, b.fill_obligation);
+        assert_eq!(a.venue_order_id, b.venue_order_id);
+    }
+
     #[test]
     fn f9a_no_bare_cancel_or_venuebound_emits() {
         let src = include_str!("lifecycle.rs");
@@ -4748,7 +4924,7 @@ mod tests {
         assert!(
             o2.effects()
                 .iter()
-                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. })))
+                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. } | JournalRecord::FillCid { .. })))
         );
         assert!(
             o2.effects()
@@ -5605,7 +5781,7 @@ mod tests {
         assert!(
             o.effects()
                 .iter()
-                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. })))
+                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. } | JournalRecord::FillCid { .. })))
         );
         assert!(
             o.effects()
@@ -6817,11 +6993,13 @@ mod tests {
         );
         assert_eq!(o.new_state(), Some(&OrderState::Filled));
         // epoch: 1 (response) → 2 (new fill + AuthorityInvalidated) → latch at 2.
+        let cid = ctx.client_order_id.clone();
         assert_eq!(
             o.effects(),
             &[
                 Effect::AppendFsync(JournalRecord::AuthorityInvalidated { epoch: 2 }),
-                Effect::AppendFsync(JournalRecord::Fill {
+                Effect::AppendFsync(JournalRecord::FillCid {
+                    client_order_id: cid,
                     fill_id: fid("Fg"),
                     qty: 10,
                     price_cents: 45,
@@ -7450,13 +7628,14 @@ mod tests {
         );
         assert!(o.effects().iter().any(|e| matches!(
             e,
-            Effect::AppendFsync(JournalRecord::Fill {
+            Effect::AppendFsync(JournalRecord::FillCid {
                 fill_id,
                 qty: 3,
                 price_cents: 41,
                 ts_ns: 7,
                 fee_cents: Some(2),
                 venue_order_id: Some(v),
+                ..
             }) if fill_id == &fid("Fj") && v == &vid("V-j")
         )));
     }
@@ -8269,7 +8448,7 @@ mod tests {
         assert!(
             journals
                 .iter()
-                .any(|j| matches!(j, JournalRecord::Fill { .. })),
+                .any(|j| matches!(j, JournalRecord::Fill { .. } | JournalRecord::FillCid { .. })),
             "expected Fill journals"
         );
         let rebuilt = rebuild_ctx_from_journal(base, &journals).expect("rebuild ok");
@@ -9026,7 +9205,7 @@ mod tests {
         assert!(
             eff.iter().any(|e| matches!(
                 e,
-                Effect::AppendFsync(JournalRecord::Fill {
+                Effect::AppendFsync(JournalRecord::FillCid {
                     fill_id,
                     qty: 3,
                     ..
@@ -9130,7 +9309,7 @@ mod tests {
         let eff = o.effects();
         assert!(
             eff.iter()
-                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. })))
+                .any(|e| matches!(e, Effect::AppendFsync(JournalRecord::Fill { .. } | JournalRecord::FillCid { .. })))
         );
         assert!(eff.iter().any(|e| matches!(e, Effect::AccountFill { .. })));
         assert!(eff.iter().any(|e| {
