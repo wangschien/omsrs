@@ -448,6 +448,21 @@ pub enum JournalRecord {
     },
     CancelRequested,
     CancelOutcome(CancelOutcome),
+    /// ★ F9a(kbot spec F9A v3):带 cid 的撤单事件——旧裸变体**永久保留**(新读老);
+    /// emit 全部切到 Cid 形;fold 语义与裸形逐字节同(仅 authority 失效)。
+    CancelRequestedCid {
+        client_order_id: ClientOrderId,
+    },
+    CancelOutcomeCid {
+        client_order_id: ClientOrderId,
+        outcome: CancelOutcome,
+    },
+    /// ★ F9a:cid↔wire 绑定(闭链必要件)——bind_venue_id 构造单点切换,每张有 wire
+    /// 订单至少一条(create-ack 首绑必 emit),Terminal/Fill 经 wire join 归 cid。
+    VenueBoundCid {
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    },
     ImmediateFillUnattributed {
         venue_order_id: VenueOrderId,
         fill_count: u64,
@@ -1015,7 +1030,9 @@ pub fn apply_event(
         (OrderState::Accepted { venue_order_id }, OrderEvent::CancelRequested) => {
             // G1: cancel is fill-admitting (fills may race between live authority and cancel).
             let mut effects = authority_invalidate_effects(ctx);
-            effects.push(Effect::AppendFsync(JournalRecord::CancelRequested));
+            effects.push(Effect::AppendFsync(JournalRecord::CancelRequestedCid {
+                client_order_id: ctx.client_order_id.clone(),
+            }));
             accept(
                 OrderState::CancelPending {
                     venue_order_id: venue_order_id.clone(),
@@ -1051,7 +1068,9 @@ pub fn apply_event(
         }, OrderEvent::CancelRequested) => {
             // G1: cancel invalidates any prior live authority snapshot.
             let mut effects = authority_invalidate_effects(ctx);
-            effects.push(Effect::AppendFsync(JournalRecord::CancelRequested));
+            effects.push(Effect::AppendFsync(JournalRecord::CancelRequestedCid {
+                client_order_id: ctx.client_order_id.clone(),
+            }));
             accept(
                 OrderState::CancelPending {
                     venue_order_id: venue_order_id.clone(),
@@ -1270,7 +1289,9 @@ pub fn apply_event(
             // Obligation already raised on response; keep on ctx (R2).
             // G1: cancel invalidates prior authority.
             let mut effects = authority_invalidate_effects(ctx);
-            effects.push(Effect::AppendFsync(JournalRecord::CancelRequested));
+            effects.push(Effect::AppendFsync(JournalRecord::CancelRequestedCid {
+                client_order_id: ctx.client_order_id.clone(),
+            }));
             accept(
                 OrderState::CancelPending {
                     venue_order_id: venue_order_id.clone(),
@@ -1399,7 +1420,9 @@ fn bind_venue_id(
                 }
             }
             ctx.venue_order_id = Some(new_id.clone());
-            Ok(Some(JournalRecord::VenueBound {
+            // ★ F9a:构造单点切 Cid 形(七调用方零改动)。
+            Ok(Some(JournalRecord::VenueBoundCid {
+                client_order_id: ctx.client_order_id.clone(),
                 venue_order_id: new_id.clone(),
             }))
         }
@@ -3457,7 +3480,10 @@ fn apply_cancel_outcome(
 ) -> TransitionOutcome {
     // G1: CancelOutcome is fill-admitting (fills may have occurred since last live latch).
     let mut effects = authority_invalidate_effects(ctx);
-    effects.push(Effect::AppendFsync(JournalRecord::CancelOutcome(outcome)));
+    effects.push(Effect::AppendFsync(JournalRecord::CancelOutcomeCid {
+        client_order_id: ctx.client_order_id.clone(),
+        outcome,
+    }));
 
     // Preserve response snapshot fields on ctx if carried in state.
     if let Some(rc) = response_fill_count {
@@ -3751,7 +3777,10 @@ pub fn rebuild_ctx_from_journal(
             }
             // G1/G4: cancel is fill-admitting. Prefer AuthorityInvalidated absolute epoch
             // when present; fallback invalidate when older journals lack it.
-            JournalRecord::CancelRequested | JournalRecord::CancelOutcome(_) => {
+            JournalRecord::CancelRequested
+            | JournalRecord::CancelOutcome(_)
+            | JournalRecord::CancelRequestedCid { .. }
+            | JournalRecord::CancelOutcomeCid { .. } => {
                 if ctx.authority_complete {
                     ctx.invalidate_authority();
                 }
@@ -3777,6 +3806,10 @@ pub fn rebuild_ctx_from_journal(
             | JournalRecord::Halted { .. } => {}
             // G4: non-terminal ctx mutations.
             JournalRecord::VenueBound { venue_order_id } => {
+                bind_venue_id(&mut ctx, venue_order_id)?;
+            }
+            // ★ F9a:Cid 形同语义(cid 载荷仅供离线,fold 只用 wire)。
+            JournalRecord::VenueBoundCid { venue_order_id, .. } => {
                 bind_venue_id(&mut ctx, venue_order_id)?;
             }
             JournalRecord::ObligationRaised {
@@ -6655,7 +6688,8 @@ mod tests {
                     fee_cents: Some(5),
                     snapshot_boundary: None,
                 }),
-                Effect::AppendFsync(JournalRecord::VenueBound {
+                Effect::AppendFsync(JournalRecord::VenueBoundCid {
+                    client_order_id: ClientOrderId("KXBTC-M|hoff-mm|1".into()),
                     venue_order_id: vid("V-g"),
                 }),
                 Effect::AppendFsync(JournalRecord::ObligationRaised {
@@ -6984,7 +7018,7 @@ mod tests {
         let vb_pos = eff.iter().position(|e| {
             matches!(
                 e,
-                Effect::AppendFsync(JournalRecord::VenueBound { venue_order_id })
+                Effect::AppendFsync(JournalRecord::VenueBoundCid { venue_order_id, .. })
                     if venue_order_id == &vid("A")
             )
         });
@@ -7070,7 +7104,7 @@ mod tests {
         let vb_pos = eff.iter().position(|e| {
             matches!(
                 e,
-                Effect::AppendFsync(JournalRecord::VenueBound { venue_order_id })
+                Effect::AppendFsync(JournalRecord::VenueBoundCid { venue_order_id, .. })
                     if venue_order_id == &vid("A")
             )
         });
