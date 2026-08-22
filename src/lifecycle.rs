@@ -3946,6 +3946,104 @@ pub struct ReplayResult {
 
 #[cfg(test)]
 mod tests {
+    // ═══════ F9a Phase 1 三钉(kbot spec F9A v3 §4-1/2/3)═══════
+
+    /// 钉1:emit 零残留——push/构造形扫描(fold 臂是 match pattern、旧形夹具是裸构造,
+    /// 天然不撞;pattern 用拼接防自匹配)。变异=留一处旧 push ⇒ 红。
+    #[test]
+    fn f9a_no_bare_cancel_or_venuebound_emits() {
+        let src = include_str!("lifecycle.rs");
+        let p1 = format!("AppendFsync(JournalRecord::{}Requested))", "Cancel");
+        let p2 = format!("AppendFsync(JournalRecord::{}Outcome(", "Cancel");
+        let p3 = format!("Some(JournalRecord::{}Bound {{", "Venue");
+        assert_eq!(src.matches(&p1).count(), 0, "裸 CancelRequested push 必须为 0");
+        assert_eq!(src.matches(&p2).count(), 0, "裸 CancelOutcome push 必须为 0");
+        assert_eq!(src.matches(&p3).count(), 0, "裸 VenueBound 构造必须为 0(bind_venue_id 已切 Cid)");
+    }
+
+    /// 钉2:载荷正确——全链驱动,三类 Cid 记录带本单 cid;VenueBoundCid.wire 与 SubmitResponse 一致。
+    /// 变异=载荷填错单 cid ⇒ 红。
+    #[test]
+    fn f9a_cid_payloads_carry_this_order() {
+        let c = ctx_default();
+        let events = vec![
+            OrderEvent::PrepareSubmit,
+            OrderEvent::StartSubmit { attempt_id: AttemptId("a".into()) },
+            OrderEvent::SubmitResponse {
+                venue_order_id: VenueOrderId("W-f9a".into()),
+                fill_count: 0,
+                remaining_count: 10,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+            OrderEvent::CancelRequested,
+            OrderEvent::CancelOutcome(CancelOutcome::Canceled),
+        ];
+        let r = replay(OrderState::New, c, &events);
+        let recs: Vec<&JournalRecord> = r
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::AppendFsync(j) => Some(j),
+                _ => None,
+            })
+            .collect();
+        let cid_ok = |c: &ClientOrderId| c.as_str() == "KXBTC-M|hoff-mm|1";
+        assert!(
+            recs.iter().any(|j| matches!(j,
+                JournalRecord::VenueBoundCid { client_order_id, venue_order_id }
+                    if cid_ok(client_order_id) && venue_order_id.0 == "W-f9a")),
+            "VenueBoundCid 须带本单 cid+SubmitResponse 同 wire: {recs:?}"
+        );
+        assert!(
+            recs.iter().any(|j| matches!(j,
+                JournalRecord::CancelRequestedCid { client_order_id } if cid_ok(client_order_id))),
+            "CancelRequestedCid 须带本单 cid: {recs:?}"
+        );
+        assert!(
+            recs.iter().any(|j| matches!(j,
+                JournalRecord::CancelOutcomeCid { client_order_id, outcome: CancelOutcome::Canceled }
+                    if cid_ok(client_order_id))),
+            "CancelOutcomeCid 须带本单 cid+结局: {recs:?}"
+        );
+    }
+
+    /// 钉3:fold 等价——旧裸形 vs 新 Cid 形序列 fold,整只 ctx 逐字段等(新臂不许多做事)。
+    /// 变异=新臂删 invalidate ⇒ 红。
+    #[test]
+    fn f9a_fold_old_and_cid_forms_equivalent() {
+        let cid = || ctx_default().client_order_id.clone();
+        let mk = |cidform: bool| {
+            let recs: Vec<JournalRecord> = if cidform {
+                vec![
+                    JournalRecord::VenueBoundCid {
+                        client_order_id: cid(),
+                        venue_order_id: VenueOrderId("W-e".into()),
+                    },
+                    JournalRecord::CancelRequestedCid { client_order_id: cid() },
+                    JournalRecord::CancelOutcomeCid {
+                        client_order_id: cid(),
+                        outcome: CancelOutcome::Canceled,
+                    },
+                ]
+            } else {
+                vec![
+                    JournalRecord::VenueBound { venue_order_id: VenueOrderId("W-e".into()) },
+                    JournalRecord::CancelRequested,
+                    JournalRecord::CancelOutcome(CancelOutcome::Canceled),
+                ]
+            };
+            let mut base = ctx_default();
+            base.latch_authority_complete();
+            rebuild_ctx_from_journal(base, &recs).expect("fold ok")
+        };
+        let old_ctx = mk(false);
+        let new_ctx = mk(true);
+        assert_eq!(old_ctx, new_ctx, "旧/新形 fold 后整只 ctx 必须逐字段等(新臂不许多做事)");
+        assert!(!old_ctx.authority_complete, "cancel 事件 fold 必须失效 authority");
+    }
+
     use super::*;
 
     fn ctx_default() -> OrderCtx {
