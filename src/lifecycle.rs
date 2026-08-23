@@ -431,6 +431,10 @@ pub enum JournalRecord {
         snapshot_boundary: Option<SnapshotBoundary>,
     },
     SubmitUnknown,
+    /// ★ SIDE 票 B:带 cid 的 SubmitUnknown。旧裸变体永久保留。
+    SubmitUnknownCid {
+        client_order_id: ClientOrderId,
+    },
     Fill {
         fill_id: FillId,
         qty: u64,
@@ -482,7 +486,15 @@ pub enum JournalRecord {
         fee_cents: Option<u64>,
     },
     ImmediateFillUnresolved,
+    /// ★ SIDE 票 B:带 cid。旧裸变体永久保留。
+    ImmediateFillUnresolvedCid {
+        client_order_id: ClientOrderId,
+    },
     UnknownNoMatch,
+    /// ★ SIDE 票 B:带 cid。旧裸变体永久保留。
+    UnknownNoMatchCid {
+        client_order_id: ClientOrderId,
+    },
     Halted {
         reason: HaltReason,
     },
@@ -964,7 +976,9 @@ pub fn apply_event(
         (OrderState::SubmitStarted { .. }, OrderEvent::SubmitTimeout) => {
             // ★ Timeout = Unknown persist, NEVER resubmit.
             let effects = vec![
-                Effect::AppendFsync(JournalRecord::SubmitUnknown),
+                Effect::AppendFsync(JournalRecord::SubmitUnknownCid {
+                    client_order_id: ctx.client_order_id.clone(),
+                }),
                 Effect::BackfillUnknown {
                     client_order_id: ctx.client_order_id.clone(),
                 },
@@ -1341,7 +1355,9 @@ pub fn apply_event(
             halt_with_reason_state(
                 OrderState::ImmediateFillUnresolved,
                 HaltReason::ImmediateFillUnresolved,
-                vec![Effect::AppendFsync(JournalRecord::ImmediateFillUnresolved)],
+                vec![Effect::AppendFsync(JournalRecord::ImmediateFillUnresolvedCid {
+                    client_order_id: ctx.client_order_id.clone(),
+                })],
             )
         }
         (OrderState::ImmediateFillUnattributed { .. }, _) => reject_illegal(state, event),
@@ -2114,8 +2130,8 @@ fn halt_with_reason_state(
         matches!(
             e,
             Effect::AppendFsync(JournalRecord::Halted { .. })
-                | Effect::AppendFsync(JournalRecord::ImmediateFillUnresolved)
-                | Effect::AppendFsync(JournalRecord::UnknownNoMatch)
+                | Effect::AppendFsync(JournalRecord::ImmediateFillUnresolvedCid { .. })
+                | Effect::AppendFsync(JournalRecord::UnknownNoMatchCid { .. })
         )
     });
     if !already_halted_journal {
@@ -3092,7 +3108,9 @@ fn apply_unknown_backfill(
             halt_with_reason_state(
                 OrderState::UnknownNoMatch,
                 HaltReason::UnknownNoMatch,
-                vec![Effect::AppendFsync(JournalRecord::UnknownNoMatch)],
+                vec![Effect::AppendFsync(JournalRecord::UnknownNoMatchCid {
+                    client_order_id: ctx.client_order_id.clone(),
+                })],
             )
         }
         0 => {
@@ -3763,7 +3781,7 @@ pub fn rebuild_ctx_from_journal(
                     recompute_response_domain(&mut ctx);
                 }
             }
-            JournalRecord::SubmitUnknown => {}
+            JournalRecord::SubmitUnknown | JournalRecord::SubmitUnknownCid { .. } => {}
             JournalRecord::Fill {
                 fill_id,
                 qty,
@@ -3846,7 +3864,9 @@ pub fn rebuild_ctx_from_journal(
                 restore_fill_obligation(&mut ctx, *fill_count)?;
             }
             JournalRecord::ImmediateFillUnresolved
+            | JournalRecord::ImmediateFillUnresolvedCid { .. }
             | JournalRecord::UnknownNoMatch
+            | JournalRecord::UnknownNoMatchCid { .. }
             | JournalRecord::Halted { .. } => {}
             // G4: non-terminal ctx mutations.
             JournalRecord::VenueBound { venue_order_id } => {
@@ -4124,6 +4144,95 @@ mod tests {
         assert_eq!(a.applied_fills, b.applied_fills);
         assert_eq!(a.fill_obligation, b.fill_obligation);
         assert_eq!(a.venue_order_id, b.venue_order_id);
+    }
+
+    #[test]
+    fn ticket_b_no_bare_unknown_emits() {
+        let src = include_str!("lifecycle.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("tests")];
+        // F9a 构造形:拼接 `AppendFsync(JournalRecord::`+`Xxx)` —— `Xxx)` 把 Cid 挡在针外,
+        // 覆盖 push/vec/逗号;halt_with_reason_state 已不留裸 match 臂。
+        let su = format!("AppendFsync(JournalRecord::{}", "SubmitUnknown)");
+        let nm = format!("AppendFsync(JournalRecord::{}", "UnknownNoMatch)");
+        let iu = format!("AppendFsync(JournalRecord::{}", "ImmediateFillUnresolved)");
+        assert_eq!(prod.matches(&su).count(), 0, "产线不得构造裸 SubmitUnknown");
+        assert_eq!(prod.matches(&nm).count(), 0, "产线不得构造裸 UnknownNoMatch");
+        assert_eq!(prod.matches(&iu).count(), 0, "产线不得构造裸 ImmediateFillUnresolved");
+        assert!(prod.contains("SubmitUnknownCid"));
+        assert!(prod.contains("UnknownNoMatchCid"));
+        assert!(prod.contains("ImmediateFillUnresolvedCid"));
+    }
+
+    #[test]
+    fn ticket_b_cid_payloads_on_unknown_paths() {
+        let mut ctx = ctx_default();
+        let cid = ctx.client_order_id.clone();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(&s, &mut ctx, &OrderEvent::SubmitTimeout);
+        assert!(o.effects().iter().any(|e| matches!(
+            e,
+            Effect::AppendFsync(JournalRecord::SubmitUnknownCid { client_order_id })
+                if client_order_id == &cid
+        )));
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: vec![],
+            },
+        );
+        assert!(o.effects().iter().any(|e| matches!(
+            e,
+            Effect::AppendFsync(JournalRecord::UnknownNoMatchCid { client_order_id })
+                if client_order_id == &cid
+        )));
+
+        let mut ctx = ctx_default();
+        let cid = ctx.client_order_id.clone();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::SubmitResponse {
+                venue_order_id: vid("W-ifu"),
+                fill_count: 3,
+                remaining_count: 7,
+                avg_price_cents: Some(45),
+                fee_cents: Some(1),
+                snapshot_boundary: None,
+            },
+        );
+        let s = o.new_state().unwrap().clone();
+        assert!(matches!(s, OrderState::ImmediateFillUnattributed { .. }));
+        let o = apply_event(&s, &mut ctx, &OrderEvent::BackfillDeadlineElapsed);
+        assert!(o.effects().iter().any(|e| matches!(
+            e,
+            Effect::AppendFsync(JournalRecord::ImmediateFillUnresolvedCid { client_order_id })
+                if client_order_id == &cid
+        )));
+    }
+
+    #[test]
+    fn ticket_b_fold_old_and_cid_unknown_equivalent() {
+        let cid = ctx_default().client_order_id.clone();
+        let fold = |recs: Vec<JournalRecord>| {
+            rebuild_ctx_from_journal(ctx_default(), &recs).expect("fold")
+        };
+        let a = fold(vec![JournalRecord::SubmitUnknown]);
+        let b = fold(vec![JournalRecord::SubmitUnknownCid {
+            client_order_id: cid.clone(),
+        }]);
+        assert_eq!(a, b);
+        let a = fold(vec![JournalRecord::UnknownNoMatch]);
+        let b = fold(vec![JournalRecord::UnknownNoMatchCid {
+            client_order_id: cid.clone(),
+        }]);
+        assert_eq!(a, b);
+        let a = fold(vec![JournalRecord::ImmediateFillUnresolved]);
+        let b = fold(vec![JournalRecord::ImmediateFillUnresolvedCid { client_order_id: cid }]);
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -4454,7 +4563,9 @@ mod tests {
         assert_eq!(
             o.effects(),
             &[
-                Effect::AppendFsync(JournalRecord::SubmitUnknown),
+                Effect::AppendFsync(JournalRecord::SubmitUnknownCid {
+                    client_order_id: ctx.client_order_id.clone(),
+                }),
                 Effect::BackfillUnknown {
                     client_order_id: ctx.client_order_id.clone(),
                 },
