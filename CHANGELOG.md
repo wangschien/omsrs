@@ -4,6 +4,24 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-09-02
+
+### Added
+
+- Add the reusable order lifecycle state machine and authoritative YES
+  inventory model used by host integrations.
+- Add client-order-aware journal variants for cancel requests, cancel
+  outcomes, venue binding, fills, submit-unknown outcomes, unknown-no-match
+  outcomes, and unresolved immediate fills while retaining legacy variants
+  for backward-compatible replay.
+
+### Fixed
+
+- Make repeated cancel transitions idempotent across cancel-pending and
+  reconcile-pending states.
+- Correct IOC miss, reconciliation, late-fill, and cancel-outcome lifecycle
+  handling so terminal state and reservation release remain consistent.
+
 ## [0.3.3] — 2026-06-12
 
 ### Fixed
