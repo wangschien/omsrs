@@ -1,6 +1,6 @@
 //! YES-market inventory authority using [`crate::BasicPosition`].
 //!
-//! O2: fill / net ownership lives in **omsrs**, not kbot.
+//! Tracks fill-derived net position with decimal contract quantities.
 
 use rust_decimal::Decimal;
 

@@ -1081,14 +1081,8 @@ impl Order {
 //    of `&dyn Broker`.
 // 2. `attribs_to_copy_<phase>()` and `order_place/modify/cancel`
 //    are `.await`ed.
-// 3. `save_to_db()` stays **sync** (it calls `rusqlite` under
-//    the persistence feature). Callers that enable persistence
-//    on the async path should wrap `execute_async` /
-//    `modify_async` in `tokio::task::spawn_blocking` or live
-//    with the blocking write; this is documented in the R12
-//    plan as an explicit non-goal (R13 would add async
-//    persistence). pbot does not enable persistence, so the
-//    caveat doesn't apply.
+// 3. Persistence uses `save_to_db_async`, which runs the synchronous
+//    SQLite upsert through `tokio::task::spawn_blocking`.
 impl Order {
     /// Async sibling of [`Order::execute`]. Same semantics, same
     /// early-return-if-completed-or-already-placed guard, same

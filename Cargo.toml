@@ -4,7 +4,7 @@ version = "0.4.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
-description = "Rust port of omspy — order management primitives"
+description = "Broker-agnostic order management, lifecycle, and simulation primitives"
 repository = "https://github.com/wangschien/omsrs"
 
 [features]

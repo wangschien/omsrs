@@ -5,22 +5,42 @@
 [![CI](https://github.com/wangschien/omsrs/actions/workflows/ci.yml/badge.svg)](https://github.com/wangschien/omsrs/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/omsrs.svg)](https://github.com/wangschien/omsrs/blob/main/LICENSE)
 
-**Rust port of [omspy](https://github.com/uberdeveloper/omspy)** — a broker-agnostic OMS for trading.
+**Rust port of [omspy](https://github.com/uberdeveloper/omspy)** - broker-agnostic order-management primitives for Rust.
 
-Pure-Rust re-implementation of omspy's MVP order-management core: `Order` lifecycle, `Broker` trait, paper-simulation engine, and virtual-broker matching engine. Built to host venue adapters for prediction-market exchanges (Polymarket, Kalshi) and anything else that fits the `Broker` shape.
+`omsrs` provides sync and async broker traits, order lifecycle management,
+paper simulation, virtual matching engines, order aggregation, persistence,
+and a deterministic event-driven lifecycle core. Applications supply their
+own venue adapter by implementing `Broker` or `AsyncBroker`.
 
 ## Status
 
-**v0.1.0** (2026-04-21): all 10 implementation phases complete. Parity gate: 237 upstream pytest items, 236 pass + 1 excused (`test_order_timezone` — pendulum tz-name not expressible in `chrono::DateTime<Utc>`, §14B). Every phase codex-audited individually; see `docs/PORT-PLAN-R{1..10}-audit-result.md`.
+**v0.1.0** (2026-04-21): initial order, broker, paper simulation,
+virtual matching, persistence, compound-order, and strategy APIs.
 
-**v0.2.0** (2026-04-21): additive `AsyncBroker` trait + `AsyncPaper` reference impl. Motivated by downstream pbot (`github.com/wangschien/pbot`) — every real prediction-market SDK in scope (Polymarket `rs-clob-client`, Kalshi `kalshi-rs`) is async, and routing them through the sync `Broker` trait forces a `block_on` bridge per adapter. v0.2 is **non-breaking**: the v0.1.0 237-item parity gate passes unchanged; sync `Broker` / `Paper` / `VirtualBroker` / `ReplicaBroker` / `CompoundOrder` / `OrderStrategy` are byte-identical. Two R11 phases (R11.1 trait + R11.2 AsyncPaper + 10-item async parity) codex-audited with ACK; see `docs/audit-R11.{1,2,3}-codex-result.md`.
+**v0.2.0** (2026-04-21): additive `AsyncBroker` trait and `AsyncPaper`
+reference implementation. Existing synchronous APIs remain unchanged.
 
-**v0.3.0** (2026-04-22): **async coverage completion**. Adds `AsyncVirtualBroker`, `AsyncReplicaBroker`, async `Order::execute_async` / `modify_async` / `cancel_async`, `AsyncCompoundOrder`, `AsyncOrderStrategy`. All five sub-phases (R12.1–R12.3b) codex-audited with ACK; see `docs/audit-R12.{1,2,3a,3b}-codex-result.md`. **Non-breaking**: every v0.2.0 public signature is unchanged; the v0.1.0 237-item parity sweep still passes. Async additions use a consistent pattern:
+**v0.3.0** (2026-04-22): completes the asynchronous API with
+`AsyncVirtualBroker`, `AsyncReplicaBroker`, async order lifecycle methods,
+`AsyncCompoundOrder`, and `AsyncOrderStrategy`. Existing v0.2 APIs remain
+unchanged. The async additions use a consistent pattern:
 - Inherent methods return the rich sync shape (`BrokerReply`, `OrderHandle`) for callers that want it
 - `impl AsyncBroker` provides a lossy `Option<String>` adapter for trait-object use
-- No `tokio` dependency in production — `parking_lot::Mutex` with no await-while-locked, matching `AsyncPaper`'s existing pattern
+- Broker operations do not require a particular executor; the narrow `tokio`
+  dependency supports non-blocking persistence writes
 - Shared-identity invariants (`Arc::ptr_eq` across matching-engine collections) preserved
 - Order's async lifecycle methods are siblings, not replacements — sync `execute` / `modify` / `cancel` still compile and work
+
+**v0.3.1-v0.3.3** (2026-04-27 to 2026-06-12): hardens asynchronous
+cancellation, persistence, cumulative fill handling, and Rust 1.78 build
+compatibility.
+
+**v0.4.0** (2026-09-02): adds a deterministic per-order lifecycle state
+machine, typed client/venue/fill/attempt identities, replayable journal
+records, reconciliation and reservation-release effects, backward-compatible
+client-order-aware journal variants, and a binary-outcome inventory helper.
+It also hardens repeated cancellation, IOC misses, late fills, and terminal
+reconciliation. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 | phase | items | surface |
 |---|---:|---|
@@ -35,7 +55,7 @@ Pure-Rust re-implementation of omspy's MVP order-management core: `Order` lifecy
 | R9 | 7 | `OrderStrategy` + clock-cascade on `add` (§6 D4) |
 | R10 | — | parity sweep + stabilisation |
 
-## For downstream consumers (e.g. pbot)
+## Synchronous broker adapters
 
 omsrs is **ready to embed**. Write your venue adapter as `impl Broker for YourBroker` and every `Order::execute / modify / cancel` path works:
 
@@ -44,11 +64,11 @@ use std::collections::HashMap;
 use omsrs::{Broker, Order, OrderInit};
 use serde_json::Value;
 
-pub struct PolymarketBroker { /* client, credentials, ... */ }
+pub struct VenueBroker { /* client, credentials, ... */ }
 
-impl Broker for PolymarketBroker {
+impl Broker for VenueBroker {
     fn order_place(&self, args: HashMap<String, Value>) -> Option<String> {
-        // map kwargs → Polymarket CLOB API call, return broker-assigned order_id
+        // Map the request to an external API and return its order ID.
     }
     fn order_modify(&self, args: HashMap<String, Value>) { /* ... */ }
     fn order_cancel(&self, args: HashMap<String, Value>) { /* ... */ }
@@ -56,14 +76,14 @@ impl Broker for PolymarketBroker {
 }
 
 let mut order = Order::from_init(OrderInit {
-    symbol: "BTC-YES".into(),
+    symbol: "EXAMPLE".into(),
     side: "buy".into(),
     quantity: 10,
     order_type: Some("LIMIT".into()),
     price: Some(rust_decimal_macros::dec!(0.42)),
     ..Default::default()
 });
-let broker = PolymarketBroker::new(/* ... */);
+let broker = VenueBroker::new(/* ... */);
 order.execute(&broker, None, HashMap::new());
 ```
 
@@ -71,7 +91,8 @@ order.execute(&broker, None, HashMap::new());
 
 ## Async venue adapters (v0.2)
 
-If your venue SDK is async — which every real prediction-market SDK we've seen is — implement `AsyncBroker` instead. Same method surface as `Broker`, async throughout:
+For an asynchronous client, implement `AsyncBroker`. It provides the same
+method surface as `Broker` with asynchronous operations throughout:
 
 ```rust
 use async_trait::async_trait;
@@ -79,10 +100,10 @@ use std::collections::HashMap;
 use omsrs::AsyncBroker;
 use serde_json::Value;
 
-pub struct PolymarketBroker { /* reqwest client, credentials, ... */ }
+pub struct VenueBroker { /* async client, credentials, ... */ }
 
 #[async_trait]
-impl AsyncBroker for PolymarketBroker {
+impl AsyncBroker for VenueBroker {
     async fn order_place(&self, args: HashMap<String, Value>) -> Option<String> {
         // .await into your async venue SDK directly — no block_on bridge
     }
@@ -95,13 +116,13 @@ v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics) and a 10
 
 ### v0.3 async matching engines + order lifecycle
 
-The quickstart below uses `#[tokio::main]` so the async APIs can
-`.await`. `tokio` is **not** an `omsrs` production dependency —
-consumers bring their own runtime:
+The quickstart below uses `#[tokio::main]` so the async APIs can `.await`.
+Broker implementations may use another executor; the library's Tokio
+dependency is limited to its asynchronous persistence helper:
 
 ```toml
 [dependencies]
-omsrs = "0.3"
+omsrs = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -155,7 +176,7 @@ Order lifecycle siblings (`execute_async` / `modify_async` / `cancel_async`) let
 
 ```toml
 [dependencies]
-omsrs = "0.3"
+omsrs = "0.4"
 
 # persistence = ["dep:rusqlite"]  — off by default (§7 "MSRV-minimum build")
 # statistical-tests — test-only, gates tests/statistical
@@ -190,10 +211,10 @@ omsrs = "0.3"
 - Aggregates (R8/R9): `CompoundOrder` / `OrderStrategy`
 
 **Out of MVP** (per PORT-PLAN §11 non-goals):
-- Indian-broker adapters (Zerodha / Finvasia / ICICI / Neo / Noren) — deliberately skipped
+- Venue-specific HTTP and WebSocket adapters
 - `omspy.algos` / `omspy.multi` / candle-tracker (`Candle`, `CandleStick`) — defer
 - `yaml` override loading — defer, test fixtures pre-apply renames
-- HTTP / WebSocket client crates — broker adapters are downstream's job
+- Network clients and credential management
 
 ## Documentation
 

@@ -427,7 +427,7 @@ fn push_completed_unique(completed: &mut Vec<OrderHandle>, handle: &OrderHandle)
 //
 // Same pattern as `AsyncVirtualBroker`: rich `OrderHandle` on the
 // inherent methods; `Option<String>` / `()` on the trait path for
-// dyn-dispatch consumers (pbot-style `Arc<dyn AsyncBroker>`).
+// dynamic-dispatch consumers using `Arc<dyn AsyncBroker>`.
 
 #[async_trait]
 impl AsyncBroker for AsyncReplicaBroker {

@@ -513,9 +513,8 @@ impl AsyncVirtualBroker {
 //
 // The trait collapses `BrokerReply` to `Option<String>` / `()` —
 // callers that want the rich reply use the inherent
-// `place`/`modify`/`cancel` methods above. Pbot's event loop only
-// needs the `Option<String>` so the lossy path is what production
-// actually uses; parity tests drive the inherent path.
+// `place`/`modify`/`cancel` methods above. Consumers that only need an
+// order ID can use the trait path; parity tests drive the inherent path.
 
 #[async_trait]
 impl AsyncBroker for AsyncVirtualBroker {

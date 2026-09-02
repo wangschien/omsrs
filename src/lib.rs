@@ -39,5 +39,5 @@ pub use utils::{
     create_basic_positions_from_orders_dict, dict_filter, update_quantity, OrderRecord, UQty,
 };
 
-// Lifecycle / true-money OMS core (moved from kbot oms_state). Use
-// `omsrs::lifecycle::*` — not aliased over async_broker names.
+// Deterministic lifecycle core. Use `omsrs::lifecycle::*`; its names are
+// intentionally not aliased over the broker API.

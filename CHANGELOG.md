@@ -8,12 +8,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Add the reusable order lifecycle state machine and authoritative YES
-  inventory model used by host integrations.
+- Add a deterministic, I/O-free per-order lifecycle state machine with typed
+  client-order, venue-order, fill, and attempt identifiers.
+- Add explicit states and effects for submission, cancellation,
+  reconciliation, immediate fills, terminal resolution, reservation release,
+  and fail-closed halts.
+- Add replayable journal records and context reconstruction for deterministic
+  recovery and testing.
 - Add client-order-aware journal variants for cancel requests, cancel
   outcomes, venue binding, fills, submit-unknown outcomes, unknown-no-match
-  outcomes, and unresolved immediate fills while retaining legacy variants
-  for backward-compatible replay.
+  outcomes, and unresolved immediate fills. Legacy journal variants remain
+  readable for backward-compatible replay.
+- Add `YesInventory`, a decimal-based helper for binary-outcome position and
+  centi-contract accounting.
 
 ### Fixed
 
@@ -21,6 +28,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   reconcile-pending states.
 - Correct IOC miss, reconciliation, late-fill, and cancel-outcome lifecycle
   handling so terminal state and reservation release remain consistent.
+- Preserve monotonic fill obligations and reject conflicting duplicate fill
+  payloads instead of silently changing accounted state.
+
+### Compatibility
+
+- Existing broker, paper, simulation, aggregate-order, and strategy APIs are
+  unchanged. The lifecycle and inventory modules are additive.
 
 ## [0.3.3] — 2026-06-12
 
@@ -53,14 +67,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.3.1] — 2026-04-27
 
-**Correctness round** triggered by an independent OMS-layer
-audit. Four omsrs-internal fixes (F1, F2, F4, F6) plus two
-follow-up fixes from the codex re-audit (Q4, Q6).
-
 ### Fixed
 
-- **F1 — `AsyncReplicaBroker::run_fill` × cancel race
-  (BLOCKING).** Phase B (no locks held) released the broker
+- **`AsyncReplicaBroker::run_fill` cancellation race.** The fill path released the broker
   inner-lock between `apply_fill_update` and Phase C's
   promote-to-`completed`. A concurrent `cancel(oid)` could push
   the same `Arc<Mutex<VOrder>>` into `inner.completed` twice.
@@ -68,7 +77,7 @@ follow-up fixes from the codex re-audit (Q4, Q6).
   for dedupe; every `completed` promotion routes through it
   (cancel Phase 3, run_fill Phase C, and the unknown-symbol
   reject path in `place`).
-- **F2 — sync `save_to_db` on Tokio worker (BLOCKING).**
+- **Synchronous persistence on a Tokio worker.**
   `Order::execute_async` and `modify_async` called sync
   rusqlite `save_to_db()` directly, stalling Tokio worker
   threads on disk I/O. New `save_to_db_async` wraps
@@ -77,13 +86,13 @@ follow-up fixes from the codex re-audit (Q4, Q6).
   clean `false + log` instead of a synchronous panic. `tokio`
   promoted from dev-dep to a regular dep with the narrow `rt`
   feature only.
-- **F4 — silently swallowed persistence errors (HIGH).** Both
+- **Silently swallowed persistence errors.** Both
   `save_to_db` (sync) and `save_to_db_async` now log to stderr
   on `upsert_order` Err, on JoinError (panic / cancel), and on
   missing-runtime. Caller contract still returns `bool` — but
   failures are no longer invisible.
-- **F6 — non-monotonic `filled_quantity` on out-of-order
-  events (HIGH).** `Order.update`'s `set_from_value` /
+- **Non-monotonic `filled_quantity` on out-of-order events.**
+  `Order.update`'s `set_from_value` /
   `set_local_field` blindly assigned the incoming
   `filled_quantity`, so a stale lower-numbered WS / poll
   redelivery rolled cumulative state backwards. Fix: clamp to
@@ -100,27 +109,19 @@ follow-up fixes from the codex re-audit (Q4, Q6).
   is intentionally narrow; consumers bring their own runtime
   as before.
 
-### Audit trail
-
-- Audit docs in `bot/docs/oms-deep-audit-2026-04-27-deepseek.md`
-  and `bot/docs/oms-3way-parity-2026-04-27-deepseek.md`.
-- Codex audit ACK'd `5e0fc8a + fb84c1f` round-1 (4 PASS,
-  Q4 + Q6 NACK) and `019a8ab` round-2 (7 PASS, ACK).
-
 ## [0.3.0] — 2026-04-22
 
-**R12 — async coverage completion.** Five sub-phases, each
-codex-audited individually with ACK.
+**Async API coverage completion.**
 
 ### Added
 
-- `AsyncVirtualBroker` (R12.1) — async port of `VirtualBroker`.
+- `AsyncVirtualBroker` - async port of `VirtualBroker`.
   Inherent `async fn place` / `modify` / `cancel` return the
   full `BrokerReply`; `impl AsyncBroker` provides a lossy
   `Option<String>` adapter for trait-object use. Seed parity
   with sync `VirtualBroker` — same `SmallRng` seed produces
   bit-for-bit identical reply sequences.
-- `AsyncReplicaBroker` (R12.2) — async port of the standalone
+- `AsyncReplicaBroker` - async port of the standalone
   `ReplicaBroker` matching engine (not a primary/replica
   wrapper — sync `ReplicaBroker` is a matching engine, not a
   mirror). Shared-identity contract via `Arc<Mutex<VOrder>>`
@@ -128,16 +129,16 @@ codex-audited individually with ACK.
   `completed()` / `fills()` / `user_orders()` returns true for
   the same order. Lock discipline: never hold inner while
   taking handle lock (ABBA deadlock prevention).
-- `Order::execute_async` / `modify_async` / `cancel_async`
-  (R12.3a) — async siblings of the sync lifecycle methods.
+- `Order::execute_async` / `modify_async` / `cancel_async` - async siblings of
+  the sync lifecycle methods.
   Take `&(dyn AsyncBroker + Send + Sync)`; await the broker's
   `attribs_to_copy_<phase>()` and lifecycle calls. Sync
   signatures unchanged.
-- `AsyncCompoundOrder` (R12.3b) — async port of `CompoundOrder`.
+- `AsyncCompoundOrder` - async port of `CompoundOrder`.
   Stores `Option<Arc<dyn AsyncBroker + Send + Sync>>`;
   `execute_all_async` + `check_flags_async` fan out to
   `Order::execute_async` etc.
-- `AsyncOrderStrategy` (R12.3b) — async port of `OrderStrategy`.
+- `AsyncOrderStrategy` - async port of `OrderStrategy`.
   `run(ltp)` callback stays synchronous by design (closure
   body doesn't do I/O).
 
@@ -163,13 +164,13 @@ codex-audited individually with ACK.
   for `tokio::time::timeout`). `tokio` remains **dev-only**;
   no change to production surface.
 
-### Non-goals (explicitly deferred to future phases)
+### Not included
 
 - Async persistence — `save_to_db()` stays synchronous inside
   the async `Order::execute_async` / `modify_async` methods.
   Callers that enable the `persistence` feature on an async
   path should wrap with `tokio::task::spawn_blocking`. Full
-  async persistence is R13 scope.
+  asynchronous persistence was not included in this release.
 - `AsyncClock` — sync `Clock` is process-local, I/O-free, so
   no async variant is needed.
 - N-replica fan-out for `AsyncReplicaBroker` — current shape
@@ -185,17 +186,16 @@ completion as a visible milestone.
 
 ## [0.2.0] — 2026-04-21
 
-**R11 — additive AsyncBroker trait.** Three sub-phases, all
-codex-audited with ACK.
+**Additive asynchronous broker interface.**
 
 ### Added
 
-- `AsyncBroker` trait (R11.1) — async sibling of `Broker`,
+- `AsyncBroker` trait - async sibling of `Broker`,
   same method surface with `async fn`. Requires `async_trait`
   macro on impl blocks.
-- `AsyncPaper` (R11.2) — reference `AsyncBroker` impl
+- `AsyncPaper` - reference `AsyncBroker` implementation
   mirroring sync `Paper`.
-- `tests/parity_async.rs` (R11.3) — 10-item async parity
+- `tests/parity_async.rs` - 10-item async parity
   harness mirroring sync R4 base tests.
 
 ### Dependency changes
@@ -210,8 +210,7 @@ codex-audited with ACK.
 
 ## [0.1.0] — 2026-04-21
 
-**MVP — 10 implementation phases (R1-R10), 237-item parity
-manifest.**
+**Initial order-management feature set.**
 
 ### Added
 

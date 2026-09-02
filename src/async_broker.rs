@@ -1,22 +1,17 @@
 //! Async sibling of [`crate::Broker`]. v0.2 additive: neither replaces
 //! nor breaks the sync trait.
 //!
-//! Motivation (from pbot R3.3b planning, 2026-04-21): every real
-//! prediction-market SDK pbot integrates with is async (Polymarket's
-//! `rs-clob-client`, Kalshi's `kalshi-rs`). The v0.1.0 sync `Broker`
-//! stays the right contract for `Paper`, `VirtualBroker`, `ReplicaBroker`,
-//! `CompoundOrder`, and `OrderStrategy` — all of which model omspy
-//! semantics that are intrinsically sync. But wrapping an async venue
-//! client behind the sync trait forces a `block_on` bridge at every
-//! broker implementation. `AsyncBroker` lives alongside `Broker` so
-//! venue adapters can implement the async path directly; sync
-//! consumers are untouched.
+//! The synchronous `Broker` remains the contract for `Paper`,
+//! `VirtualBroker`, `ReplicaBroker`, `CompoundOrder`, and `OrderStrategy`.
+//! Wrapping an asynchronous client behind that trait would require a
+//! `block_on` bridge in each implementation, so `AsyncBroker` provides a
+//! direct asynchronous path while leaving synchronous consumers unchanged.
 //!
 //! The default methods (`close_all_positions`, `cancel_all_orders`,
 //! `get_positions_from_orders`) are line-for-line async mirrors of
 //! their sync counterparts in [`crate::broker`]. Keeping them in
-//! lock-step means pbot's R2.3-style 10-item Paper parity harness
-//! ports to AsyncPaper with only the `#[tokio::test]` macro change.
+//! lock-step allows the synchronous Paper parity cases to run against
+//! `AsyncPaper` with only asynchronous test setup.
 
 use std::collections::HashMap;
 use std::sync::Arc;

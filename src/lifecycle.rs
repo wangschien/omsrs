@@ -1,7 +1,6 @@
 //! Order lifecycle state machine + client↔venue id mapping (OMS core).
 //!
-//! Moved from kbot `oms_state` into **omsrs** so platform-agnostic order
-//! authority lives here (GROK_NEXT_O1_O2_OMSRS_CORE O1). Pure: no I/O.
+//! This module owns platform-agnostic order authority and performs no I/O.
 //!
 //! OMS per-order lifecycle state machine — pure deterministic core (§6 B/B2/C/D).
 //!
@@ -373,7 +372,7 @@ pub enum OrderEvent {
         qty: u64,
         price_cents: u64,
         ts_ns: i64,
-        /// Kalshi WS fill carries order_id — required once parent venue id is known (R3).
+        /// Venue fill identifier, required once the parent venue order is known.
         venue_order_id: Option<VenueOrderId>,
         /// Venue-reported fee cents for this fill (E3).
         fee_cents: Option<u64>,
@@ -463,7 +462,8 @@ pub enum JournalRecord {
     },
     CancelRequested,
     CancelOutcome(CancelOutcome),
-    /// ★ F9a(kbot spec F9A v3):带 cid 的撤单事件——旧裸变体**永久保留**(新读老);
+    /// Client-order-aware cancel event. The legacy variant remains readable
+    /// for backward-compatible journal replay.
     /// emit 全部切到 Cid 形;fold 语义与裸形逐字节同(仅 authority 失效)。
     CancelRequestedCid {
         client_order_id: ClientOrderId,
