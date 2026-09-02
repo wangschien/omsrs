@@ -4,6 +4,20 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-09-02
+
+### Documentation
+
+- Describe the crate in terms of its reusable order-management, lifecycle,
+  simulation, and persistence capabilities.
+- Add complete v0.4 lifecycle and journal release notes.
+- Replace application-specific README and Rustdoc examples with generic
+  broker-adapter examples.
+
+### Compatibility
+
+- No functional or public API changes from v0.4.0.
+
 ## [0.4.0] — 2026-09-02
 
 ### Added

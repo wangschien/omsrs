@@ -42,6 +42,10 @@ client-order-aware journal variants, and a binary-outcome inventory helper.
 It also hardens repeated cancellation, IOC misses, late fills, and terminal
 reconciliation. See [CHANGELOG.md](CHANGELOG.md) for details.
 
+**v0.4.1** (2026-09-02): documentation-only release with a generic crate
+description, complete v0.4 release notes, and application-neutral examples.
+There are no functional or public API changes from v0.4.0.
+
 | phase | items | surface |
 |---|---:|---|
 | R1 | 20 | `utils` + `BasicPosition` + parity harness (libtest-mimic) + 13-row smoke matrix |
