@@ -12,6 +12,7 @@ pub mod compound_order;
 pub mod models;
 pub mod order;
 pub mod lifecycle;
+pub mod execution;
 pub mod yes_inventory;
 pub mod order_strategy;
 pub mod parity_gate;

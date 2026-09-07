@@ -72,7 +72,7 @@ pub struct FillId(pub String);
 pub struct AttemptId(pub String);
 
 /// Local side mirror (isolated from connector/strategy types).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     BuyYes,
     SellYes,
@@ -90,7 +90,7 @@ pub fn derive_client_order_id(market: &str, strategy: &str, seq: u64) -> ClientO
 // ─── Order state (§6.B + B2 + C) ──────────────────────────────────────────────
 
 /// Per-order lifecycle state (typed; exhaustive for the pure core).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderState {
     /// Pre-prepare: no durable intent yet.
     New,
@@ -177,14 +177,14 @@ impl OrderState {
 // ─── Reconcile target (E5) ────────────────────────────────────────────────────
 
 /// Known venue terminal intent while still reconciling fill attribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReconcileTerminal {
     Canceled,
     Filled,
 }
 
 /// Target final state after attribution catches up to venue_filled_qty.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileTarget {
     pub terminal: ReconcileTerminal,
     pub venue_filled_qty: u64,
@@ -257,7 +257,7 @@ pub enum HaltReason {
     Operator(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
     /// Illegal transition for current state.
     IllegalTransition { state: String, event: String },
@@ -294,7 +294,7 @@ pub enum CancelOutcome {
 
 /// First-seen fill payload stored for conflict detection (D7 / R4).
 /// Full-field equality required for NoOp; venue/fee None→Some is upgrade (F2/F5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FillPayload {
     pub qty: u64,
     pub price_cents: u64,
@@ -313,7 +313,7 @@ pub enum SnapshotBoundary {
 }
 
 /// One attributed fill (WS or GET). Always carries authoritative `fill_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FillRecord {
     pub fill_id: FillId,
     pub qty: u64,
@@ -328,7 +328,7 @@ pub struct FillRecord {
 }
 
 /// Matched order row from §6.C backfill (shell-fetched, pure-matched here).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillOrderRecord {
     pub client_order_id: ClientOrderId,
     pub venue_order_id: VenueOrderId,
@@ -338,7 +338,7 @@ pub struct BackfillOrderRecord {
     pub fills: Vec<FillRecord>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackfillOrderStatus {
     Open,
     Partial,
@@ -535,6 +535,10 @@ pub enum JournalRecord {
         attributed_fill_qty: u64,
         attributed_fee_cents: u64,
     },
+    /// OMS-A scoped order transaction (emitted only by execution API).
+    OrderTxn(Box<crate::execution::OrderTxnRecord>),
+    /// OMS-A scoped execution transaction (emitted only by execution API).
+    ExecutionTxn(Box<crate::execution::ExecutionTxnRecord>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -688,7 +692,7 @@ pub fn reservation_held(state: &OrderState) -> ReservationHold {
 /// **F1/G1:** `authority_complete` is a **generation-scoped** latch — the release gate
 /// reads only ctx fields; callers cannot feed a one-shot boolean into finalize.
 /// Fill-admitting activity bumps `authority_epoch` and clears the latch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderCtx {
     pub client_order_id: ClientOrderId,
     pub market: String,
@@ -1367,7 +1371,7 @@ pub fn apply_event(
     }
 }
 
-fn is_restart_frozen(state: &OrderState) -> bool {
+pub(crate) fn is_restart_frozen(state: &OrderState) -> bool {
     matches!(
         state,
         OrderState::Filled
@@ -2104,7 +2108,7 @@ fn fee_cross_check_mismatch(response_fee: Option<u64>, attributed_fee: u64) -> O
 // ─── R6 unified halt helper ───────────────────────────────────────────────────
 
 /// **All** Halt paths append durable `JournalRecord::Halted` + HaltNewExposure.
-fn halt_with_reason(reason: HaltReason, mut prior: Vec<Effect>) -> TransitionOutcome {
+pub(crate) fn halt_with_reason(reason: HaltReason, mut prior: Vec<Effect>) -> TransitionOutcome {
     prior.push(Effect::AppendFsync(JournalRecord::Halted {
         reason: reason.clone(),
     }));
@@ -3661,7 +3665,7 @@ fn apply_cancel_outcome(
 
 // ─── TransitionOutcome helpers ────────────────────────────────────────────────
 
-fn accept(new_state: OrderState, effects: Vec<Effect>) -> TransitionOutcome {
+pub(crate) fn accept(new_state: OrderState, effects: Vec<Effect>) -> TransitionOutcome {
     TransitionOutcome::Accept { new_state, effects }
 }
 
@@ -3721,7 +3725,7 @@ fn state_name(s: &OrderState) -> &'static str {
     }
 }
 
-fn event_name(e: &OrderEvent) -> &'static str {
+pub(crate) fn event_name(e: &OrderEvent) -> &'static str {
     match e {
         OrderEvent::PrepareSubmit => "PrepareSubmit",
         OrderEvent::StartSubmit { .. } => "StartSubmit",
@@ -3950,6 +3954,8 @@ pub fn rebuild_ctx_from_journal(
                     ctx.attributed_fee_cents = *attributed_fee_cents;
                 }
             }
+            // OMS-A: scoped txn records ignored by legacy fold.
+            JournalRecord::OrderTxn(_) | JournalRecord::ExecutionTxn(_) => {}
         }
     }
     Ok(ctx)
