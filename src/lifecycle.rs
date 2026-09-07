@@ -181,6 +181,9 @@ impl OrderState {
 pub enum ReconcileTerminal {
     Canceled,
     Filled,
+    /// Generic terminal intent (OMS-C). Same core gates as Canceled/Filled;
+    /// never resumes as a per-cid Filled or Canceled count.
+    Terminal,
 }
 
 /// Target final state after attribution catches up to venue_filled_qty.
@@ -408,6 +411,10 @@ pub enum OrderEvent {
         /// Shell proves open orders + positions + fill authority fully fetched (E2).
         authority_complete: bool,
     },
+    /// OMS-C: own remaining-changing decrease ack.
+    DecreaseObserved { remaining: u64, ts_ms: i64 },
+    /// OMS-C: own remaining-changing amend ack.
+    AmendObserved,
 }
 
 // ─── Effects (pure descriptions — shell executes) ─────────────────────────────
@@ -539,6 +546,19 @@ pub enum JournalRecord {
     OrderTxn(Box<crate::execution::OrderTxnRecord>),
     /// OMS-A scoped execution transaction (emitted only by execution API).
     ExecutionTxn(Box<crate::execution::ExecutionTxnRecord>),
+    /// OMS-C single self-contained observation record.
+    ObservationTxn(Box<crate::observation::ObservationTxnRecord>),
+    /// OMS-C own remaining-changing action, carried in A's OrderTxn core records.
+    OwnActionCid {
+        client_order_id: ClientOrderId,
+        kind: OwnActionKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OwnActionKind {
+    Decrease { remaining: u64, ts_ms: i64 },
+    Amend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -588,6 +608,8 @@ pub enum Effect {
     ReserveFull,
     /// Block new exposure at account portfolio owner (HALT paths).
     HaltNewExposure,
+    /// OMS-C round outcome published to the shell (non-durable).
+    Observation(crate::observation::ObservationOutcome),
     // Intentionally NO Resubmit / RetrySubmit effect.
 }
 
@@ -1134,6 +1156,9 @@ pub fn apply_event(
                 effects,
             )
         }
+        (OrderState::Accepted { .. } | OrderState::Partial { .. }, OrderEvent::DecreaseObserved { .. } | OrderEvent::AmendObserved) => {
+            own_action_accept(state, ctx, event)
+        }
         (OrderState::Accepted { .. } | OrderState::Partial { .. }, _) => reject_illegal(state, event),
 
         // ── CancelPending typed outcomes ──────────────────────────────────
@@ -1225,6 +1250,9 @@ pub fn apply_event(
             // no-op：状态不变、零 effect（重试不重复记 journal）。
             accept(state.clone(), vec![])
         }
+        (OrderState::CancelPending { .. }, OrderEvent::DecreaseObserved { .. } | OrderEvent::AmendObserved) => {
+            own_action_accept(state, ctx, event)
+        }
         (OrderState::CancelPending { .. }, _) => reject_illegal(state, event),
 
         // ── E5 ReconcilePending ───────────────────────────────────────────
@@ -1304,6 +1332,9 @@ pub fn apply_event(
         (OrderState::ReconcilePending { .. }, OrderEvent::CancelOutcome(_)) => {
             accept(state.clone(), vec![])
         }
+        (OrderState::ReconcilePending { .. }, OrderEvent::DecreaseObserved { .. } | OrderEvent::AmendObserved) => {
+            own_action_accept(state, ctx, event)
+        }
         (OrderState::ReconcilePending { .. }, _) => reject_illegal(state, event),
 
         // ── §6.B2 ImmediateFillUnattributed ───────────────────────────────
@@ -1355,6 +1386,9 @@ pub fn apply_event(
                 effects,
             )
         }
+        (OrderState::ImmediateFillUnattributed { .. }, OrderEvent::DecreaseObserved { .. } | OrderEvent::AmendObserved) => {
+            own_action_accept(state, ctx, event)
+        }
         (OrderState::ImmediateFillUnattributed { .. }, OrderEvent::BackfillDeadlineElapsed) => {
             halt_with_reason_state(
                 OrderState::ImmediateFillUnresolved,
@@ -1393,6 +1427,13 @@ fn restart_safe_handle(
     ctx: &mut OrderCtx,
     event: &OrderEvent,
 ) -> TransitionOutcome {
+    // OMS-C: frozen own-action is a pure no-op Accept (no effect, no record).
+    if matches!(
+        event,
+        OrderEvent::DecreaseObserved { .. } | OrderEvent::AmendObserved
+    ) {
+        return accept(state.clone(), vec![]);
+    }
     if let OrderEvent::Fill {
         fill_id,
         qty,
@@ -2178,7 +2219,7 @@ pub enum ProposedTerminal {
 /// 5. ownership: every attributed fill with known parent venue has Some(venue)==bound (G2)
 ///
 /// Any failure → ReconcilePending (recoverable) or Halt (contradiction) — **no release**.
-fn try_finalize_terminal(
+pub(crate) fn try_finalize_terminal(
     ctx: &OrderCtx,
     proposed: ProposedTerminal,
     venue_order_id: VenueOrderId,
@@ -3077,6 +3118,13 @@ fn finalize_reconcile_target(
                 ReconcileTerminal::Filled,
             )
         }
+        ReconcileTerminal::Terminal => try_finalize_terminal(
+            ctx,
+            ProposedTerminal::Terminal,
+            venue_order_id,
+            effects,
+            ReconcileTerminal::Terminal,
+        ),
     }
 }
 
@@ -3739,7 +3787,31 @@ pub(crate) fn event_name(e: &OrderEvent) -> &'static str {
         OrderEvent::BackfillDeadlineElapsed => "BackfillDeadlineElapsed",
         OrderEvent::RequestResubmit { .. } => "RequestResubmit",
         OrderEvent::ReconcileResult { .. } => "ReconcileResult",
+        OrderEvent::DecreaseObserved { .. } => "DecreaseObserved",
+        OrderEvent::AmendObserved => "AmendObserved",
     }
+}
+
+fn own_action_accept(
+    state: &OrderState,
+    ctx: &OrderCtx,
+    event: &OrderEvent,
+) -> TransitionOutcome {
+    let kind = match event {
+        OrderEvent::DecreaseObserved { remaining, ts_ms } => OwnActionKind::Decrease {
+            remaining: *remaining,
+            ts_ms: *ts_ms,
+        },
+        OrderEvent::AmendObserved => OwnActionKind::Amend,
+        _ => return reject_illegal(state, event),
+    };
+    accept(
+        state.clone(),
+        vec![Effect::AppendFsync(JournalRecord::OwnActionCid {
+            client_order_id: ctx.client_order_id.clone(),
+            kind,
+        })],
+    )
 }
 
 // ─── Journal rebuild (F7/G4) ──────────────────────────────────────────────────
@@ -3956,6 +4028,8 @@ pub fn rebuild_ctx_from_journal(
             }
             // OMS-A: scoped txn records ignored by legacy fold.
             JournalRecord::OrderTxn(_) | JournalRecord::ExecutionTxn(_) => {}
+            // OMS-C: observation / own-action records ignored by legacy ctx fold.
+            JournalRecord::ObservationTxn(_) | JournalRecord::OwnActionCid { .. } => {}
         }
     }
     Ok(ctx)
