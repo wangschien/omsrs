@@ -1388,6 +1388,31 @@ mod tests {
         }
     }
 
+    fn a_fill_outcome(row: &Row, inv: &MarketInventory, e: ExecutionEvidence) -> ExecutionOutcome {
+        let ev = OrderEvent::Fill {
+            fill_id: e.execution_id.clone(),
+            qty: e.qty,
+            price_cents: e.price_cents,
+            ts_ns: e.ts_ns,
+            venue_order_id: e.venue_order_id.clone(),
+            fee_cents: e.fee_cents,
+        };
+        prepare_execution_batch(oref(row), inv, &ev, &[e])
+            .unwrap()
+            .outcomes[0]
+            .clone()
+    }
+
+    fn snap_row(row: &Row) -> (OrderState, OrderCtx, u64) {
+        (row.state.clone(), row.ctx.clone(), row.cursor.seq)
+    }
+
+    fn assert_row_unchanged(before: &(OrderState, OrderCtx, u64), row: &Row, label: &str) {
+        assert_eq!(before.0, row.state, "{label} state mutated");
+        assert_eq!(before.1, row.ctx, "{label} ctx mutated");
+        assert_eq!(before.2, row.cursor.seq, "{label} cursor mutated");
+    }
+
     fn row_ev(
         filled: u64,
         remaining: u64,
@@ -1840,8 +1865,24 @@ mod tests {
             ];
             txn.apply(&mut ts, &mut reg, &inv).unwrap();
         }
-        assert!(matches!(o.state, OrderState::Canceled | OrderState::Terminal), "{:?}", o.state);
-        assert!(matches!(n.state, OrderState::Canceled | OrderState::Terminal), "{:?}", n.state);
+        assert!(
+            matches!(o.state, OrderState::Terminal),
+            "O must be exactly Terminal, got {:?}",
+            o.state
+        );
+        assert!(
+            matches!(n.state, OrderState::Canceled),
+            "current N must be exactly Canceled, got {:?}",
+            n.state
+        );
+        assert!(
+            reg.get(&o.led, &vid("W1"))
+                .unwrap()
+                .members
+                .iter()
+                .all(|m| m.role != MemberRole::Current),
+            "after canceled wire, no Current"
+        );
 
         // variant: O obligation 150 stays ReconcilePending Terminal
         let mut o = drive_to_accepted("O", 150, "W1");
@@ -1928,6 +1969,123 @@ mod tests {
         assert!(
             matches!(o.state, OrderState::Terminal),
             "catch-up must release Terminal, got {:?}",
+            o.state
+        );
+
+        // (ii) O qty 1000 partial catch-up: no re-latch, stay ReconcilePending{Terminal}
+        // with RequestAuthorityReconcile; later Consistent round => Terminal.
+        let mut o = drive_to_accepted("O", 1000, "W1");
+        let mut inv = MarketInventory::new(o.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &o.logs, &inv);
+        ingest(&mut o, &mut inv, evd("F1", 100, Side::BuyYes));
+        o.ctx.fill_obligation = 150;
+        fold_logs(&mut reg, &o.logs, &inv);
+        let mut n = drive_to_accepted("N", 50, "W1");
+        n.led = o.led.clone();
+        fold_logs(&mut reg, &n.logs, &inv);
+        let f2 = ingest_norow(&mut inv, &mut n.logs, evd("F2", 50, Side::BuyYes));
+        fold_logs(&mut reg, &n.logs, &inv);
+        let f1 = a_fill_outcome(&o, &inv, evd("F1", 100, Side::BuyYes));
+        let txn = {
+            let members = [oref(&o), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(150, 0, BackfillOrderStatus::Canceled, 0),
+                &[f1.clone(), f2.clone()],
+                Some(empty_page()),
+            )
+        };
+        if let Some(j) = &txn.journal {
+            o.logs.push(j.clone());
+        }
+        {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &o.led,
+                    state: &mut o.state,
+                    ctx: &mut o.ctx,
+                    cursor: &mut o.cursor,
+                },
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap();
+        }
+        match &o.state {
+            OrderState::ReconcilePending { target, .. } => {
+                assert_eq!(target.terminal, ReconcileTerminal::Terminal);
+            }
+            other => panic!("(ii) expected ReconcilePending Terminal, got {other:?}"),
+        }
+        let t = prepare_execution_batch(
+            oref(&o),
+            &inv,
+            &OrderEvent::Fill {
+                fill_id: fid("F3"),
+                qty: 50,
+                price_cents: 50,
+                ts_ns: 3,
+                venue_order_id: Some(vid("W1")),
+                fee_cents: None,
+            },
+            &[evd("F3", 50, Side::BuyYes)],
+        )
+        .unwrap();
+        assert!(
+            t.effects.iter().any(|e| matches!(
+                e,
+                Effect::RequestAuthorityReconcile { .. }
+            )),
+            "partial catch-up must emit RequestAuthorityReconcile: {:?}",
+            t.effects
+        );
+        if let Some(j) = &t.journal {
+            o.logs.push(j.clone());
+        }
+        t.apply(
+            Some(OrderTarget {
+                ledger: &o.led,
+                state: &mut o.state,
+                ctx: &mut o.ctx,
+                cursor: &mut o.cursor,
+            }),
+            &mut inv,
+        )
+        .unwrap();
+        match &o.state {
+            OrderState::ReconcilePending { target, .. } => {
+                assert_eq!(
+                    target.terminal,
+                    ReconcileTerminal::Terminal,
+                    "no early release, target kind must stay Terminal"
+                );
+            }
+            other => panic!("(ii) after F3 must stay ReconcilePending Terminal, got {other:?}"),
+        }
+        fold_logs(&mut reg, &o.logs, &inv);
+        let f3 = a_fill_outcome(&o, &inv, evd("F3", 50, Side::BuyYes));
+        let txn = {
+            let members = [oref(&o)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(150, 0, BackfillOrderStatus::Canceled, 0),
+                &[f1, f2, f3],
+                Some(empty_page()),
+            )
+        };
+        apply_obs(txn, &mut o, &mut reg, &inv);
+        assert!(
+            matches!(o.state, OrderState::Terminal),
+            "(ii) later Consistent round must Terminal, got {:?}",
             o.state
         );
     }
@@ -2194,13 +2352,84 @@ mod tests {
             Readiness::Unresolved {
                 member_debt,
                 wire_residual,
+                unresolved_venue_only,
                 ..
             } => {
-                assert_eq!(member_debt + wire_residual, 100);
+                assert_eq!(member_debt, 0);
+                assert_eq!(wire_residual, 100);
+                assert!(unresolved_venue_only >= 1);
             }
             other => panic!("{other:?}"),
         }
         let _ = (inv2, logs);
+
+        // UNTRACKED all-frozen historical wire, larger row + lagging page.
+        // Bind via A, then Consistent canceled GET terminalizes the member without
+        // a new held id and without tracking. Do not re-fold the full log after
+        // apply: an earlier ObservationTxn wire_after would restore Current.
+        let mut frozen = drive_to_accepted("c1", 100, "W1");
+        let inv_f = MarketInventory::new(frozen.led.clone());
+        let mut reg_f = WireRegistry::new();
+        fold_logs(&mut reg_f, &frozen.logs, &inv_f);
+        assert!(!reg_f.get(&frozen.led, &vid("W1")).unwrap().tracked);
+        let txn = observe(
+            &reg_f,
+            &inv_f,
+            &[oref(&frozen)],
+            row_ev(0, 0, BackfillOrderStatus::Canceled, 0),
+            &[],
+            Some(empty_page()),
+        );
+        assert!(matches!(txn.outcome, ObservationOutcome::Consistent { .. }));
+        apply_obs(txn, &mut frozen, &mut reg_f, &inv_f);
+        let ws = reg_f.get(&frozen.led, &vid("W1")).unwrap();
+        assert!(
+            ws.members.iter().all(|m| m.role == MemberRole::Terminal),
+            "expected all Terminal after canceled Consistent, got {:?}",
+            ws.members
+        );
+        assert!(
+            !ws.tracked,
+            "Consistent cancel with no pending must leave the wire untracked"
+        );
+        let txn = observe(
+            &reg_f,
+            &inv_f,
+            &[],
+            row_ev(200, 0, BackfillOrderStatus::Open, 0),
+            &[],
+            Some(empty_page()),
+        );
+        assert!(
+            matches!(
+                txn.outcome,
+                ObservationOutcome::RowInconsistent | ObservationOutcome::NotCovered
+            ),
+            "larger row on empty held must be RowInconsistent/NotCovered, got {:?}",
+            txn.outcome
+        );
+        assert!(txn.journal.is_some(), "wire-only path must write a record");
+        let rec = match txn.journal.as_ref().unwrap() {
+            JournalRecord::ObservationTxn(t) => t.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(rec.wire_after.filled_hw >= 200);
+        assert!(rec.wire_after.tracked);
+        txn.apply(&mut [], &mut reg_f, &inv_f).unwrap();
+        let r = reg_f
+            .readiness(
+                &frozen.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(oref(&frozen))
+                    } else {
+                        None
+                    }
+                },
+                &inv_f,
+            )
+            .unwrap();
+        assert!(matches!(r, Readiness::Unresolved { .. }), "{r:?}");
 
         // MissingMember
         let err = reg
@@ -2230,34 +2459,161 @@ mod tests {
                 ..
             }
         ));
+
+        // ForeignScope
+        let foreign_led = LedgerId {
+            scope: ExecutionScope("other".into()),
+            market: "MKT".into(),
+        };
+        let err = reg
+            .readiness(
+                &row.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(OrderRef {
+                            ledger: &foreign_led,
+                            cursor: row.cursor,
+                            state: &row.state,
+                            ctx: &row.ctx,
+                        })
+                    } else {
+                        None
+                    }
+                },
+                &inv,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ReadinessError::MemberMismatch {
+                reason: MemberMismatchReason::ForeignScope,
+                ..
+            }
+        ));
+
+        // ForeignMarket
+        let mut ctx_m = row.ctx.clone();
+        ctx_m.market = "OTHER".into();
+        let err = reg
+            .readiness(
+                &row.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(OrderRef {
+                            ledger: &row.led,
+                            cursor: row.cursor,
+                            state: &row.state,
+                            ctx: &ctx_m,
+                        })
+                    } else {
+                        None
+                    }
+                },
+                &inv,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ReadinessError::MemberMismatch {
+                reason: MemberMismatchReason::ForeignMarket,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn t11_one_record_torn_tails() {
-        let mut row = drive_to_accepted("c1", 100, "W1");
-        let inv = MarketInventory::new(row.led.clone());
+        let mut o = drive_to_accepted("O", 200, "W1");
+        let mut inv = MarketInventory::new(o.led.clone());
         let mut reg = WireRegistry::new();
-        fold_logs(&mut reg, &row.logs, &inv);
-        let txn = observe(
-            &reg,
-            &inv,
-            &[oref(&row)],
-            row_ev(0, 100, BackfillOrderStatus::Open, 0),
-            &[],
-            Some(empty_page()),
-        );
-        let j = txn.journal.clone().unwrap();
-        apply_obs(txn, &mut row, &mut reg, &inv);
-        let pre = WireRegistry::rebuild(&row.logs[..row.logs.len() - 1], &inv).unwrap();
-        assert!(pre.get(&row.led, &vid("W1")).unwrap().last.is_none()
-            || pre.working_view(&row.led, &vid("W1")) != WorkingView::Known(100)
-            || row.logs.len() > 1);
-        let post = WireRegistry::rebuild(&row.logs, &inv).unwrap();
-        assert_eq!(post.working_view(&row.led, &vid("W1")), WorkingView::Known(100));
+        fold_logs(&mut reg, &o.logs, &inv);
+        ingest(&mut o, &mut inv, evd("F1", 100, Side::BuyYes));
+        fold_logs(&mut reg, &o.logs, &inv);
+        let mut n = drive_to_accepted("N", 50, "W1");
+        n.led = o.led.clone();
+        fold_logs(&mut reg, &n.logs, &inv);
+        let f2 = ingest_norow(&mut inv, &mut n.logs, evd("F2", 50, Side::BuyYes));
+        fold_logs(&mut reg, &n.logs, &inv);
+        let f1 = a_fill_outcome(&o, &inv, evd("F1", 100, Side::BuyYes));
+        let mut pre_logs = o.logs.clone();
+        pre_logs.extend(n.logs.iter().cloned());
+        let pre_reg = WireRegistry::rebuild(&pre_logs, &inv).unwrap();
+        let pre_o = rebuild_order_with_observations(&o.led, &cid("O"), &pre_logs)
+            .unwrap()
+            .unwrap();
+        let pre_n = rebuild_order_with_observations(&n.led, &cid("N"), &pre_logs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_o.0, o.state);
+        assert_eq!(pre_n.0, n.state);
+        let txn = {
+            let members = [oref(&o), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(150, 0, BackfillOrderStatus::Canceled, 0),
+                &[f1, f2],
+                Some(empty_page()),
+            )
+        };
+        let j = txn.journal.clone().expect("one ObservationTxn");
         match &j {
-            JournalRecord::ObservationTxn(_) => {}
+            JournalRecord::ObservationTxn(rec) => {
+                assert_eq!(rec.members_after.len(), 2, "multi-member atomicity");
+            }
             other => panic!("must be one ObservationTxn, got {other:?}"),
         }
+        // complete durable record before apply ⇒ replay equals post-state (A §2.6)
+        let mut complete_logs = pre_logs.clone();
+        complete_logs.push(j.clone());
+        let rebuilt_before_apply = WireRegistry::rebuild(&complete_logs, &inv).unwrap();
+        {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &o.led,
+                    state: &mut o.state,
+                    ctx: &mut o.ctx,
+                    cursor: &mut o.cursor,
+                },
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap();
+        }
+        o.logs.push(j);
+        assert_eq!(
+            rebuilt_before_apply.get(&o.led, &vid("W1")).unwrap(),
+            reg.get(&o.led, &vid("W1")).unwrap()
+        );
+        let post_o = rebuild_order_with_observations(&o.led, &cid("O"), &complete_logs)
+            .unwrap()
+            .unwrap();
+        let post_n = rebuild_order_with_observations(&n.led, &cid("N"), &complete_logs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(post_o.0, o.state);
+        assert_eq!(post_n.0, n.state);
+        // torn last LINE ⇒ replay equals pre-observation registry and members
+        let torn = WireRegistry::rebuild(&pre_logs, &inv).unwrap();
+        assert_eq!(
+            torn.get(&o.led, &vid("W1")).unwrap(),
+            pre_reg.get(&o.led, &vid("W1")).unwrap()
+        );
+        let torn_o = rebuild_order_with_observations(&o.led, &cid("O"), &pre_logs)
+            .unwrap()
+            .unwrap();
+        let torn_n = rebuild_order_with_observations(&n.led, &cid("N"), &pre_logs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(torn_o, pre_o);
+        assert_eq!(torn_n, pre_n);
+        assert_ne!(torn_o.0, o.state, "split prefix must not look like full post");
+        assert_ne!(torn_n.0, n.state, "split prefix must not look like full post");
     }
 
     #[test]
@@ -2366,6 +2722,293 @@ mod tests {
             err,
             ObservationApplyMismatch::Member(ApplyMismatch::InventoryGeneration { .. })
         ));
+        assert_row_unchanged(&snap_row(&row), &row, "inventory-gen reject");
+        assert_row_unchanged(&snap_row(&n), &n, "inventory-gen reject n");
+
+        // duplicated target set
+        let txn = {
+            let members = [oref(&row), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+                &[],
+                Some(empty_page()),
+            )
+        };
+        let before_r = snap_row(&row);
+        let before_n = snap_row(&n);
+        let mut n2_state = n.state.clone();
+        let mut n2_ctx = n.ctx.clone();
+        let mut n2_cur = n.cursor;
+        let err = {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n2_state,
+                    ctx: &mut n2_ctx,
+                    cursor: &mut n2_cur,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap_err()
+        };
+        assert!(matches!(err, ObservationApplyMismatch::Targets { .. }));
+        assert_row_unchanged(&before_r, &row, "dup targets");
+        assert_row_unchanged(&before_n, &n, "dup targets n");
+
+        // partial target set
+        let txn = {
+            let members = [oref(&row), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+                &[],
+                Some(empty_page()),
+            )
+        };
+        let before_r = snap_row(&row);
+        let err = {
+            let mut ts = [OrderTarget {
+                ledger: &row.led,
+                state: &mut row.state,
+                ctx: &mut row.ctx,
+                cursor: &mut row.cursor,
+            }];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap_err()
+        };
+        assert!(matches!(err, ObservationApplyMismatch::Targets { .. }));
+        assert_row_unchanged(&before_r, &row, "partial targets");
+
+        // interleaved own action => WireGeneration
+        // Apply the own action first so member cursor matches prepare, then fold
+        // it into the registry so only wire generation diverges (gate 3).
+        let d = prepare_order_event(
+            oref(&row),
+            &OrderEvent::DecreaseObserved {
+                remaining: 90,
+                ts_ms: 1,
+            },
+        )
+        .unwrap();
+        if let Some(j) = &d.journal {
+            row.logs.push(j.clone());
+        }
+        d.apply(OrderTarget {
+            ledger: &row.led,
+            state: &mut row.state,
+            ctx: &mut row.ctx,
+            cursor: &mut row.cursor,
+        })
+        .unwrap();
+        let txn = {
+            let members = [oref(&row), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+                &[],
+                Some(empty_page()),
+            )
+        };
+        fold_logs(&mut reg, &row.logs, &inv);
+        let before_r = snap_row(&row);
+        let before_n = snap_row(&n);
+        let err = {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &row.led,
+                    state: &mut row.state,
+                    ctx: &mut row.ctx,
+                    cursor: &mut row.cursor,
+                },
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap_err()
+        };
+        assert!(matches!(
+            err,
+            ObservationApplyMismatch::WireGeneration { .. }
+        ));
+        assert_row_unchanged(&before_r, &row, "wire-gen reject");
+        assert_row_unchanged(&before_n, &n, "wire-gen reject n");
+
+        // interleaved member cursor (no wire fold) => Member(OrderCursor)
+        let txn = {
+            let members = [oref(&row), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+                &[],
+                Some(empty_page()),
+            )
+        };
+        row.cursor.seq = row.cursor.seq.saturating_add(1);
+        let before_r = snap_row(&row);
+        let err = {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &row.led,
+                    state: &mut row.state,
+                    ctx: &mut row.ctx,
+                    cursor: &mut row.cursor,
+                },
+                OrderTarget {
+                    ledger: &n.led,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap_err()
+        };
+        assert!(matches!(
+            err,
+            ObservationApplyMismatch::Member(ApplyMismatch::OrderCursor { .. })
+        ));
+        assert_row_unchanged(&before_r, &row, "cursor reject");
+        row.cursor.seq = row.cursor.seq.saturating_sub(1);
+
+        // complete cid set, one target under another ledger => Member(LedgerIdentity)
+        let txn = {
+            let members = [oref(&row), oref(&n)];
+            observe(
+                &reg,
+                &inv,
+                &members,
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+                &[],
+                Some(empty_page()),
+            )
+        };
+        let foreign = LedgerId {
+            scope: ExecutionScope("other".into()),
+            market: "MKT".into(),
+        };
+        let before_r = snap_row(&row);
+        let before_n = snap_row(&n);
+        let err = {
+            let mut ts = [
+                OrderTarget {
+                    ledger: &row.led,
+                    state: &mut row.state,
+                    ctx: &mut row.ctx,
+                    cursor: &mut row.cursor,
+                },
+                OrderTarget {
+                    ledger: &foreign,
+                    state: &mut n.state,
+                    ctx: &mut n.ctx,
+                    cursor: &mut n.cursor,
+                },
+            ];
+            txn.apply(&mut ts, &mut reg, &inv).unwrap_err()
+        };
+        assert!(matches!(
+            err,
+            ObservationApplyMismatch::Member(ApplyMismatch::LedgerIdentity)
+        ));
+        assert_row_unchanged(&before_r, &row, "ledger-identity reject");
+        assert_row_unchanged(&before_n, &n, "ledger-identity reject n");
+
+        // finish extra cid
+        let extra = drive_to_accepted("X", 10, "W1");
+        let err = {
+            let mut rnd = ObservationRound::begin(row.led.clone(), vid("W1"));
+            rnd.page(empty_page());
+            rnd.finish(
+                &reg,
+                &inv,
+                &[oref(&row), oref(&n), oref(&extra)],
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(err, RoundError::MembersInvalid { extra, .. } if !extra.is_empty()));
+
+        // finish wrong ledger (cid set would match)
+        let foreign = LedgerId {
+            scope: ExecutionScope("other".into()),
+            market: "MKT".into(),
+        };
+        let bad_led = OrderRef {
+            ledger: &foreign,
+            cursor: row.cursor,
+            state: &row.state,
+            ctx: &row.ctx,
+        };
+        let err = {
+            let mut rnd = ObservationRound::begin(row.led.clone(), vid("W1"));
+            rnd.page(empty_page());
+            rnd.finish(
+                &reg,
+                &inv,
+                &[bad_led, oref(&n)],
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(err, RoundError::MembersInvalid { mismatched, .. } if !mismatched.is_empty()));
+
+        // finish wrong market
+        let mut ctx_m = row.ctx.clone();
+        ctx_m.market = "OTHER".into();
+        let bad_mkt = OrderRef {
+            ledger: &row.led,
+            cursor: row.cursor,
+            state: &row.state,
+            ctx: &ctx_m,
+        };
+        let err = {
+            let mut rnd = ObservationRound::begin(row.led.clone(), vid("W1"));
+            rnd.page(empty_page());
+            rnd.finish(
+                &reg,
+                &inv,
+                &[bad_mkt, oref(&n)],
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(err, RoundError::MembersInvalid { mismatched, .. } if !mismatched.is_empty()));
+
+        // finish: ctx cid differs from the cid it stands for
+        let mut ctx_wrong = row.ctx.clone();
+        ctx_wrong.client_order_id = cid("not-c1");
+        let stand_in = OrderRef {
+            ledger: &row.led,
+            cursor: row.cursor,
+            state: &row.state,
+            ctx: &ctx_wrong,
+        };
+        let err = {
+            let mut rnd = ObservationRound::begin(row.led.clone(), vid("W1"));
+            rnd.page(empty_page());
+            rnd.finish(
+                &reg,
+                &inv,
+                &[stand_in, oref(&n)],
+                row_ev(0, 100, BackfillOrderStatus::Open, 0),
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(err, RoundError::MembersInvalid { .. }));
     }
 
     #[test]
@@ -2510,6 +3153,108 @@ mod tests {
             "{:?}",
             row.state
         );
+
+        // no-prior-positive-row: local F1+F2, hw 0, first cancel GET 0/0
+        let mut row = drive_to_accepted("c1", 1000, "W1");
+        let mut inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        ingest(&mut row, &mut inv, evd("F1", 100, Side::BuyYes));
+        ingest(&mut row, &mut inv, evd("F2", 50, Side::BuyYes));
+        fold_logs(&mut reg, &row.logs, &inv);
+        assert_eq!(reg.get(&row.led, &vid("W1")).unwrap().filled_hw, 0);
+        let o1 = a_fill_outcome(&row, &inv, evd("F1", 100, Side::BuyYes));
+        let o2 = a_fill_outcome(&row, &inv, evd("F2", 50, Side::BuyYes));
+        let obl_before = row.ctx.fill_obligation;
+        let txn = observe(
+            &reg,
+            &inv,
+            &[oref(&row)],
+            row_ev(0, 0, BackfillOrderStatus::Canceled, 0),
+            &[o1, o2],
+            Some(empty_page()),
+        );
+        assert!(matches!(txn.outcome, ObservationOutcome::Consistent { .. }));
+        let rec = match txn.journal.as_ref().unwrap() {
+            JournalRecord::ObservationTxn(t) => t.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            rec.wire_after.filled_hw, 0,
+            "must not fabricate filled_hw from Σ_H"
+        );
+        apply_obs(txn, &mut row, &mut reg, &inv);
+        assert_eq!(row.ctx.fill_obligation, obl_before);
+        assert_eq!(row.ctx.fill_obligation, row.ctx.attributed_fill_qty);
+        assert!(
+            matches!(row.state, OrderState::Canceled | OrderState::ReconcilePending { .. }),
+            "{:?}",
+            row.state
+        );
+        let r = reg
+            .readiness(
+                &row.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(oref(&row))
+                    } else {
+                        None
+                    }
+                },
+                &inv,
+            )
+            .unwrap();
+        match r {
+            Readiness::Ready => {}
+            Readiness::Unresolved {
+                member_debt,
+                wire_residual,
+                ..
+            } => {
+                assert_eq!(member_debt, 0);
+                assert_eq!(wire_residual, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // venue-only first observed canceled 0/0 after identified rows
+        let mut inv = MarketInventory::new(led());
+        let mut logs = Vec::new();
+        let o1 = ingest_norow(&mut inv, &mut logs, evd("F1", 100, Side::BuyYes));
+        let o2 = ingest_norow(&mut inv, &mut logs, evd("F2", 50, Side::BuyYes));
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &logs, &inv);
+        let txn = observe(
+            &reg,
+            &inv,
+            &[],
+            row_ev(0, 0, BackfillOrderStatus::Canceled, 0),
+            &[o1, o2],
+            Some(empty_page()),
+        );
+        assert!(matches!(txn.outcome, ObservationOutcome::Consistent { .. }));
+        let rec = match txn.journal.as_ref().unwrap() {
+            JournalRecord::ObservationTxn(t) => t.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rec.wire_after.filled_hw, 0);
+        txn.apply(&mut [], &mut reg, &inv).unwrap();
+        assert!(reg.get(&led(), &vid("W1")).unwrap().resolved);
+        let r = reg.readiness(&led(), |_| None, &inv).unwrap();
+        match r {
+            Readiness::Ready => {}
+            Readiness::Unresolved {
+                member_debt,
+                wire_residual,
+                unresolved_venue_only,
+                ..
+            } => {
+                assert_eq!(member_debt, 0);
+                assert_eq!(wire_residual, 0);
+                assert_eq!(unresolved_venue_only, 0);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -2588,23 +3333,43 @@ mod tests {
             .unwrap();
         assert!(matches!(r, Readiness::Unresolved { .. }), "{r:?}");
 
-        // (d) journal None when still pending and no wire change
+        // (b) unowned new held id on a scoped wire
+        let mut row_b = drive_to_accepted("c1", 100, "W1");
+        let mut inv_b = MarketInventory::new(row_b.led.clone());
+        let mut reg_b = WireRegistry::new();
+        fold_logs(&mut reg_b, &row_b.logs, &inv_b);
+        assert!(!reg_b.get(&row_b.led, &vid("W1")).unwrap().tracked);
+        ingest_norow(&mut inv_b, &mut row_b.logs, evd("Fu", 7, Side::BuyYes));
+        fold_logs(&mut reg_b, &row_b.logs, &inv_b);
+        assert!(
+            reg_b.get(&row_b.led, &vid("W1")).unwrap().tracked,
+            "unowned new held id must track a scoped wire"
+        );
+        let r = reg_b
+            .readiness(
+                &row_b.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(oref(&row_b))
+                    } else {
+                        None
+                    }
+                },
+                &inv_b,
+            )
+            .unwrap();
+        assert!(matches!(r, Readiness::Unresolved { .. }), "{r:?}");
+
+        // (c)/(d) Consistent round whose terminal gate fails on the response domain
         let mut row = drive_to_accepted("c1", 100, "W1");
         let mut inv = MarketInventory::new(row.led.clone());
         let mut reg = WireRegistry::new();
         fold_logs(&mut reg, &row.logs, &inv);
         row.ctx.response_fill_count = Some(50);
         row.ctx.response_snapshot_boundary = Some(crate::lifecycle::SnapshotBoundary::TsNs(0));
-        // Consistent canceled with obligation/gate fail on response domain
         ingest(&mut row, &mut inv, evd("F1", 10, Side::BuyYes));
         fold_logs(&mut reg, &row.logs, &inv);
-        let o1 = ExecutionOutcome {
-            evidence: evd("F1", 10, Side::BuyYes),
-            order: crate::execution::OrderDisposition::Duplicate,
-            inventory: InventoryDisposition::Duplicate,
-            entry_after: inv.get(&fid("F1")).cloned(),
-            conflict: None,
-        };
+        let o1 = a_fill_outcome(&row, &inv, evd("F1", 10, Side::BuyYes));
         let txn = observe(
             &reg,
             &inv,
@@ -2613,21 +3378,68 @@ mod tests {
             &[o1.clone()],
             Some(empty_page()),
         );
+        assert!(
+            txn.effects.iter().any(|e| matches!(
+                e,
+                Effect::RequestAuthorityReconcile { .. }
+            )),
+            "response-domain gate fail must request authority: {:?}",
+            txn.effects
+        );
         apply_obs(txn, &mut row, &mut reg, &inv);
         fold_logs(&mut reg, &row.logs, &inv);
+        assert!(
+            matches!(row.state, OrderState::ReconcilePending { .. }),
+            "pending must be established, got {:?}",
+            row.state
+        );
         assert!(reg.get(&row.led, &vid("W1")).unwrap().tracked);
+        let r = reg
+            .readiness(
+                &row.led,
+                |c| {
+                    if *c == cid("c1") {
+                        Some(oref(&row))
+                    } else {
+                        None
+                    }
+                },
+                &inv,
+            )
+            .unwrap();
+        assert!(matches!(r, Readiness::Unresolved { .. }), "{r:?}");
+
         let txn = observe(
             &reg,
             &inv,
             &[oref(&row)],
             row_ev(10, 0, BackfillOrderStatus::Canceled, 0),
+            &[o1.clone()],
+            Some(empty_page()),
+        );
+        assert!(txn.journal.is_none(), "no decorative record on unchanged second round");
+        assert!(reg.get(&row.led, &vid("W1")).unwrap().tracked);
+        let rebuilt = WireRegistry::rebuild(&row.logs, &inv).unwrap();
+        assert!(
+            rebuilt.get(&row.led, &vid("W1")).unwrap().tracked,
+            "full-log rebuild must keep tracked"
+        );
+
+        // genuine wire-field change (filled_hw raised) writes one record, tracked true
+        let txn = observe(
+            &reg,
+            &inv,
+            &[oref(&row)],
+            row_ev(20, 0, BackfillOrderStatus::Canceled, 0),
             &[o1],
             Some(empty_page()),
         );
-        if matches!(row.state, OrderState::ReconcilePending { .. }) {
-            assert!(txn.journal.is_none(), "no decorative record");
-            assert!(reg.get(&row.led, &vid("W1")).unwrap().tracked);
-        }
+        let rec = match txn.journal.as_ref().expect("wire change must journal") {
+            JournalRecord::ObservationTxn(t) => t.clone(),
+            other => panic!("expected ObservationTxn, got {other:?}"),
+        };
+        assert!(rec.wire_after.tracked);
+        assert!(rec.wire_after.filled_hw >= 20);
     }
 
     #[test]
