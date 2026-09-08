@@ -46,6 +46,11 @@ reconciliation. See [CHANGELOG.md](CHANGELOG.md) for details.
 description, complete v0.4 release notes, and application-neutral examples.
 There are no functional or public API changes from v0.4.0.
 
+**v0.5.0** (2026-09-08): adds I/O-free execution transactions and market
+inventory (first-admitted fill attribution, foreign-row refusal) and venue
+observation (wire membership, routing, coverage, working view, readiness).
+Existing v0.4 APIs remain. See [CHANGELOG.md](CHANGELOG.md) for details.
+
 | phase | items | surface |
 |---|---:|---|
 | R1 | 20 | `utils` + `BasicPosition` + parity harness (libtest-mimic) + 13-row smoke matrix |
@@ -126,7 +131,7 @@ dependency is limited to its asynchronous persistence helper:
 
 ```toml
 [dependencies]
-omsrs = "0.4"
+omsrs = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -180,7 +185,7 @@ Order lifecycle siblings (`execute_async` / `modify_async` / `cancel_async`) let
 
 ```toml
 [dependencies]
-omsrs = "0.4"
+omsrs = "0.5"
 
 # persistence = ["dep:rusqlite"]  — off by default (§7 "MSRV-minimum build")
 # statistical-tests — test-only, gates tests/statistical

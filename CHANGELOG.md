@@ -4,6 +4,24 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-09-08
+
+### Added
+
+- Add an I/O-free execution module: scoped order/execution transactions,
+  durable market inventory, first-admitted fill attribution, and explicit
+  refusal of foreign-row evidence.
+- Add an I/O-free observation module: venue wire membership, routing,
+  coverage, working view, and readiness over the execution ledger.
+- Add `OwnActionKind` on the per-order lifecycle for classified own-action
+  observations (decrease and amend).
+
+### Compatibility
+
+- Existing broker, paper, simulation, aggregate-order, strategy, and v0.4
+  lifecycle APIs remain. The execution and observation modules are additive.
+  Caret `omsrs = "0.4"` does not include this release; depend on `0.5`.
+
 ## [0.4.1] - 2026-09-02
 
 ### Documentation
