@@ -2138,7 +2138,10 @@ impl ExecutionTransaction {
 mod tests {
     #![allow(unused_variables, unused_mut, unused_assignments)]
     use super::*;
-    use crate::lifecycle::{AttemptId, rebuild_ctx_from_journal};
+    use crate::lifecycle::{
+        AttemptId, SubmissionCloseReason, is_restart_frozen, rebuild_ctx_from_journal,
+    };
+    use crate::observation::rebuild_order_with_observations;
 
     fn scope(s: &str) -> ExecutionScope {
         ExecutionScope(s.into())
@@ -4620,5 +4623,423 @@ mod tests {
         }));
         let out = rebuild_ctx_from_journal(base.clone(), &[rec]).unwrap();
         assert_eq!(out, base);
+    }
+
+    fn apply_order(
+        led: &LedgerId,
+        state: &mut OrderState,
+        ctx: &mut OrderCtx,
+        cursor: &mut OrderCursor,
+        ev: &OrderEvent,
+    ) -> OrderTransaction {
+        let oref = OrderRef {
+            ledger: led,
+            cursor: *cursor,
+            state,
+            ctx,
+        };
+        let txn = prepare_order_event(oref, ev).expect("prep order");
+        let journal = txn.journal.clone();
+        let effects = txn.effects.clone();
+        let rejected = txn.rejected.clone();
+        let had_journal = journal.is_some();
+        txn.apply(OrderTarget {
+            ledger: led,
+            state,
+            ctx,
+            cursor,
+        })
+        .expect("apply order");
+        OrderTransaction {
+            journal,
+            effects,
+            rejected,
+            prepared_ledger: led.clone(),
+            expected_cursor: OrderCursor { seq: 0 },
+            expected_state: OrderState::New,
+            expected_ctx: ctx.clone(),
+            state_after: state.clone(),
+            ctx_after: ctx.clone(),
+            advance_cursor: had_journal,
+            next_seq: cursor.seq,
+        }
+    }
+
+    fn to_started() -> (LedgerId, OrderState, OrderCtx, OrderCursor) {
+        let led = ledger("sub", "MKT");
+        let mut state = OrderState::New;
+        let mut ctx = base_ctx("MKT", Side::BuyYes, 10);
+        let mut cursor = OrderCursor { seq: 0 };
+        for ev in [
+            OrderEvent::PrepareSubmit,
+            OrderEvent::StartSubmit {
+                attempt_id: AttemptId("a1".into()),
+            },
+        ] {
+            apply_order(&led, &mut state, &mut ctx, &mut cursor, &ev);
+        }
+        (led, state, ctx, cursor)
+    }
+
+    fn records_from(journal: &Option<JournalRecord>) -> Vec<JournalRecord> {
+        journal.iter().cloned().collect()
+    }
+
+    /// Drive New→Prepare→Start→Close through prepare/apply. seq=3; serde rebuild
+    /// of the prefix stays Started; full prefix is the closed reason. Dropping the
+    /// OrderTxn write would fail seq/rebuild.
+    #[test]
+    fn close_submission_txn_seq3_serde_rebuild() {
+        let (led, mut state, mut ctx, mut cursor) = to_started();
+        assert_eq!(cursor.seq, 2);
+        assert!(matches!(state, OrderState::SubmitStarted { .. }));
+        let inv = MarketInventory::new(led.clone());
+        let net_before = inv.net();
+        let mut journals: Vec<JournalRecord> = Vec::new();
+        // Recreate prepare+start journals by replaying from New for the record list.
+        let mut rec_state = OrderState::New;
+        let mut rec_ctx = base_ctx("MKT", Side::BuyYes, 10);
+        let mut rec_cursor = OrderCursor { seq: 0 };
+        for ev in [
+            OrderEvent::PrepareSubmit,
+            OrderEvent::StartSubmit {
+                attempt_id: AttemptId("a1".into()),
+            },
+        ] {
+            let t = apply_order(&led, &mut rec_state, &mut rec_ctx, &mut rec_cursor, &ev);
+            journals.extend(records_from(&t.journal));
+        }
+        let live_before_close = state.clone();
+        let ctx_before_close = ctx.clone();
+        let close_ev = OrderEvent::CloseSubmission {
+            reason: SubmissionCloseReason::DefiniteFailure,
+        };
+        // Prepare alone must not mutate the live target.
+        let prepared = prepare_order_event(
+            OrderRef {
+                ledger: &led,
+                cursor,
+                state: &state,
+                ctx: &ctx,
+            },
+            &close_ev,
+        )
+        .expect("prep close");
+        assert_eq!(state, live_before_close);
+        assert_eq!(ctx, ctx_before_close);
+        assert_eq!(cursor.seq, 2);
+        assert!(prepared.rejected.is_none());
+        assert!(prepared.effects.is_empty());
+        match prepared.journal.as_ref() {
+            Some(JournalRecord::OrderTxn(rec)) => {
+                assert_eq!(rec.event, "CloseSubmission");
+                assert_eq!(rec.seq, 3);
+                assert!(rec.core_records.is_empty());
+                assert!(matches!(rec.outcome, BatchOutcome::Accept));
+                assert!(matches!(
+                    rec.state_after,
+                    OrderState::SubmissionClosed {
+                        reason: SubmissionCloseReason::DefiniteFailure
+                    }
+                ));
+                assert_eq!(rec.ctx_after, ctx_before_close);
+            }
+            other => panic!("expected OrderTxn, got {other:?}"),
+        }
+        prepared
+            .apply(OrderTarget {
+                ledger: &led,
+                state: &mut state,
+                ctx: &mut ctx,
+                cursor: &mut cursor,
+            })
+            .expect("apply close");
+        assert_eq!(cursor.seq, 3);
+        assert!(matches!(
+            state,
+            OrderState::SubmissionClosed {
+                reason: SubmissionCloseReason::DefiniteFailure
+            }
+        ));
+        assert!(state.is_submission_closed());
+        assert!(!state.is_terminal_or_halt());
+        assert!(is_restart_frozen(&state));
+        journals.push(
+            // Re-read from a second prepare is wrong; capture via rebuild of live
+            // is done below using a fresh prepare? We need the journal record.
+            // Reconstruct from live snapshot:
+            JournalRecord::OrderTxn(Box::new(OrderTxnRecord {
+                ledger: led.clone(),
+                client_order_id: ctx.client_order_id.clone(),
+                seq: 3,
+                event: "CloseSubmission".into(),
+                outcome: BatchOutcome::Accept,
+                core_records: vec![],
+                state_after: state.clone(),
+                ctx_after: ctx.clone(),
+            })),
+        );
+        assert_eq!(inv.net(), net_before);
+
+        let json = serde_json::to_string(&journals).expect("ser");
+        let decoded: Vec<JournalRecord> = serde_json::from_str(&json).expect("de");
+        let prefix: Vec<JournalRecord> = decoded.iter().take(2).cloned().collect();
+        let started = rebuild_order(&led, &ctx.client_order_id, &prefix)
+            .unwrap()
+            .expect("prefix rebuild");
+        assert!(matches!(started.0, OrderState::SubmitStarted { .. }));
+        assert_eq!(started.2.seq, 2);
+        let started_obs = rebuild_order_with_observations(&led, &ctx.client_order_id, &prefix)
+            .unwrap()
+            .expect("prefix obs");
+        assert!(matches!(started_obs.0, OrderState::SubmitStarted { .. }));
+
+        let full = rebuild_order(&led, &ctx.client_order_id, &decoded)
+            .unwrap()
+            .expect("full rebuild");
+        assert!(matches!(
+            full.0,
+            OrderState::SubmissionClosed {
+                reason: SubmissionCloseReason::DefiniteFailure
+            }
+        ));
+        assert_eq!(full.1, ctx);
+        assert_eq!(full.2.seq, 3);
+        let full_obs = rebuild_order_with_observations(&led, &ctx.client_order_id, &decoded)
+            .unwrap()
+            .expect("full obs");
+        assert_eq!(full_obs.0, full.0);
+        assert_eq!(full_obs.1, full.1);
+        assert_eq!(full_obs.2.seq, 3);
+
+        let no_close = rebuild_order(&led, &ctx.client_order_id, &prefix)
+            .unwrap()
+            .unwrap();
+        assert!(!no_close.0.is_submission_closed());
+    }
+
+    /// Repeat same/different reason: no journal, no cursor, first reason kept.
+    /// After serde rebuild too. Removing no-change Accept short-circuit fails this.
+    #[test]
+    fn close_submission_repeat_no_txn_after_rebuild() {
+        let (led, mut state, mut ctx, mut cursor) = to_started();
+        let close = OrderEvent::CloseSubmission {
+            reason: SubmissionCloseReason::LocalNotSent,
+        };
+        apply_order(&led, &mut state, &mut ctx, &mut cursor, &close);
+        assert_eq!(cursor.seq, 3);
+        let first = state.clone();
+        let ctx_first = ctx.clone();
+        for r in [
+            SubmissionCloseReason::LocalNotSent,
+            SubmissionCloseReason::DefiniteFailure,
+        ] {
+            let t = prepare_order_event(
+                OrderRef {
+                    ledger: &led,
+                    cursor,
+                    state: &state,
+                    ctx: &ctx,
+                },
+                &OrderEvent::CloseSubmission { reason: r },
+            )
+            .expect("prep repeat");
+            assert!(t.rejected.is_none());
+            assert!(t.journal.is_none());
+            assert!(t.effects.is_empty());
+            t.apply(OrderTarget {
+                ledger: &led,
+                state: &mut state,
+                ctx: &mut ctx,
+                cursor: &mut cursor,
+            })
+            .expect("apply repeat");
+            assert_eq!(cursor.seq, 3);
+            assert_eq!(state, first);
+            assert_eq!(ctx, ctx_first);
+        }
+
+        let journals = {
+            let mut rec_state = OrderState::New;
+            let mut rec_ctx = base_ctx("MKT", Side::BuyYes, 10);
+            let mut rec_cursor = OrderCursor { seq: 0 };
+            let mut js = Vec::new();
+            for ev in [
+                OrderEvent::PrepareSubmit,
+                OrderEvent::StartSubmit {
+                    attempt_id: AttemptId("a1".into()),
+                },
+                close.clone(),
+            ] {
+                let t = apply_order(&led, &mut rec_state, &mut rec_ctx, &mut rec_cursor, &ev);
+                js.extend(records_from(&t.journal));
+            }
+            js
+        };
+        let json = serde_json::to_string(&journals).unwrap();
+        let decoded: Vec<JournalRecord> = serde_json::from_str(&json).unwrap();
+        let rebuilt = rebuild_order(&led, &ctx.client_order_id, &decoded)
+            .unwrap()
+            .unwrap();
+        let mut st = rebuilt.0;
+        let mut cx = rebuilt.1;
+        let mut cur = rebuilt.2;
+        let t = prepare_order_event(
+            OrderRef {
+                ledger: &led,
+                cursor: cur,
+                state: &st,
+                ctx: &cx,
+            },
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::ExhaustiveAbsent,
+            },
+        )
+        .unwrap();
+        assert!(t.journal.is_none());
+        t.apply(OrderTarget {
+            ledger: &led,
+            state: &mut st,
+            ctx: &mut cx,
+            cursor: &mut cur,
+        })
+        .unwrap();
+        assert_eq!(cur.seq, 3);
+        assert!(matches!(
+            st,
+            OrderState::SubmissionClosed {
+                reason: SubmissionCloseReason::LocalNotSent
+            }
+        ));
+    }
+
+    /// Real pre-ACK execution through the execution API populates Started context
+    /// and blocks close. Assigned counters alone are not this witness.
+    #[test]
+    fn close_submission_preack_execution_blocks_close() {
+        let (led, mut state, mut ctx, mut cursor) = to_started();
+        let mut inv = MarketInventory::new(led.clone());
+        let e = ExecutionEvidence {
+            scope: scope("sub"),
+            market: "MKT".into(),
+            execution_id: fid("preack"),
+            side: Side::BuyYes,
+            qty: 2,
+            price_cents: 50,
+            ts_ns: 1000,
+            venue_order_id: Some(vid("W1")),
+            claimed_client_order_id: Some(ctx.client_order_id.clone()),
+            fee_cents: None,
+            source: ExecutionSource::WsFill,
+        };
+        let txn = prepare_execution(
+            Some(OrderRef {
+                ledger: &led,
+                cursor,
+                state: &state,
+                ctx: &ctx,
+            }),
+            &inv,
+            &e,
+        )
+        .expect("prep exec");
+        txn.apply(
+            Some(OrderTarget {
+                ledger: &led,
+                state: &mut state,
+                ctx: &mut ctx,
+                cursor: &mut cursor,
+            }),
+            &mut inv,
+        )
+        .expect("apply exec");
+        assert!(matches!(state, OrderState::SubmitStarted { .. }));
+        assert!(!ctx.applied_fills.is_empty());
+        assert!(ctx.attributed_fill_qty > 0);
+        let before = ctx.clone();
+        let t = prepare_order_event(
+            OrderRef {
+                ledger: &led,
+                cursor,
+                state: &state,
+                ctx: &ctx,
+            },
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        )
+        .expect("prep close");
+        assert!(t.rejected.is_some());
+        assert!(t.journal.is_none());
+        t.apply(OrderTarget {
+            ledger: &led,
+            state: &mut state,
+            ctx: &mut ctx,
+            cursor: &mut cursor,
+        })
+        .expect("apply rejected close");
+        assert!(matches!(state, OrderState::SubmitStarted { .. }));
+        assert_eq!(ctx, before);
+        assert_eq!(ctx.applied_fills, before.applied_fills);
+        assert_eq!(ctx.attributed_fill_qty, before.attributed_fill_qty);
+    }
+
+    /// Explicit closed-row Fill keeps existing Released→ReserveFull / PostTerminalFill
+    /// defense. This is not the later production NoRow route.
+    #[test]
+    fn close_submission_supplied_closed_row_late_fill_defense() {
+        let (led, mut state, mut ctx, mut cursor) = to_started();
+        apply_order(
+            &led,
+            &mut state,
+            &mut ctx,
+            &mut cursor,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        );
+        assert!(state.is_submission_closed());
+        let mut inv = MarketInventory::new(led.clone());
+        let e = evidence("MKT", "late", Side::BuyYes, 5, 50, None);
+        let ev = OrderEvent::Fill {
+            fill_id: fid("late"),
+            qty: 5,
+            price_cents: 50,
+            ts_ns: 1,
+            venue_order_id: Some(vid("W1")),
+            fee_cents: None,
+        };
+        let t = apply_exec(&led, &mut state, &mut ctx, &mut cursor, &mut inv, &ev, &[e]);
+        assert!(
+            t.effects.iter().any(|e| matches!(e, Effect::ReserveFull))
+                || matches!(
+                    t.journal.as_ref(),
+                    Some(JournalRecord::ExecutionTxn(x))
+                        if x.order.as_ref().map(|o| {
+                            matches!(o.outcome, BatchOutcome::Halt(HaltReason::PostTerminalFill))
+                        }).unwrap_or(false)
+                ),
+            "explicit closed-row fill must take existing ReserveFull/PostTerminalFill path"
+        );
+        assert!(ctx.applied_fills.contains_key(&fid("late")));
+        // Duplicate same payload retains existing no-op / duplicate behavior.
+        let e2 = evidence("MKT", "late", Side::BuyYes, 5, 50, None);
+        let t2 = apply_exec(
+            &led,
+            &mut state,
+            &mut ctx,
+            &mut cursor,
+            &mut inv,
+            &ev,
+            &[e2],
+        );
+        assert!(
+            matches!(
+                t2.outcomes[0].order,
+                OrderDisposition::Duplicate | OrderDisposition::Enriched
+            ) || t2.outcomes[0].order == t.outcomes[0].order
+                && matches!(t2.outcomes[0].inventory, InventoryDisposition::Duplicate)
+                || matches!(t2.outcomes[0].inventory, InventoryDisposition::Duplicate)
+        );
     }
 }

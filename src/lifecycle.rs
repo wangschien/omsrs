@@ -89,6 +89,15 @@ pub fn derive_client_order_id(market: &str, strategy: &str, seq: u64) -> ClientO
 
 // ─── Order state (§6.B + B2 + C) ──────────────────────────────────────────────
 
+/// Local submission-closure reason. Records a local submission decision, not
+/// venue terminality or impossibility of a later execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubmissionCloseReason {
+    LocalNotSent,
+    DefiniteFailure,
+    ExhaustiveAbsent,
+}
+
 /// Per-order lifecycle state (typed; exhaustive for the pure core).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderState {
@@ -158,6 +167,8 @@ pub enum OrderState {
     UnknownNoMatch,
     /// Explicit halt with reason (cross-check mismatch, unproven resubmit, …).
     Halted { reason: HaltReason },
+    /// Inactive retained local submission. Not a venue terminal.
+    SubmissionClosed { reason: SubmissionCloseReason },
 }
 
 impl OrderState {
@@ -171,6 +182,28 @@ impl OrderState {
                 | OrderState::UnknownNoMatch
                 | OrderState::Halted { .. }
         )
+    }
+
+    /// True only for [`OrderState::SubmissionClosed`]. Exhaustive, no wildcard.
+    pub fn is_submission_closed(&self) -> bool {
+        match self {
+            OrderState::SubmissionClosed { .. } => true,
+            OrderState::New => false,
+            OrderState::SubmitPrepared => false,
+            OrderState::SubmitStarted { .. } => false,
+            OrderState::SubmitUnknown => false,
+            OrderState::Accepted { .. } => false,
+            OrderState::Partial { .. } => false,
+            OrderState::Filled => false,
+            OrderState::CancelPending { .. } => false,
+            OrderState::ReconcilePending { .. } => false,
+            OrderState::Canceled => false,
+            OrderState::Terminal => false,
+            OrderState::ImmediateFillUnattributed { .. } => false,
+            OrderState::ImmediateFillUnresolved => false,
+            OrderState::UnknownNoMatch => false,
+            OrderState::Halted { .. } => false,
+        }
     }
 }
 
@@ -415,6 +448,8 @@ pub enum OrderEvent {
     DecreaseObserved { remaining: u64, ts_ms: i64 },
     /// OMS-C: own remaining-changing amend ack.
     AmendObserved,
+    /// Typed local submission closure. Caller already holds approved evidence.
+    CloseSubmission { reason: SubmissionCloseReason },
 }
 
 // ─── Effects (pure descriptions — shell executes) ─────────────────────────────
@@ -674,16 +709,18 @@ pub enum ReservationHold {
 
 /// Reservation held predicate (§6.B invariant).
 ///
-/// **Released only** on true terminals: `Canceled`, `Filled` (attributed),
-/// `Terminal` (reconciled).  
+/// **Released** on true terminals: `Canceled`, `Filled` (attributed),
+/// `Terminal` (reconciled), and local `SubmissionClosed` (no reservation for
+/// this attempt; emits no `ReleaseReservation` effect).
 /// **Full** for everything else — including `SubmitUnknown`,
 /// `ImmediateFillUnattributed`, `ImmediateFillUnresolved`, `UnknownNoMatch`,
 /// `Halted`, live states, and `Partial` / `Accepted`.
 pub fn reservation_held(state: &OrderState) -> ReservationHold {
     match state {
-        OrderState::Canceled | OrderState::Filled | OrderState::Terminal => {
-            ReservationHold::Released
-        }
+        OrderState::Canceled
+        | OrderState::Filled
+        | OrderState::Terminal
+        | OrderState::SubmissionClosed { .. } => ReservationHold::Released,
         OrderState::New
         | OrderState::SubmitPrepared
         | OrderState::SubmitStarted { .. }
@@ -928,7 +965,7 @@ impl TransitionOutcome {
 /// 1. Order: Prepare → Started → Response (no skip Started).
 /// 2. Timeout → SubmitUnknown, **no** resubmit effect.
 /// 3. Cancel typed seven-way routing.
-/// 4. `reservation_held` released only on true terminals.
+/// 4. `reservation_held` released on true terminals and `SubmissionClosed`.
 /// 5. Restart-safe: replaying into terminal/halt yields no new I/O on re-apply
 ///    of terminal-confirming events (idempotent no-op / reject).
 pub fn apply_event(
@@ -936,6 +973,28 @@ pub fn apply_event(
     ctx: &mut OrderCtx,
     event: &OrderEvent,
 ) -> TransitionOutcome {
+    // First committed close reason wins (same or different recognized reason).
+    if let (OrderState::SubmissionClosed { reason: committed }, OrderEvent::CloseSubmission { .. }) =
+        (state, event)
+    {
+        return accept(
+            OrderState::SubmissionClosed {
+                reason: *committed,
+            },
+            vec![],
+        );
+    }
+
+    // Narrow UnknownNoMatch admission despite that state's frozen classification.
+    if matches!(state, OrderState::UnknownNoMatch) {
+        if let OrderEvent::CloseSubmission {
+            reason: SubmissionCloseReason::ExhaustiveAbsent,
+        } = event
+        {
+            return try_close_submission(ctx, SubmissionCloseReason::ExhaustiveAbsent);
+        }
+    }
+
     // Terminal / halt states: restart-safe — no new I/O effects (except D2 late fill).
     if is_restart_frozen(state) {
         return restart_safe_handle(state, ctx, event);
@@ -1036,6 +1095,12 @@ pub fn apply_event(
                 },
             }
         }
+        (OrderState::SubmitStarted { .. }, OrderEvent::CloseSubmission { reason }) => match reason {
+            SubmissionCloseReason::LocalNotSent | SubmissionCloseReason::DefiniteFailure => {
+                try_close_submission(ctx, *reason)
+            }
+            SubmissionCloseReason::ExhaustiveAbsent => reject_illegal(state, event),
+        },
         (OrderState::SubmitStarted { .. }, _) => reject_illegal(state, event),
 
         // ── §6.C SubmitUnknown recovery ───────────────────────────────────
@@ -1079,6 +1144,12 @@ pub fn apply_event(
                 state.clone(),
             )
         }
+        (OrderState::SubmitUnknown, OrderEvent::CloseSubmission { reason }) => match reason {
+            SubmissionCloseReason::ExhaustiveAbsent => try_close_submission(ctx, *reason),
+            SubmissionCloseReason::LocalNotSent | SubmissionCloseReason::DefiniteFailure => {
+                reject_illegal(state, event)
+            }
+        },
         (OrderState::SubmitUnknown, _) => reject_illegal(state, event),
 
         // ── Live: Accepted / Partial ──────────────────────────────────────
@@ -1414,7 +1485,39 @@ pub(crate) fn is_restart_frozen(state: &OrderState) -> bool {
             | OrderState::ImmediateFillUnresolved
             | OrderState::UnknownNoMatch
             | OrderState::Halted { .. }
+            | OrderState::SubmissionClosed { .. }
     )
+}
+
+/// Context contradiction for a not-yet-closed row. Does not clear evidence.
+fn submission_close_blocked(ctx: &OrderCtx) -> bool {
+    ctx.venue_order_id.is_some()
+        || !ctx.applied_fills.is_empty()
+        || ctx.attributed_fill_qty > 0
+        || ctx.fill_obligation > 0
+        || ctx.response_fill_count.is_some()
+        || ctx.response_remaining_count.is_some()
+        || ctx.response_avg_price_cents.is_some()
+        || ctx.response_fee_cents.is_some()
+        || ctx.response_snapshot_boundary.is_some()
+        || ctx.last_venue_remaining_qty.is_some()
+        || ctx.attributed_notional_cents > 0
+        || ctx.attributed_fee_cents > 0
+        || ctx.response_domain_qty > 0
+        || ctx.response_domain_notional_cents > 0
+        || ctx.response_domain_fee_cents > 0
+        || ctx.authority_complete
+}
+
+fn try_close_submission(ctx: &OrderCtx, reason: SubmissionCloseReason) -> TransitionOutcome {
+    if submission_close_blocked(ctx) {
+        return TransitionOutcome::Reject {
+            reason: RejectReason::NotApplicable {
+                detail: "submission close contradiction: bound venue, fill evidence, obligation, or create-response present".into(),
+            },
+        };
+    }
+    accept(OrderState::SubmissionClosed { reason }, vec![])
 }
 
 /// Restart-in-terminal safety: replaying further events produces no new I/O
@@ -3770,6 +3873,7 @@ fn state_name(s: &OrderState) -> &'static str {
         OrderState::ImmediateFillUnresolved => "ImmediateFillUnresolved",
         OrderState::UnknownNoMatch => "UnknownNoMatch",
         OrderState::Halted { .. } => "Halted",
+        OrderState::SubmissionClosed { .. } => "SubmissionClosed",
     }
 }
 
@@ -3789,6 +3893,7 @@ pub(crate) fn event_name(e: &OrderEvent) -> &'static str {
         OrderEvent::ReconcileResult { .. } => "ReconcileResult",
         OrderEvent::DecreaseObserved { .. } => "DecreaseObserved",
         OrderEvent::AmendObserved => "AmendObserved",
+        OrderEvent::CloseSubmission { .. } => "CloseSubmission",
     }
 }
 
@@ -4963,6 +5068,9 @@ mod tests {
             OrderState::Canceled,
             OrderState::Filled,
             OrderState::Terminal,
+            OrderState::SubmissionClosed {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
         ];
         for s in &released {
             assert_eq!(reservation_held(s), ReservationHold::Released, "{s:?}");
@@ -10461,6 +10569,358 @@ mod tests {
             "地板抬升重合成 target=4: {ns:?}"
         );
         assert_eq!(ctx.attributed_fill_qty, 4);
+    }
+
+    // ── Run-59 submission closure (core) ──────────────────────────────────
+
+    fn assert_close_accept(o: &TransitionOutcome, reason: SubmissionCloseReason) {
+        match o {
+            TransitionOutcome::Accept { new_state, effects } => {
+                assert!(
+                    matches!(
+                        new_state,
+                        OrderState::SubmissionClosed { reason: r } if *r == reason
+                    ),
+                    "expected SubmissionClosed({reason:?}), got {new_state:?}"
+                );
+                assert!(effects.is_empty(), "closure must emit no effects: {effects:?}");
+                assert!(!effects.iter().any(|e| matches!(
+                    e,
+                    Effect::ReleaseReservation
+                        | Effect::ReserveFull
+                        | Effect::HaltNewExposure
+                        | Effect::AccountFill { .. }
+                        | Effect::BackfillUnknown { .. }
+                        | Effect::AppendFsync(_)
+                )));
+            }
+            other => panic!("closure must Accept, got {other:?}"),
+        }
+        assert!(!o.is_halt());
+        let st = o.new_state().unwrap();
+        assert!(st.is_submission_closed());
+        assert!(!st.is_terminal_or_halt());
+        assert!(is_restart_frozen(st));
+        assert_eq!(reservation_held(st), ReservationHold::Released);
+        assert_eq!(state_name(st), "SubmissionClosed");
+    }
+
+    /// Removing Started+LocalNotSent admission fails this.
+    #[test]
+    fn close_submission_started_local_not_sent() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let before = ctx.clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::LocalNotSent,
+            },
+        );
+        assert_close_accept(&o, SubmissionCloseReason::LocalNotSent);
+        assert_eq!(ctx, before);
+        assert_eq!(event_name(&OrderEvent::CloseSubmission {
+            reason: SubmissionCloseReason::LocalNotSent,
+        }), "CloseSubmission");
+    }
+
+    /// Removing Started+DefiniteFailure admission fails this.
+    #[test]
+    fn close_submission_started_definite_failure() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        );
+        assert_close_accept(&o, SubmissionCloseReason::DefiniteFailure);
+    }
+
+    /// Timeout→SubmitUnknown then ExhaustiveAbsent. Inverting the Unknown arm fails this.
+    #[test]
+    fn close_submission_timeout_unknown_exhaustive_absent() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(&s, &mut ctx, &OrderEvent::SubmitTimeout);
+        assert!(matches!(o.new_state(), Some(OrderState::SubmitUnknown)));
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::ExhaustiveAbsent,
+            },
+        );
+        assert_close_accept(&o, SubmissionCloseReason::ExhaustiveAbsent);
+    }
+
+    /// Real exhaustive-empty backfill reaches UnknownNoMatch; only ExhaustiveAbsent may close it.
+    #[test]
+    fn close_submission_unknown_no_match_via_exhaustive_empty() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(&s, &mut ctx, &OrderEvent::SubmitTimeout);
+        let s = o.new_state().unwrap().clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: vec![],
+            },
+        );
+        assert!(o.is_halt());
+        assert_eq!(o.new_state(), Some(&OrderState::UnknownNoMatch));
+        let s = o.new_state().unwrap().clone();
+        let before = ctx.clone();
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::ExhaustiveAbsent,
+            },
+        );
+        assert_close_accept(&o, SubmissionCloseReason::ExhaustiveAbsent);
+        assert_eq!(ctx, before);
+        let o_bad = apply_event(
+            &OrderState::UnknownNoMatch,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::LocalNotSent,
+            },
+        );
+        assert!(o_bad.is_reject());
+        assert_eq!(ctx, before);
+    }
+
+    /// Wrong state/reason pairs reject with no ctx mutation. Broadening admission fails this.
+    #[test]
+    fn close_submission_forbidden_state_reason_pairs_reject() {
+        let reasons = [
+            SubmissionCloseReason::LocalNotSent,
+            SubmissionCloseReason::DefiniteFailure,
+            SubmissionCloseReason::ExhaustiveAbsent,
+        ];
+        let states = [
+            OrderState::New,
+            OrderState::SubmitPrepared,
+            OrderState::SubmitStarted {
+                attempt_id: AttemptId("a".into()),
+            },
+            OrderState::SubmitUnknown,
+            OrderState::Accepted {
+                venue_order_id: vid("V"),
+            },
+            OrderState::Partial {
+                venue_order_id: vid("V"),
+                filled_qty: 1,
+                remaining_qty: 9,
+            },
+            OrderState::Filled,
+            OrderState::Canceled,
+            OrderState::Terminal,
+            OrderState::ImmediateFillUnresolved,
+            OrderState::Halted {
+                reason: HaltReason::UnknownNoMatch,
+            },
+        ];
+        let allowed = |s: &OrderState, r: SubmissionCloseReason| -> bool {
+            match (s, r) {
+                (OrderState::SubmitStarted { .. }, SubmissionCloseReason::LocalNotSent) => true,
+                (OrderState::SubmitStarted { .. }, SubmissionCloseReason::DefiniteFailure) => true,
+                (OrderState::SubmitUnknown, SubmissionCloseReason::ExhaustiveAbsent) => true,
+                _ => false,
+            }
+        };
+        for s in &states {
+            for r in reasons {
+                if allowed(s, r) {
+                    continue;
+                }
+                let mut ctx = ctx_default();
+                let before = ctx.clone();
+                let o = apply_event(
+                    s,
+                    &mut ctx,
+                    &OrderEvent::CloseSubmission { reason: r },
+                );
+                assert!(
+                    o.is_reject(),
+                    "forbidden pair {s:?} + {r:?} must Reject, got {o:?}"
+                );
+                assert!(!o.is_halt());
+                assert!(o.effects().is_empty());
+                assert_eq!(ctx, before, "reject must not mutate ctx for {s:?} + {r:?}");
+            }
+        }
+    }
+
+    /// Same/different-reason repeats keep the first reason, no effects. Dropping the
+    /// SubmissionClosed arm fails this (generic frozen reject).
+    #[test]
+    fn close_submission_repeat_keeps_first_reason() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+        let o = apply_event(
+            &s,
+            &mut ctx,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        );
+        let closed = o.new_state().unwrap().clone();
+        let before = ctx.clone();
+        for r in [
+            SubmissionCloseReason::DefiniteFailure,
+            SubmissionCloseReason::LocalNotSent,
+            SubmissionCloseReason::ExhaustiveAbsent,
+        ] {
+            let o2 = apply_event(
+                &closed,
+                &mut ctx,
+                &OrderEvent::CloseSubmission { reason: r },
+            );
+            assert_close_accept(&o2, SubmissionCloseReason::DefiniteFailure);
+            assert_eq!(ctx, before);
+        }
+    }
+
+    /// Wire / create-response / obligation contradictions reject without clearing evidence.
+    #[test]
+    fn close_submission_contradiction_controls_reject() {
+        let mut ctx = ctx_default();
+        let s = prepare_started(&mut ctx);
+
+        let mut wire = ctx.clone();
+        wire.venue_order_id = Some(vid("W"));
+        let before = wire.clone();
+        let o = apply_event(
+            &s,
+            &mut wire,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        );
+        assert!(o.is_reject());
+        assert!(!o.is_halt());
+        assert_eq!(wire, before);
+
+        let mut resp = ctx.clone();
+        resp.response_fill_count = Some(0);
+        let before = resp.clone();
+        let o = apply_event(
+            &s,
+            &mut resp,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::LocalNotSent,
+            },
+        );
+        assert!(o.is_reject());
+        assert_eq!(resp, before);
+
+        let mut obl = ctx.clone();
+        obl.raise_fill_obligation(1).unwrap();
+        let before = obl.clone();
+        let o = apply_event(
+            &s,
+            &mut obl,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::DefiniteFailure,
+            },
+        );
+        assert!(o.is_reject());
+        assert_eq!(obl, before);
+        assert_eq!(obl.fill_obligation, 1);
+    }
+
+    /// Replay of Prepare+Start without a close record must not infer SubmissionClosed.
+    #[test]
+    fn close_submission_replay_without_close_stays_started() {
+        let ctx = ctx_default();
+        let r = replay(
+            OrderState::New,
+            ctx,
+            &[
+                OrderEvent::PrepareSubmit,
+                OrderEvent::StartSubmit {
+                    attempt_id: AttemptId("a1".into()),
+                },
+            ],
+        );
+        assert!(matches!(r.state, OrderState::SubmitStarted { .. }));
+        assert!(!r.state.is_submission_closed());
+        assert!(r.reject.is_none());
+    }
+
+    /// is_submission_closed is true only for the new variant.
+    #[test]
+    fn close_submission_classification_only_new_state() {
+        let closed = OrderState::SubmissionClosed {
+            reason: SubmissionCloseReason::LocalNotSent,
+        };
+        assert!(closed.is_submission_closed());
+        assert!(!closed.is_terminal_or_halt());
+        assert!(is_restart_frozen(&closed));
+        assert_eq!(reservation_held(&closed), ReservationHold::Released);
+        for s in [
+            OrderState::New,
+            OrderState::SubmitPrepared,
+            OrderState::SubmitStarted {
+                attempt_id: AttemptId("a".into()),
+            },
+            OrderState::SubmitUnknown,
+            OrderState::Accepted {
+                venue_order_id: vid("V"),
+            },
+            OrderState::Partial {
+                venue_order_id: vid("V"),
+                filled_qty: 1,
+                remaining_qty: 9,
+            },
+            OrderState::Filled,
+            OrderState::CancelPending {
+                venue_order_id: vid("V"),
+                filled_qty: 0,
+                remaining_qty: 10,
+                response_fill_count: None,
+                response_avg_price_cents: None,
+                response_fee_cents: None,
+                reconcile_target: None,
+            },
+            OrderState::ReconcilePending {
+                venue_order_id: vid("V"),
+                filled_qty: 2,
+                remaining_qty: 8,
+                target: ReconcileTarget {
+                    terminal: ReconcileTerminal::Canceled,
+                    venue_filled_qty: 4,
+                    venue_remaining_qty: Some(6),
+                },
+                response_fill_count: Some(4),
+                response_avg_price_cents: None,
+                response_fee_cents: None,
+            },
+            OrderState::Canceled,
+            OrderState::Terminal,
+            OrderState::ImmediateFillUnattributed {
+                venue_order_id: vid("V"),
+                response_fill_count: 5,
+                response_remaining_count: 5,
+                response_avg_price_cents: None,
+                response_fee_cents: None,
+            },
+            OrderState::ImmediateFillUnresolved,
+            OrderState::UnknownNoMatch,
+            OrderState::Halted {
+                reason: HaltReason::UnknownNoMatch,
+            },
+        ] {
+            assert!(!s.is_submission_closed(), "{s:?}");
+        }
     }
 }
 
