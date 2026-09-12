@@ -46,6 +46,8 @@ reconciliation. See [CHANGELOG.md](CHANGELOG.md) for details.
 description, complete v0.4 release notes, and application-neutral examples.
 There are no functional or public API changes from v0.4.0.
 
+**v0.5.1** (2026-09-12): adds typed `CloseSubmission` / definite-failure close on the OrderTxn path.
+
 **v0.5.0** (2026-09-08): adds I/O-free execution transactions and market
 inventory (first-admitted fill attribution, foreign-row refusal) and venue
 observation (wire membership, routing, coverage, working view, readiness).

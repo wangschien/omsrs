@@ -4,6 +4,22 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-09-12
+
+### Added
+
+- Add typed local submission-close through the existing `OrderTxn` path:
+  `CloseSubmission` event, closed-submission state, and close reason
+  (including definite failure such as venue `post_only_cross` rejects).
+- Repeat close keeps the first reason and emits no new transaction.
+- Pre-ACK execution evidence blocks close; an explicit closed-row Fill
+  keeps the existing frozen ReserveFull path.
+
+### Compatibility
+
+- Additive on the v0.5 lifecycle / journal surface. Caret `omsrs = "0.5"`
+  picks this up.
+
 ## [0.5.0] - 2026-09-08
 
 ### Added
