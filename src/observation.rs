@@ -660,7 +660,7 @@ impl WireRegistry {
             JournalRecord::OrderAuthorityHold { ledger, wire } => {
                 let state = self.ensure(ledger, wire);
                 state.authority_hold = true;
-                state.authority_hold_revision = pos;
+                state.authority_hold_revision = pos.saturating_add(1);
             }
             JournalRecord::OrderStateTxn(t) => {
                 self.wires.insert((t.ledger.clone(), t.wire.clone()), t.wire_after.clone());
