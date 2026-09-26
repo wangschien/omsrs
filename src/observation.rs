@@ -692,9 +692,12 @@ impl WireRegistry {
         }
         self.seen_order.insert(key, o.clone());
         // This exact admitted WS terminal claim and the FillCid-backed order
-        // transition form one journaled fact. Clear only the older hold on the
-        // proved child; a terminal frame preceding H2 must not clear H2.
-        let terminal_hold_wire = if o.event == "UserOrderTerminalClaim"
+        // transition form one journaled fact. A full Fill can itself make the
+        // child terminal before UserOrderTerminalClaim is legal. Both paths
+        // clear only an older hold on the proved child; a frame preceding H2
+        // cannot clear H2.
+        let terminal_hold_wire = if (o.event == "UserOrderTerminalClaim"
+            || (o.event == "Fill" && o.state_after == OrderState::Filled))
             && matches!(&o.state_after, OrderState::Canceled | OrderState::Filled | OrderState::Terminal)
         {
             o.ctx_after.venue_order_id.as_ref().and_then(|wire| {
@@ -707,7 +710,8 @@ impl WireRegistry {
                             e.wire == *wire && e.market == o.ledger.market
                                 && e.client_order_id == o.client_order_id
                                 && ws.observed_exchange_index == Some(e.exchange_index)
-                                && matches!(e.status, UserOrderStatus::Canceled | UserOrderStatus::Executed)
+                                && (matches!(e.status, UserOrderStatus::Canceled | UserOrderStatus::Executed))
+                                && (o.event != "Fill" || e.status == UserOrderStatus::Executed)
                                 && e.filled == o.ctx_after.attributed_fill_qty
                         })
                 }).map(|_| wire.clone())
