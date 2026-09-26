@@ -734,8 +734,9 @@ impl WireRegistry {
         }
         if let Some(wire) = terminal_hold_wire {
             if let Some(ws) = self.wires.get_mut(&(o.ledger.clone(), wire)) {
-                if !ws.members.is_empty()
-                    && ws.members.iter().all(|member| member.role == MemberRole::Terminal)
+                if ws.members.iter().any(|member|
+                    member.cid == o.client_order_id && member.role == MemberRole::Terminal)
+                    && ws.members.iter().all(|member| member.role != MemberRole::Current)
                 {
                     ws.authority_hold = false;
                 }
