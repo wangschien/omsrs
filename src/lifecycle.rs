@@ -402,6 +402,20 @@ pub enum OrderEvent {
     },
     /// Submit timeout / transport Unknown → `SubmitUnknown`, never resubmit.
     SubmitTimeout,
+    /// A separately committed, same-CID/same-wire user_order resting frame
+    /// can claim an unknown zero-fill submission.  This is not an HTTP ACK and
+    /// does not synthesize fills, fees, or an exhaustive REST page.
+    UserOrderRestingClaim {
+        venue_order_id: VenueOrderId,
+        remaining: u64,
+    },
+    /// A matching terminal user_order plus a complete FillCid ledger is
+    /// terminal authority for this order only. It is not an execution fill.
+    UserOrderTerminalClaim {
+        venue_order_id: VenueOrderId,
+        filled: u64,
+        executed: bool,
+    },
     /// Authoritative fill (WS or GET) keyed by `fill_id`.
     Fill {
         fill_id: FillId,
@@ -583,6 +597,38 @@ pub enum JournalRecord {
     ExecutionTxn(Box<crate::execution::ExecutionTxnRecord>),
     /// OMS-C single self-contained observation record.
     ObservationTxn(Box<crate::observation::ObservationTxnRecord>),
+    /// A committed per-wire amend intent or phase transition. The current
+    /// generation is still advanced only by OwnActionCid, never by this record.
+    AmendLineage {
+        ledger: crate::execution::LedgerId,
+        wire: VenueOrderId,
+        lineage: Option<crate::observation::AmendLineage>,
+    },
+    /// Independently admitted order-state evidence. It is not a fill and does
+    /// not pretend to be an exhaustive REST execution page.
+    UserOrderReceived {
+        ledger: crate::execution::LedgerId,
+        wire: VenueOrderId,
+        evidence: crate::observation::UserOrderEvidence,
+    },
+    /// Identity/version conflict retained for restart diagnostics, never
+    /// treated as a state transition or fill authority.
+    UserOrderQuarantined {
+        ledger: crate::execution::LedgerId,
+        wire: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+        reason: String,
+    },
+    /// Durable pre-ACK frame, keyed by the prepared client id.  It remains
+    /// non-authoritative until the submitted row/lineage is reconciled.
+    UserOrderStaged {
+        ledger: crate::execution::LedgerId,
+        client_order_id: ClientOrderId,
+        evidence: Option<crate::observation::UserOrderEvidence>,
+    },
+    /// Durable transaction proving the current amended generation's remaining.
+    OrderStateTxn(Box<crate::observation::OrderStateTxnRecord>),
+    RestOrderProofTxn(Box<crate::observation::RestOrderProofTxnRecord>),
     /// OMS-C own remaining-changing action, carried in A's OrderTxn core records.
     OwnActionCid {
         client_order_id: ClientOrderId,
@@ -1001,6 +1047,28 @@ pub fn apply_event(
     }
 
     match (state, event) {
+        (OrderState::Accepted { .. } | OrderState::Partial { .. }
+        | OrderState::CancelPending { .. } | OrderState::ReconcilePending { .. },
+            OrderEvent::UserOrderTerminalClaim { venue_order_id, filled, executed }) => {
+            if ctx.venue_order_id.as_ref() != Some(venue_order_id)
+                || ctx.attributed_fill_qty != *filled
+                || (*executed && *filled != ctx.qty)
+                || (!*executed && *filled > ctx.qty)
+            {
+                return reject_illegal(state, event);
+            }
+            ctx.note_venue_remaining(0);
+            let mut effects = Vec::new();
+            if let Some(record) = note_authority_complete(ctx, true) {
+                effects.push(Effect::AppendFsync(record));
+            }
+            try_finalize_terminal(ctx,
+                if *executed { ProposedTerminal::Filled {
+                    venue_authoritative_filled: *filled, venue_remaining_qty: 0,
+                }} else { ProposedTerminal::Canceled },
+                venue_order_id.clone(), effects,
+                if *executed { ReconcileTerminal::Filled } else { ReconcileTerminal::Canceled })
+        }
         // ── §6.B prepare / start / response / timeout ─────────────────────
         (OrderState::New, OrderEvent::PrepareSubmit) => {
             let effects = vec![Effect::AppendFsync(JournalRecord::SubmitPrepared {
@@ -1106,6 +1174,22 @@ pub fn apply_event(
         // ── §6.C SubmitUnknown recovery ───────────────────────────────────
         (OrderState::SubmitUnknown, OrderEvent::UnknownBackfillResult { exhaustive, matched }) => {
             apply_unknown_backfill(ctx, *exhaustive, matched)
+        }
+        (OrderState::SubmitUnknown, OrderEvent::UserOrderRestingClaim { venue_order_id, remaining }) => {
+            if ctx.attributed_fill_qty != 0 || *remaining != ctx.qty {
+                return reject_illegal(state, event);
+            }
+            let bind = match bind_venue_id(ctx, venue_order_id) {
+                Ok(bind) => bind,
+                Err(reason) => return halt_with_reason(reason, vec![]),
+            };
+            ctx.note_venue_remaining(*remaining);
+            let mut effects = Vec::new();
+            push_journal(&mut effects, bind);
+            accept(
+                OrderState::Accepted { venue_order_id: venue_order_id.clone() },
+                effects,
+            )
         }
         (OrderState::SubmitUnknown, OrderEvent::RequestResubmit {
             venue_idempotent_proven,
@@ -3883,6 +3967,8 @@ pub(crate) fn event_name(e: &OrderEvent) -> &'static str {
         OrderEvent::StartSubmit { .. } => "StartSubmit",
         OrderEvent::SubmitResponse { .. } => "SubmitResponse",
         OrderEvent::SubmitTimeout => "SubmitTimeout",
+        OrderEvent::UserOrderRestingClaim { .. } => "UserOrderRestingClaim",
+        OrderEvent::UserOrderTerminalClaim { .. } => "UserOrderTerminalClaim",
         OrderEvent::Fill { .. } => "Fill",
         OrderEvent::CancelRequested => "CancelRequested",
         OrderEvent::CancelOutcome(_) => "CancelOutcome",
@@ -4134,7 +4220,14 @@ pub fn rebuild_ctx_from_journal(
             // OMS-A: scoped txn records ignored by legacy fold.
             JournalRecord::OrderTxn(_) | JournalRecord::ExecutionTxn(_) => {}
             // OMS-C: observation / own-action records ignored by legacy ctx fold.
-            JournalRecord::ObservationTxn(_) | JournalRecord::OwnActionCid { .. } => {}
+            JournalRecord::ObservationTxn(_)
+            | JournalRecord::OwnActionCid { .. }
+            | JournalRecord::AmendLineage { .. }
+            | JournalRecord::UserOrderReceived { .. }
+            | JournalRecord::UserOrderQuarantined { .. }
+            | JournalRecord::UserOrderStaged { .. }
+            | JournalRecord::OrderStateTxn(_)
+            | JournalRecord::RestOrderProofTxn(_) => {}
         }
     }
     Ok(ctx)

@@ -53,6 +53,95 @@ pub struct WireState {
     pub last: Option<ObservationOutcome>,
     pub resolved: bool,
     pub remaining_observation: Option<RemainingObservation>,
+    #[serde(default)]
+    pub amend_lineage: Option<AmendLineage>,
+    #[serde(default)]
+    pub latest_user_order: Option<UserOrderEvidence>,
+    #[serde(default)]
+    pub proved_current_cid: Option<ClientOrderId>,
+    #[serde(default)]
+    pub observed_exchange_index: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AmendPhase {
+    HttpPending,
+    AppliedNeedsObservation,
+    Unknown,
+    RestDue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmendLineage {
+    pub old_cid: ClientOrderId,
+    pub new_cid: ClientOrderId,
+    pub pre_generation: u64,
+    pub phase: AmendPhase,
+    pub declared_remaining: u64,
+    pub applied_at_utc_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UserOrderStatus {
+    Resting,
+    Canceled,
+    Executed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserOrderEvidence {
+    pub wire: VenueOrderId,
+    pub market: String,
+    pub exchange_index: i64,
+    pub subaccount_number: i64,
+    pub sid: u64,
+    pub side: crate::lifecycle::Side,
+    pub yes_price_e4: u64,
+    pub client_order_id: ClientOrderId,
+    pub status: UserOrderStatus,
+    pub filled: u64,
+    pub remaining: u64,
+    pub initial: u64,
+    pub updated_ts_ms: u64,
+    pub connection_generation: u64,
+    pub payload_digest: String,
+}
+
+fn same_user_order_state(a: &UserOrderEvidence, b: &UserOrderEvidence) -> bool {
+    a.wire == b.wire && a.market == b.market
+        && a.exchange_index == b.exchange_index
+        && a.subaccount_number == b.subaccount_number
+        && a.side == b.side && a.yes_price_e4 == b.yes_price_e4
+        && a.client_order_id == b.client_order_id && a.status == b.status
+        && a.filled == b.filled && a.remaining == b.remaining
+        && a.initial == b.initial && a.updated_ts_ms == b.updated_ts_ms
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderStateTxnRecord {
+    pub ledger: LedgerId,
+    pub wire: VenueOrderId,
+    pub evidence: UserOrderEvidence,
+    pub inventory_generation_before: u64,
+    pub wire_generation_before: u64,
+    pub wire_after: WireState,
+}
+
+/// A completed, identity-bound REST order page may prove the current amended
+/// generation.  This is distinct from a user_order frame: no venue timestamp
+/// or WS subscription identity is invented for the REST response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestOrderProofTxnRecord {
+    pub ledger: LedgerId,
+    pub wire: VenueOrderId,
+    pub client_order_id: ClientOrderId,
+    pub filled: u64,
+    pub remaining: u64,
+    pub initial: u64,
+    pub inventory_generation_before: u64,
+    pub wire_generation_before: u64,
+    pub wire_after: WireState,
 }
 
 impl WireState {
@@ -68,6 +157,10 @@ impl WireState {
             last: None,
             resolved: false,
             remaining_observation: None,
+            amend_lineage: None,
+            latest_user_order: None,
+            proved_current_cid: None,
+            observed_exchange_index: None,
         }
     }
 
@@ -109,6 +202,21 @@ pub enum Route {
 pub enum WorkingView {
     Known(u64),
     Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderStateProofError {
+    MissingWire,
+    MissingCurrent,
+    WrongCurrent,
+    PendingAmend,
+    LineageMismatch,
+    InvalidTransition,
+    StaleOrConflictingVersion,
+    FillMismatch,
+    QuantityMismatch,
+    GenerationChanged,
+    InventoryChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +371,243 @@ impl WireRegistry {
         self.wire(ledger, wire)
     }
 
+    /// A lineage record is a prepared journal effect, not a mutation. The
+    /// caller must append and commit it before fold and before venue dispatch.
+    pub fn prepare_amend_lineage(
+        &self,
+        ledger: &LedgerId,
+        wire: &VenueOrderId,
+        lineage: AmendLineage,
+    ) -> Result<JournalRecord, OrderStateProofError> {
+        let ws = self.wire(ledger, wire).ok_or(OrderStateProofError::MissingWire)?;
+        match lineage.phase {
+            AmendPhase::HttpPending => {
+                if ws.amend_lineage.is_some() || ws.generation != lineage.pre_generation {
+                    return Err(OrderStateProofError::PendingAmend);
+                }
+                if ws.current().map(|m| &m.cid) != Some(&lineage.old_cid)
+                    || lineage.old_cid == lineage.new_cid
+                {
+                    return Err(OrderStateProofError::WrongCurrent);
+                }
+            }
+            AmendPhase::AppliedNeedsObservation | AmendPhase::Unknown | AmendPhase::RestDue => {
+                let prior = ws.amend_lineage.as_ref().ok_or(OrderStateProofError::LineageMismatch)?;
+                if prior.old_cid != lineage.old_cid
+                    || prior.new_cid != lineage.new_cid
+                    || prior.pre_generation != lineage.pre_generation
+                    || prior.declared_remaining != lineage.declared_remaining
+                {
+                    return Err(OrderStateProofError::LineageMismatch);
+                }
+                if lineage.phase == AmendPhase::AppliedNeedsObservation
+                    && (ws.generation != lineage.pre_generation.checked_add(1).ok_or(OrderStateProofError::GenerationChanged)?
+                        || ws.current().map(|m| &m.cid) != Some(&lineage.new_cid))
+                {
+                    return Err(OrderStateProofError::GenerationChanged);
+                }
+            }
+        }
+        Ok(JournalRecord::AmendLineage {
+            ledger: ledger.clone(),
+            wire: wire.clone(),
+            lineage: Some(lineage),
+        })
+    }
+
+    pub fn prepare_user_order_received(
+        &self,
+        ledger: &LedgerId,
+        wire: &VenueOrderId,
+        evidence: UserOrderEvidence,
+    ) -> Result<Option<JournalRecord>, OrderStateProofError> {
+        let ws = self.wire(ledger, wire).ok_or(OrderStateProofError::MissingWire)?;
+        if evidence.wire != *wire || evidence.market != ledger.market
+            || ws.observed_exchange_index.is_some_and(|index| index != evidence.exchange_index)
+        {
+            return Err(OrderStateProofError::WrongCurrent);
+        }
+        let belongs = ws.current().map(|m| &m.cid) == Some(&evidence.client_order_id)
+            || ws.amend_lineage.as_ref().is_some_and(|l| l.new_cid == evidence.client_order_id);
+        if !belongs {
+            return Err(OrderStateProofError::WrongCurrent);
+        }
+        let quantity_valid = match evidence.status {
+            UserOrderStatus::Resting | UserOrderStatus::Unknown =>
+                evidence.initial.checked_sub(evidence.filled) == Some(evidence.remaining),
+            UserOrderStatus::Canceled => evidence.remaining == 0 && evidence.filled <= evidence.initial,
+            UserOrderStatus::Executed => evidence.remaining == 0 && evidence.filled == evidence.initial,
+        };
+        if !quantity_valid {
+            return Err(OrderStateProofError::QuantityMismatch);
+        }
+        if let Some(prev) = ws.latest_user_order.as_ref() {
+            if prev.client_order_id == evidence.client_order_id {
+                if evidence.updated_ts_ms < prev.updated_ts_ms
+                    || evidence.filled < prev.filled
+                    || (evidence.updated_ts_ms == prev.updated_ts_ms
+                        && !same_user_order_state(&evidence, prev))
+                    || (prev.status != UserOrderStatus::Resting
+                        && evidence.status == UserOrderStatus::Resting)
+                {
+                    return Err(OrderStateProofError::StaleOrConflictingVersion);
+                }
+                if same_user_order_state(&evidence, prev) {
+                    return Ok(None);
+                }
+            } else if ws.current().map(|m| &m.cid) != Some(&evidence.client_order_id)
+                && !ws.amend_lineage.as_ref().is_some_and(|l| l.new_cid == evidence.client_order_id)
+            {
+                return Err(OrderStateProofError::WrongCurrent);
+            }
+        }
+        Ok(Some(JournalRecord::UserOrderReceived {
+            ledger: ledger.clone(),
+            wire: wire.clone(),
+            evidence,
+        }))
+    }
+
+    /// A current zero-generation order or an Applied amend successor may use a
+    /// matching order-state frame. The frame contributes no execution fill.
+    pub fn prepare_order_state_resting(
+        &self,
+        ledger: &LedgerId,
+        wire: &VenueOrderId,
+        inventory: &MarketInventory,
+    ) -> Result<OrderStateTxnRecord, OrderStateProofError> {
+        let ws = self.wire(ledger, wire).ok_or(OrderStateProofError::MissingWire)?;
+        let evidence = ws.latest_user_order.as_ref().ok_or(OrderStateProofError::MissingCurrent)?;
+        if evidence.status != UserOrderStatus::Resting {
+            return Err(OrderStateProofError::InvalidTransition);
+        }
+        if ws.current().map(|m| &m.cid) != Some(&evidence.client_order_id) {
+            return Err(OrderStateProofError::LineageMismatch);
+        }
+        if let Some(lineage) = ws.amend_lineage.as_ref() {
+            if lineage.phase != AmendPhase::AppliedNeedsObservation
+                || evidence.client_order_id != lineage.new_cid
+                || ws.generation != lineage.pre_generation.checked_add(1)
+                    .ok_or(OrderStateProofError::GenerationChanged)?
+            {
+                return Err(OrderStateProofError::LineageMismatch);
+            }
+            if evidence.initial != lineage.declared_remaining {
+                return Err(OrderStateProofError::QuantityMismatch);
+            }
+        } else if ws.generation != 0 {
+            // Decrease and old own-action evidence must not regain Known.
+            return Err(OrderStateProofError::LineageMismatch);
+        }
+        let filled = ws.held.iter().try_fold(0_u64, |acc, id| {
+            acc.checked_add(inventory.get(id).map(|entry| entry.qty).unwrap_or(0))
+        }).ok_or(OrderStateProofError::FillMismatch)?;
+        if evidence.filled != filled {
+            return Err(OrderStateProofError::FillMismatch);
+        }
+        let mut wire_after = ws.clone();
+        wire_after.last = Some(ObservationOutcome::Consistent { remaining_fresh: true });
+        wire_after.remaining_observation = Some(RemainingObservation {
+            remaining: evidence.remaining,
+            covered: ws.held.clone(),
+            generation: ws.generation,
+        });
+        wire_after.proved_current_cid = Some(evidence.client_order_id.clone());
+        wire_after.amend_lineage = None;
+        Ok(OrderStateTxnRecord {
+            ledger: ledger.clone(),
+            wire: wire.clone(),
+            evidence: evidence.clone(),
+            inventory_generation_before: inventory.generation(),
+            wire_generation_before: ws.generation,
+            wire_after,
+        })
+    }
+
+    pub fn apply_order_state_resting(
+        &mut self,
+        txn: &OrderStateTxnRecord,
+        inventory: &MarketInventory,
+    ) -> Result<(), OrderStateProofError> {
+        if inventory.generation() != txn.inventory_generation_before {
+            return Err(OrderStateProofError::InventoryChanged);
+        }
+        let fresh = self.prepare_order_state_resting(&txn.ledger, &txn.wire, inventory)?;
+        if fresh != *txn {
+            return Err(OrderStateProofError::GenerationChanged);
+        }
+        self.wires.insert((txn.ledger.clone(), txn.wire.clone()), txn.wire_after.clone());
+        Ok(())
+    }
+
+    pub fn prepare_rest_order_proof(
+        &self,
+        ledger: &LedgerId,
+        wire: &VenueOrderId,
+        client_order_id: &ClientOrderId,
+        filled: u64,
+        remaining: u64,
+        initial: u64,
+        inventory: &MarketInventory,
+    ) -> Result<RestOrderProofTxnRecord, OrderStateProofError> {
+        let ws = self.wire(ledger, wire).ok_or(OrderStateProofError::MissingWire)?;
+        let lineage = ws.amend_lineage.as_ref().ok_or(OrderStateProofError::LineageMismatch)?;
+        if !matches!(lineage.phase, AmendPhase::AppliedNeedsObservation | AmendPhase::RestDue)
+            || ws.current().map(|m| &m.cid) != Some(client_order_id)
+            || &lineage.new_cid != client_order_id
+            || ws.generation != lineage.pre_generation.checked_add(1).ok_or(OrderStateProofError::GenerationChanged)?
+        {
+            return Err(OrderStateProofError::LineageMismatch);
+        }
+        if initial != lineage.declared_remaining
+            || filled.checked_add(remaining) != Some(initial)
+            || ws.last != Some(ObservationOutcome::Consistent { remaining_fresh: false })
+        {
+            return Err(OrderStateProofError::QuantityMismatch);
+        }
+        let covered_filled = ws.held.iter().try_fold(0_u64, |acc, id| {
+            acc.checked_add(inventory.get(id).map(|entry| entry.qty).unwrap_or(0))
+        }).ok_or(OrderStateProofError::FillMismatch)?;
+        if covered_filled != filled {
+            return Err(OrderStateProofError::FillMismatch);
+        }
+        let mut wire_after = ws.clone();
+        wire_after.last = Some(ObservationOutcome::Consistent { remaining_fresh: true });
+        wire_after.remaining_observation = Some(RemainingObservation {
+            remaining,
+            covered: ws.held.clone(),
+            generation: ws.generation,
+        });
+        wire_after.proved_current_cid = Some(client_order_id.clone());
+        wire_after.amend_lineage = None;
+        Ok(RestOrderProofTxnRecord {
+            ledger: ledger.clone(), wire: wire.clone(), client_order_id: client_order_id.clone(),
+            filled, remaining, initial,
+            inventory_generation_before: inventory.generation(),
+            wire_generation_before: ws.generation,
+            wire_after,
+        })
+    }
+
+    pub fn apply_rest_order_proof(
+        &mut self,
+        txn: &RestOrderProofTxnRecord,
+        inventory: &MarketInventory,
+    ) -> Result<(), OrderStateProofError> {
+        if inventory.generation() != txn.inventory_generation_before {
+            return Err(OrderStateProofError::InventoryChanged);
+        }
+        let fresh = self.prepare_rest_order_proof(
+            &txn.ledger, &txn.wire, &txn.client_order_id,
+            txn.filled, txn.remaining, txn.initial, inventory,
+        )?;
+        if fresh != *txn {
+            return Err(OrderStateProofError::GenerationChanged);
+        }
+        self.wires.insert((txn.ledger.clone(), txn.wire.clone()), txn.wire_after.clone());
+        Ok(())
+    }
+
     pub fn fold(
         &mut self,
         pos: u64,
@@ -291,6 +636,20 @@ impl WireRegistry {
                         }
                     }
                 }
+            }
+            JournalRecord::AmendLineage { ledger, wire, lineage } => {
+                self.ensure(ledger, wire).amend_lineage = lineage.clone();
+            }
+            JournalRecord::UserOrderReceived { ledger, wire, evidence } => {
+                let ws = self.ensure(ledger, wire);
+                ws.latest_user_order = Some(evidence.clone());
+                ws.observed_exchange_index = Some(evidence.exchange_index);
+            }
+            JournalRecord::OrderStateTxn(t) => {
+                self.wires.insert((t.ledger.clone(), t.wire.clone()), t.wire_after.clone());
+            }
+            JournalRecord::RestOrderProofTxn(t) => {
+                self.wires.insert((t.ledger.clone(), t.wire.clone()), t.wire_after.clone());
             }
             _ => {}
         }
@@ -379,6 +738,7 @@ impl WireRegistry {
             if ws.members.iter().any(|m| m.cid == *cid) {
                 ws.generation = ws.generation.saturating_add(1);
                 ws.remaining_observation = None;
+                ws.proved_current_cid = None;
             }
         }
     }
@@ -468,7 +828,8 @@ impl WireRegistry {
                 }),
             ) if obs.covered == ws.held
                 && obs.generation == ws.generation
-                && ws.generation == 0 =>
+                && (ws.generation == 0
+                    || ws.proved_current_cid.as_ref() == ws.current().map(|m| &m.cid)) =>
             {
                 WorkingView::Known(obs.remaining)
             }
@@ -1517,6 +1878,35 @@ mod tests {
         ));
         apply_obs(txn, &mut row, &mut reg, &inv);
         assert_eq!(reg.working_view(&row.led, &vid("W1")), WorkingView::Unresolved);
+    }
+
+    #[test]
+    fn user_order_reconnect_duplicate_ignores_transport_identity_but_not_state_conflict() {
+        let row = drive_to_accepted("c1", 100, "W1");
+        let inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        let evidence = UserOrderEvidence {
+            wire: vid("W1"), market: row.led.market.clone(), exchange_index: 2,
+            subaccount_number: 0, sid: 3, side: Side::BuyYes,
+            yes_price_e4: 4000, client_order_id: cid("c1"),
+            status: UserOrderStatus::Resting, filled: 0, remaining: 100,
+            initial: 100, updated_ts_ms: 1000,
+            connection_generation: 1, payload_digest: "first".into(),
+        };
+        let record = reg.prepare_user_order_received(&row.led, &vid("W1"),
+            evidence.clone()).unwrap().unwrap();
+        reg.fold(10_000, &record, &inv).unwrap();
+        let mut after_reconnect = evidence.clone();
+        after_reconnect.sid = 9;
+        after_reconnect.connection_generation = 2;
+        after_reconnect.payload_digest = "second".into();
+        assert_eq!(reg.prepare_user_order_received(&row.led, &vid("W1"),
+            after_reconnect.clone()).unwrap(), None);
+        after_reconnect.remaining = 99;
+        after_reconnect.initial = 99;
+        assert_eq!(reg.prepare_user_order_received(&row.led, &vid("W1"),
+            after_reconnect), Err(OrderStateProofError::StaleOrConflictingVersion));
     }
 
     #[test]
@@ -3479,4 +3869,3 @@ mod tests {
         assert_eq!(reg.get(&row.led, &vid("W1")).unwrap().generation, gen);
     }
 }
-
