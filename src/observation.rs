@@ -57,6 +57,10 @@ pub struct WireState {
     pub amend_lineage: Option<AmendLineage>,
     #[serde(default)]
     pub latest_user_order: Option<UserOrderEvidence>,
+    /// Journal position+1 of the latest admitted order-state frame. A frame
+    /// preceding a newer authority hold cannot discharge that hold.
+    #[serde(default)]
+    pub latest_user_order_revision: u64,
     #[serde(default)]
     pub proved_current_cid: Option<ClientOrderId>,
     #[serde(default)]
@@ -165,6 +169,7 @@ impl WireState {
             remaining_observation: None,
             amend_lineage: None,
             latest_user_order: None,
+            latest_user_order_revision: 0,
             proved_current_cid: None,
             observed_exchange_index: None,
             authority_hold: false,
@@ -655,6 +660,7 @@ impl WireRegistry {
             JournalRecord::UserOrderReceived { ledger, wire, evidence } => {
                 let ws = self.ensure(ledger, wire);
                 ws.latest_user_order = Some(evidence.clone());
+                ws.latest_user_order_revision = pos.saturating_add(1);
                 ws.observed_exchange_index = Some(evidence.exchange_index);
             }
             JournalRecord::OrderAuthorityHold { ledger, wire } => {
@@ -685,6 +691,30 @@ impl WireRegistry {
             return Ok(());
         }
         self.seen_order.insert(key, o.clone());
+        // This exact admitted WS terminal claim and the FillCid-backed order
+        // transition form one journaled fact. Clear only the older hold on the
+        // proved child; a terminal frame preceding H2 must not clear H2.
+        let terminal_hold_wire = if o.event == "UserOrderTerminalClaim"
+            && matches!(&o.state_after, OrderState::Canceled | OrderState::Filled | OrderState::Terminal)
+        {
+            o.ctx_after.venue_order_id.as_ref().and_then(|wire| {
+                self.wire(&o.ledger, wire).filter(|ws| {
+                    ws.authority_hold && ws.generation > 0 && ws.amend_lineage.is_none()
+                        && ws.latest_user_order_revision > ws.authority_hold_revision
+                        && ws.current().map(|m| &m.cid) == Some(&o.client_order_id)
+                        && ws.proved_current_cid.as_ref() == Some(&o.client_order_id)
+                        && ws.latest_user_order.as_ref().is_some_and(|e| {
+                            e.wire == *wire && e.market == o.ledger.market
+                                && e.client_order_id == o.client_order_id
+                                && ws.observed_exchange_index == Some(e.exchange_index)
+                                && matches!(e.status, UserOrderStatus::Canceled | UserOrderStatus::Executed)
+                                && e.filled == o.ctx_after.attributed_fill_qty
+                        })
+                }).map(|_| wire.clone())
+            })
+        } else {
+            None
+        };
         for rec in &o.core_records {
             match rec {
                 JournalRecord::VenueBoundCid {
@@ -700,6 +730,15 @@ impl WireRegistry {
                     self.bump_generation(&o.ledger, client_order_id);
                 }
                 _ => {}
+            }
+        }
+        if let Some(wire) = terminal_hold_wire {
+            if let Some(ws) = self.wires.get_mut(&(o.ledger.clone(), wire)) {
+                if !ws.members.is_empty()
+                    && ws.members.iter().all(|member| member.role == MemberRole::Terminal)
+                {
+                    ws.authority_hold = false;
+                }
             }
         }
         Ok(())
