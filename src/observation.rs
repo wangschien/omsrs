@@ -63,6 +63,10 @@ pub struct WireState {
     pub observed_exchange_index: Option<i64>,
     #[serde(default)]
     pub authority_hold: bool,
+    /// Journal position of the latest authority invalidation. A REST round
+    /// captured before another hold must not clear that newer obligation.
+    #[serde(default)]
+    pub authority_hold_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +168,7 @@ impl WireState {
             proved_current_cid: None,
             observed_exchange_index: None,
             authority_hold: false,
+            authority_hold_revision: 0,
         }
     }
 
@@ -653,7 +658,9 @@ impl WireRegistry {
                 ws.observed_exchange_index = Some(evidence.exchange_index);
             }
             JournalRecord::OrderAuthorityHold { ledger, wire } => {
-                self.ensure(ledger, wire).authority_hold = true;
+                let state = self.ensure(ledger, wire);
+                state.authority_hold = true;
+                state.authority_hold_revision = pos;
             }
             JournalRecord::OrderStateTxn(t) => {
                 self.wires.insert((t.ledger.clone(), t.wire.clone()), t.wire_after.clone());
@@ -1368,6 +1375,17 @@ impl ObservationRound {
                     m.role = MemberRole::Terminal;
                 }
             }
+        }
+        if ws.authority_hold
+            && matches!(row.status, BackfillOrderStatus::Canceled | BackfillOrderStatus::Filled)
+            && matches!(outcome, ObservationOutcome::Consistent { .. })
+            && !post_pending
+            && !wire_after.members.is_empty()
+            && wire_after.members.iter().all(|m| m.role == MemberRole::Terminal)
+        {
+            // An amended generation is never re-proved resting after a gap.
+            // Exhaustive terminal/fill reconciliation may discharge the hold.
+            wire_after.authority_hold = false;
         }
 
         let wire_changed = wire_after != ws;
