@@ -619,6 +619,12 @@ pub enum JournalRecord {
         client_order_id: Option<ClientOrderId>,
         reason: String,
     },
+    /// A channel gap or conflicting order version withdraws working authority
+    /// until an exhaustive, attributable REST observation is committed.
+    OrderAuthorityHold {
+        ledger: crate::execution::LedgerId,
+        wire: VenueOrderId,
+    },
     /// Durable pre-ACK frame, keyed by the prepared client id.  It remains
     /// non-authoritative until the submitted row/lineage is reconciled.
     UserOrderStaged {
@@ -4225,6 +4231,7 @@ pub fn rebuild_ctx_from_journal(
             | JournalRecord::AmendLineage { .. }
             | JournalRecord::UserOrderReceived { .. }
             | JournalRecord::UserOrderQuarantined { .. }
+            | JournalRecord::OrderAuthorityHold { .. }
             | JournalRecord::UserOrderStaged { .. }
             | JournalRecord::OrderStateTxn(_)
             | JournalRecord::RestOrderProofTxn(_) => {}

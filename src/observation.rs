@@ -61,6 +61,8 @@ pub struct WireState {
     pub proved_current_cid: Option<ClientOrderId>,
     #[serde(default)]
     pub observed_exchange_index: Option<i64>,
+    #[serde(default)]
+    pub authority_hold: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +163,7 @@ impl WireState {
             latest_user_order: None,
             proved_current_cid: None,
             observed_exchange_index: None,
+            authority_hold: false,
         }
     }
 
@@ -477,6 +480,9 @@ impl WireRegistry {
         inventory: &MarketInventory,
     ) -> Result<OrderStateTxnRecord, OrderStateProofError> {
         let ws = self.wire(ledger, wire).ok_or(OrderStateProofError::MissingWire)?;
+        if ws.authority_hold {
+            return Err(OrderStateProofError::InvalidTransition);
+        }
         let evidence = ws.latest_user_order.as_ref().ok_or(OrderStateProofError::MissingCurrent)?;
         if evidence.status != UserOrderStatus::Resting {
             return Err(OrderStateProofError::InvalidTransition);
@@ -580,6 +586,7 @@ impl WireRegistry {
         });
         wire_after.proved_current_cid = Some(client_order_id.clone());
         wire_after.amend_lineage = None;
+        wire_after.authority_hold = false;
         Ok(RestOrderProofTxnRecord {
             ledger: ledger.clone(), wire: wire.clone(), client_order_id: client_order_id.clone(),
             filled, remaining, initial,
@@ -644,6 +651,9 @@ impl WireRegistry {
                 let ws = self.ensure(ledger, wire);
                 ws.latest_user_order = Some(evidence.clone());
                 ws.observed_exchange_index = Some(evidence.exchange_index);
+            }
+            JournalRecord::OrderAuthorityHold { ledger, wire } => {
+                self.ensure(ledger, wire).authority_hold = true;
             }
             JournalRecord::OrderStateTxn(t) => {
                 self.wires.insert((t.ledger.clone(), t.wire.clone()), t.wire_after.clone());
@@ -820,6 +830,9 @@ impl WireRegistry {
         let Some(ws) = self.wire(ledger, wire) else {
             return WorkingView::Unresolved;
         };
+        if ws.authority_hold {
+            return WorkingView::Unresolved;
+        }
         match (&ws.remaining_observation, &ws.last) {
             (
                 Some(obs),
@@ -1334,6 +1347,7 @@ impl ObservationRound {
                 remaining_fresh: true
             }
         ) {
+            wire_after.authority_hold = false;
             wire_after.remaining_observation = Some(RemainingObservation {
                 remaining: row.remaining,
                 covered: h.clone(),
