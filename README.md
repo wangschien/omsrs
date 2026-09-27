@@ -12,59 +12,20 @@ paper simulation, virtual matching engines, order aggregation, persistence,
 and a deterministic event-driven lifecycle core. Applications supply their
 own venue adapter by implementing `Broker` or `AsyncBroker`.
 
-## Status
+## Release notes
 
-**v0.1.0** (2026-04-21): initial order, broker, paper simulation,
-virtual matching, persistence, compound-order, and strategy APIs.
+- v0.5.1 — typed close submission on the transaction path.
+- v0.5.0 — I/O-free execution transactions, market inventory, and venue observation.
+- v0.4.1 — documentation only; no functional change.
+- v0.4.0 — per-order lifecycle state machine, replayable journal, and binary-outcome inventory.
+- v0.3.3 — Rust 1.78 build compatibility.
+- v0.3.2 — typed asynchronous cancel outcomes and the cancel-versus-fill report.
+- v0.3.1 — duplicate-completion guard, non-blocking persistence, and monotonic fills.
+- v0.3.0 — asynchronous virtual and replica brokers, and asynchronous order lifecycle.
+- v0.2.0 — asynchronous broker trait and asynchronous paper broker.
+- v0.1.0 — initial order, broker, simulation, and persistence primitives.
 
-**v0.2.0** (2026-04-21): additive `AsyncBroker` trait and `AsyncPaper`
-reference implementation. Existing synchronous APIs remain unchanged.
-
-**v0.3.0** (2026-04-22): completes the asynchronous API with
-`AsyncVirtualBroker`, `AsyncReplicaBroker`, async order lifecycle methods,
-`AsyncCompoundOrder`, and `AsyncOrderStrategy`. Existing v0.2 APIs remain
-unchanged. The async additions use a consistent pattern:
-- Inherent methods return the rich sync shape (`BrokerReply`, `OrderHandle`) for callers that want it
-- `impl AsyncBroker` provides a lossy `Option<String>` adapter for trait-object use
-- Broker operations do not require a particular executor; the narrow `tokio`
-  dependency supports non-blocking persistence writes
-- Shared-identity invariants (`Arc::ptr_eq` across matching-engine collections) preserved
-- Order's async lifecycle methods are siblings, not replacements — sync `execute` / `modify` / `cancel` still compile and work
-
-**v0.3.1-v0.3.3** (2026-04-27 to 2026-06-12): hardens asynchronous
-cancellation, persistence, cumulative fill handling, and Rust 1.78 build
-compatibility.
-
-**v0.4.0** (2026-09-02): adds a deterministic per-order lifecycle state
-machine, typed client/venue/fill/attempt identities, replayable journal
-records, reconciliation and reservation-release effects, backward-compatible
-client-order-aware journal variants, and a binary-outcome inventory helper.
-It also hardens repeated cancellation, IOC misses, late fills, and terminal
-reconciliation. See [CHANGELOG.md](CHANGELOG.md) for details.
-
-**v0.4.1** (2026-09-02): documentation-only release with a generic crate
-description, complete v0.4 release notes, and application-neutral examples.
-There are no functional or public API changes from v0.4.0.
-
-**v0.5.1** (2026-09-12): adds typed `CloseSubmission` / definite-failure close on the OrderTxn path.
-
-**v0.5.0** (2026-09-08): adds I/O-free execution transactions and market
-inventory (first-admitted fill attribution, foreign-row refusal) and venue
-observation (wire membership, routing, coverage, working view, readiness).
-Existing v0.4 APIs remain. See [CHANGELOG.md](CHANGELOG.md) for details.
-
-| phase | items | surface |
-|---|---:|---|
-| R1 | 20 | `utils` + `BasicPosition` + parity harness (libtest-mimic) + 13-row smoke matrix |
-| R2 | 10 | `Quote` / `OrderBook` / `OrderLock` + `Clock` trait + `MockClock` |
-| R3 | 64 | `Order` (~40 fields, full lifecycle), `Broker` trait, `PersistenceHandle` trait + SQLite backend |
-| R4 | 10 | `Broker::close_all_positions` / `cancel_all_orders` / `get_positions_from_orders` + `Paper` broker |
-| R5 | 54 | Simulation models (`VOrder`, `VTrade`, `VPosition`, `VUser`, `Ticker`, `OHLC*`, `OrderFill`, 8 response types) + statistical target for `test_ticker_ltp_statistical` |
-| R6 | 22 | `VirtualBroker` (multi-user via `VUser`, seeded RNG, clock-driven `get(order_id, status)`) |
-| R7 | 10 | `ReplicaBroker` + `ReplicaFill` (shared ownership via `Arc<Mutex<VOrder>>`) |
-| R8 | 40 | `CompoundOrder` (indexes, keys, aggregate views, execute_all, check_flags, save) |
-| R9 | 7 | `OrderStrategy` + clock-cascade on `add` (§6 D4) |
-| R10 | — | parity sweep + stabilisation |
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Synchronous broker adapters
 
@@ -123,7 +84,7 @@ impl AsyncBroker for VenueBroker {
 }
 ```
 
-v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics) and a 10-item async parity harness at `tests/parity_async.rs` that mirrors the sync R4 base tests 1:1. If `AsyncPaper` passes an assertion, sync `Paper` passes the same assertion with the same inputs.
+v0.2 ships `AsyncPaper` (async sibling of `Paper`, same echo semantics).
 
 ### v0.3 async matching engines + order lifecycle
 
@@ -189,7 +150,7 @@ Order lifecycle siblings (`execute_async` / `modify_async` / `cancel_async`) let
 [dependencies]
 omsrs = "0.5"
 
-# persistence = ["dep:rusqlite"]  — off by default (§7 "MSRV-minimum build")
+# persistence = ["dep:rusqlite"]  — off by default
 # statistical-tests — test-only, gates tests/statistical
 ```
 
@@ -197,42 +158,8 @@ omsrs = "0.5"
 
 | Feature | Default | Enables |
 | --- | --- | --- |
-| `persistence` | off | SQLite-backed `PersistenceHandle` — pulls in `rusqlite` (bundled build). Off at MSRV-minimum build. |
-| `statistical-tests` | off | `tests/statistical/*` — Z-mean / Z-std bounds on Ticker RNG path. Test-only. |
-
-## Verification
-
-- `scripts/parity_gate.sh` — release-mode full sweep, exits 0 on 237-item manifest
-- `cargo test --test parity --all-features` — 237 / 236 pass / 1 excused, exit 0
-- `cargo test --test parity_async` — 10-item async parity (v0.2 AsyncPaper), all pass
-- `cargo test --test parity_runner_smoke` — 13-row exit-code smoke matrix
-- `cargo test --no-default-features` — 222-item effective manifest, all pass
-- `cargo test --test statistical --features statistical-tests --release` — Z-mean / Z-std bounds on Ticker RNG path
-- `cargo clippy --all-features --all-targets -- -D warnings` — clean
-- `cargo fmt --check` — clean
-
-## Scope
-
-**In MVP** (10 phases complete):
-- `Order` lifecycle (R3): ~40 fields, update / execute / modify / cancel / save / clone / add_lock
-- `Broker` trait (R3/R4): object-safe, `Paper` reference impl
-- `AsyncBroker` trait + `AsyncPaper` (v0.2 / R11): additive async surface for async venue SDKs
-- `PersistenceHandle` trait (R3): SQLite backend behind `persistence` feature
-- Simulation (R5-R7): `VirtualBroker`, `ReplicaBroker`, `Ticker`, fill engine
-- Aggregates (R8/R9): `CompoundOrder` / `OrderStrategy`
-
-**Out of MVP** (per PORT-PLAN §11 non-goals):
-- Venue-specific HTTP and WebSocket adapters
-- `omspy.algos` / `omspy.multi` / candle-tracker (`Candle`, `CandleStick`) — defer
-- `yaml` override loading — defer, test fixtures pre-apply renames
-- Network clients and credential management
-
-## Documentation
-
-- `docs/PORT-PLAN.md` — the v11 ACKed port plan (§1–§14)
-- `docs/omspy-source-notes.md` — symbol-level inventory of upstream
-- `docs/PORT-PLAN-R{1..10}-audit-result.md` — per-phase codex audit results
-- `docs/PORT-PLAN-v{2..11}-audit-result.md` — plan evolution history
+| `persistence` | off | SQLite-backed `PersistenceHandle` — pulls in `rusqlite` (bundled build). Off unless the feature is enabled. |
+| `statistical-tests` | off | `tests/statistical/*` — Z-mean / Z-std bounds on the ticker RNG path. Test-only. |
 
 ## License
 
@@ -241,4 +168,3 @@ MIT. Matches upstream omspy.
 ## Upstream reference
 
 - omspy (upstream): https://github.com/uberdeveloper/omspy
-- local path: `~/refs/omspy/`

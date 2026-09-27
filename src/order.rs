@@ -286,7 +286,7 @@ impl Order {
         // Upstream `Order.__init__` unconditionally sets
         // `self.pending_quantity = self.quantity` after validation
         // (`order.py:224`), ignoring any caller-provided value. Match that
-        // to close R3.b audit P2.1 — preserves the invariant that
+        // This preserves the invariant that
         // `Order(**row)` round-trips through a freshly-saved row and
         // ignores stored `pending_quantity` on partially-updated loads.
         let _unused_init_pending = init.pending_quantity;

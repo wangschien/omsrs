@@ -3556,16 +3556,9 @@ fn route_from_backfill_status(
 
     match status {
         BackfillOrderStatus::Canceled => {
-            // ★ 2026-08-15 审计 HIGH **撤销**（docs/OMSRS_AUDIT_2026_08_15.md §复核）：
-            //   勿在此加 filled/remaining 守恒门。真 REST 实测（o2a 探针 1000 单）：
-            //   Kalshi canceled 单 **987/1000 报 fill_count=0/remaining_count=0**（撤后
-            //   清零常态），恒等 filled+remaining==qty 0/1000 成立——任何 0/0 或恒等门
-            //   都会 false-halt 超时恢复 backfill 流（98.7% 命中，资金锁死）。journal
-            //   的 ReconcileObserved 是壳回显（本地合成），对场端语义零鉴别力。
-            //   「撤成空成交」的防线：fill 已投影 ⇒ note_fill_evidence 抬 obligation ⇒
-            //   invariant 2 兜；未投影且行在 ⇒ PostTerminalFill；行不在 ⇒ 壳 off-book。
-            //   REST 瞬时少计 + WS 同丢 = 本地不可见，无门可加。见正向钉
-            //   inv_canceled_zero_zero_rest_is_normal_release。
+            // Some venues report `filled=0, remaining=0` for cancelled orders.
+            // Do not add a fill-conservation gate here. A zero-fill cancel with
+            // complete authority is a normal terminal release.
             // Attempt terminal via choke point (reads ctx.authority_is_fresh()).
             let o = try_finalize_terminal(
                 ctx,
@@ -4295,7 +4288,7 @@ pub struct ReplayResult {
 
 #[cfg(test)]
 mod tests {
-    // ═══════ F9a Phase 1 三钉(kbot spec F9A v3 §4-1/2/3)═══════
+    // ═══════ Client-order identifier variants ═══════
 
     /// 钉1:emit 零残留——push/构造形扫描(fold 臂是 match pattern、旧形夹具是裸构造,
     /// 天然不撞;pattern 用拼接防自匹配)。变异=留一处旧 push ⇒ 红。
@@ -4344,8 +4337,8 @@ mod tests {
         let canceled = o.new_state().unwrap().clone();
         let mut new_ctx = OrderCtx::new(
             ClientOrderId("new-kin-cid".into()),
-            "KXBTC-M",
-            "hoff-mm",
+            "MKT",
+            "desk",
             Side::BuyYes,
             45,
             10,
@@ -4559,7 +4552,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let cid_ok = |c: &ClientOrderId| c.as_str() == "KXBTC-M|hoff-mm|1";
+        let cid_ok = |c: &ClientOrderId| c.as_str() == "MKT|desk|1";
         assert!(
             recs.iter().any(|j| matches!(j,
                 JournalRecord::VenueBoundCid { client_order_id, venue_order_id }
@@ -4618,9 +4611,9 @@ mod tests {
 
     fn ctx_default() -> OrderCtx {
         OrderCtx::new(
-            derive_client_order_id("KXBTC-M", "hoff-mm", 1),
-            "KXBTC-M",
-            "hoff-mm",
+            derive_client_order_id("MKT", "desk", 1),
+            "MKT",
+            "desk",
             Side::BuyYes,
             45,
             10,
@@ -4912,11 +4905,9 @@ mod tests {
         )
     }
 
-    /// ★ 正向钉（2026-08-15 审计 HIGH **撤销**后的护栏）：Kalshi canceled 单 REST
-    /// 实测（o2a 探针）**987/1000 报 filled=0/remaining=0**（撤后清零常态）——
-    /// `0/0 + authority_complete` 的零成交撤必须正常 `Canceled + Release`。
-    /// 任何人再加「零踪迹 halt」或「filled+remaining==qty 恒等」门 ⇒ 本钉红
-    /// （那会 false-halt 98.7% 的超时恢复 backfill 流 = 资金锁死）。
+    /// A cancelled order reported as `filled=0, remaining=0` with complete
+    /// authority must reach `Canceled` and release its reservation. Do not add
+    /// a zero-trace halt or a `filled + remaining == qty` gate here.
     #[test]
     fn inv_canceled_zero_zero_rest_is_normal_release() {
         // 路径 1：cancel → ReconcileResult{0/0, complete}（HTTP 撤后 REST 复核形态）。
@@ -4943,7 +4934,7 @@ mod tests {
         assert_eq!(
             o.new_state(),
             Some(&OrderState::Canceled),
-            "0/0 零成交撤是 Kalshi 常态，必须正常终态（加守恒门 = false-halt 恢复流）"
+            "a cancelled order reported as filled=0, remaining=0 must reach the cancelled terminal state"
         );
         assert!(
             o.effects().iter().any(|e| matches!(e, Effect::ReleaseReservation)),
@@ -7362,7 +7353,7 @@ mod tests {
                     snapshot_boundary: None,
                 }),
                 Effect::AppendFsync(JournalRecord::VenueBoundCid {
-                    client_order_id: ClientOrderId("KXBTC-M|hoff-mm|1".into()),
+                    client_order_id: ClientOrderId("MKT|desk|1".into()),
                     venue_order_id: vid("V-g"),
                 }),
                 Effect::AppendFsync(JournalRecord::ObligationRaised {
@@ -11045,9 +11036,9 @@ mod cancel_retry_idempotency_pins {
             reconcile_target: None,
         };
         let mut ctx = OrderCtx::new(
-            derive_client_order_id("KXBTC-M", "hoff-mm", 1),
-            "KXBTC-M",
-            "hoff-mm",
+            derive_client_order_id("MKT", "desk", 1),
+            "MKT",
+            "desk",
             Side::BuyYes,
             50,
             500,

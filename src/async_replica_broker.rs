@@ -26,7 +26,7 @@
 //! OrderFill semantics. Both take `&OrderHandle` and acquire the
 //! handle's own mutex internally.
 //!
-//! ### Lock-order discipline (R12.2 audit closeout — item 1/5)
+//! ### Lock-order discipline
 //!
 //! Each broker method acquires AT MOST ONE of {`inner`, per-handle
 //! `Mutex<VOrder>`} at a time. Every path that previously held
@@ -267,7 +267,7 @@ impl AsyncReplicaBroker {
     /// Async `order_cancel`. `order_id` via args kwarg (same
     /// convention as `modify`).
     ///
-    /// Lock discipline (R12.2 audit closeout): never hold
+    /// Lock discipline: never hold
     /// `inner` while taking the handle's lock. Resolve oid →
     /// handle under a brief `inner.lock()`, release, do the
     /// handle-mutation work, then re-acquire `inner` only to
@@ -312,7 +312,7 @@ impl AsyncReplicaBroker {
     /// OrderFill update, promotes done orders to `completed`,
     /// trims the `fills` list. Same bookkeeping as sync.
     ///
-    /// Lock discipline (R12.2 audit closeout): never hold
+    /// Lock discipline: never hold
     /// `inner` while taking a fill-order handle's lock.
     /// Restructured into phases:
     ///

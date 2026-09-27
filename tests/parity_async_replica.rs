@@ -463,8 +463,8 @@ async fn unknown_symbol_results_in_rejected_order() {
     assert_eq!(o.status(), Status::Rejected);
 }
 
-// ── R12.2.async_replica.12 — R12.2 audit closeout: lock-order
-// discipline. Exercises the exact ABBA path codex flagged — an
+// ── R12.2.async_replica.12 — lock-order discipline.
+// Exercises the ABBA path — an
 // external caller holds `handle.lock()` while a concurrent task
 // runs `cancel` / `run_fill` / accessors. The new lock discipline
 // (never hold inner while taking handle lock) means this must

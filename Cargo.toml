@@ -6,6 +6,13 @@ rust-version = "1.78"
 license = "MIT"
 description = "Broker-agnostic order management, lifecycle, and simulation primitives"
 repository = "https://github.com/wangschien/omsrs"
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
 
 [features]
 default = []

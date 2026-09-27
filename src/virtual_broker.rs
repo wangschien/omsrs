@@ -429,7 +429,7 @@ impl VOrder {
     /// same public fields + a new RNG-seeded helper. The response doesn't
     /// need to mutate the RNG, so a seed=0 fresh RNG is fine.
     ///
-    /// R12.1 audit closeout: `VOrder::from_init` hard-codes
+    /// `VOrder::from_init` hard-codes
     /// `delay = 1_000_000 μs` (see `simulation.rs:375`), so we copy the
     /// source's `delay` onto the clone afterwards. Without this the
     /// `AsyncVirtualBroker::orders()` snapshot silently resets delays

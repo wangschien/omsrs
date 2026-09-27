@@ -1,13 +1,12 @@
 //! Parity-gate arithmetic + `excused.toml` validation. Factored out so the
 //! smoke runner (`tests/parity_runner_smoke`) can drive the same logic with
-//! injected fixtures without duplicating the real parity harness (v11 audit
-//! non-blocking note).
+//! injected fixtures without duplicating the real parity harness.
 //!
-//! TOML parsing is **not** done here — the `toml` crate is a dev-dependency
-//! (PORT-PLAN §7), so the test harness does `toml::from_str` and then hands
-//! parsed rows to [`validate_excused`]. This keeps the library TOML-free.
+//! TOML parsing is **not** done here — the `toml` crate is a dev-dependency,
+//! so the test harness does `toml::from_str` and then hands parsed rows to
+//! [`validate_excused`]. This keeps the library TOML-free.
 //!
-//! Exit-code contract (PORT-PLAN §4.1.2 + §4.1.3):
+//! Exit-code contract:
 //!
 //! | code | meaning |
 //! |---:|---|

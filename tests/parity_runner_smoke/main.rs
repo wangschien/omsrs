@@ -108,7 +108,7 @@ fn row03_excused_failure_within_budget_yields_zero() {
 id = "t05"
 rationale = "probabilistic flake"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(&m, &manifest_set(), Some(src), &p, &f, R0_OFF);
     assert_eq!(gate, GateExit::Pass);
@@ -137,13 +137,13 @@ fn row05_duplicate_excused_yields_two() {
 id = "t05"
 rationale = "first"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 
 [[excused]]
 id = "t05"
 rationale = "dup"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(
         &m,
@@ -166,7 +166,7 @@ fn row06_unknown_excused_id_yields_three() {
 id = "t99"
 rationale = "not in manifest"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(
         &m,
@@ -189,7 +189,7 @@ fn row07_r0_gate_rejects_nonempty_excused_yields_four() {
 id = "t05"
 rationale = "any"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let mut p = all_pass();
     p.remove("t05");
@@ -209,42 +209,42 @@ fn row08_excused_over_cap_yields_five() {
 id = "t01"
 rationale = "1"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t02"
 rationale = "2"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t03"
 rationale = "3"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t04"
 rationale = "4"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t05"
 rationale = "5"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t06"
 rationale = "6"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t07"
 rationale = "7"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 [[excused]]
 id = "t08"
 rationale = "8"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(
         &m,
@@ -300,7 +300,7 @@ fn row11_missing_rationale_yields_six() {
 [[excused]]
 id = "t05"
 approved_at = "R_smoke"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(
         &m,
@@ -322,7 +322,7 @@ fn row12_missing_approved_at_yields_six() {
 [[excused]]
 id = "t05"
 rationale = "x"
-approved_by = "codex"
+approved_by = "reviewer"
 "#;
     let gate = drive(
         &m,

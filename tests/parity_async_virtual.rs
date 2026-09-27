@@ -538,7 +538,7 @@ async fn add_user_is_idempotent_on_duplicate() {
 // ─────────────────────────────────────────────────────────────
 // R12.1.async_virtual.15 — order_place attaches to matching user
 // (mirror of sync test_virtual_broker_order_place_users, strengthened
-// after R12.1 audit item 3 — previously only asserted reply.status)
+// previously only asserted reply.status)
 // ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -594,7 +594,7 @@ async fn order_place_attaches_to_userid_when_registered() {
 
 // ─────────────────────────────────────────────────────────────
 // R12.1.async_virtual.19 — delay kwarg preserved in orders()
-// snapshot (R12.1 audit item 2 closeout — regression guard for
+// snapshot (regression guard for
 // `cloned_clone_weak` now preserving `delay`).
 // ─────────────────────────────────────────────────────────────
 

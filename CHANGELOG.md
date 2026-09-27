@@ -145,10 +145,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `filled_quantity`, so a stale lower-numbered WS / poll
   redelivery rolled cumulative state backwards. Fix: clamp to
   `[self.filled_quantity, self.quantity]` and only write on
-  strict increase. NOTE: this is **stricter than upstream
-  omspy** — `refs/omspy/omspy/order.py:446-458` has no such
-  guard, but the unguarded behaviour is a real foot-gun for
-  any consumer ingesting concurrent fill streams.
+  strict increase. This is stricter than upstream omspy, which
+  assigns the incoming filled quantity without a floor. The
+  unguarded behaviour is a foot-gun for any consumer ingesting
+  concurrent fill streams.
 
 ### Changed
 
@@ -226,11 +226,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Semver
 
-Every 0.2.0 public signature is unchanged. The 237-item
-parity gate still passes. 0.3.0 is a milestone marker for a
-substantive additive block; 0.2.1 would also be semver-legal
-under pre-1.0 caret rules, but 0.3.0 flags the async
-completion as a visible milestone.
+Every 0.2.0 public signature is unchanged. 0.3.0 marks the
+async completion. 0.2.1 would also be semver-legal under
+pre-1.0 caret rules.
 
 ## [0.2.0] — 2026-04-21
 
@@ -243,8 +241,8 @@ completion as a visible milestone.
   macro on impl blocks.
 - `AsyncPaper` - reference `AsyncBroker` implementation
   mirroring sync `Paper`.
-- `tests/parity_async.rs` - 10-item async parity
-  harness mirroring sync R4 base tests.
+- `tests/parity_async.rs` — async parity tests for the paper
+  broker, mirroring the synchronous base tests.
 
 ### Dependency changes
 
@@ -253,8 +251,7 @@ completion as a visible milestone.
 
 ### Non-breaking
 
-- Every 0.1.0 public signature unchanged. 237-item parity
-  gate passes.
+- Every 0.1.0 public signature is unchanged.
 
 ## [0.1.0] — 2026-04-21
 
