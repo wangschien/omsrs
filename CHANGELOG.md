@@ -4,6 +4,30 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-27
+
+### Added
+
+- Amend lineage tracking in venue observation: `AmendLineage`, `AmendPhase`
+  and `prepare_amend_lineage`, with generation-bound amend observations.
+- User-order evidence intake: `UserOrderStatus`, `UserOrderEvidence` and
+  `prepare_user_order_received` (wire, membership, quantity and staleness checks).
+- Order-state proofs: `prepare_order_state_resting` / `apply_order_state_resting`,
+  `prepare_rest_order_proof` / `apply_rest_order_proof`, and `OrderStateProofError`.
+- Conservative per-order authority hold, persisted and versioned across
+  reconciliation rounds, with discharge on a fresh terminal claim or on a
+  full fill joining a terminal frame.
+
+### Changed (breaking)
+
+- `OrderEvent` and `JournalRecord` gain new variants for the records above.
+  Exhaustive `match` statements over these enums must add the new arms.
+
+### Documentation
+
+- The README keeps to the functional description and release notes.
+- Packaging ships only `src/`, `Cargo.toml`, `README.md`, `CHANGELOG.md` and `LICENSE`.
+
 ## [0.5.1] - 2026-09-12
 
 ### Added

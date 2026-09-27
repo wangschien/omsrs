@@ -1,5 +1,5 @@
 /target
 *.swp
 .DS_Store
-# codex runtime scratch — created by codex:codex-rescue agents.
+# local tool scratch directory
 .codex

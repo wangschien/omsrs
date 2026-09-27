@@ -14,6 +14,7 @@ own venue adapter by implementing `Broker` or `AsyncBroker`.
 
 ## Release notes
 
+- v0.6.0 — amend lineage, user-order evidence, and order-state proofs; documentation and packaging cleanup.
 - v0.5.1 — typed close submission on the transaction path.
 - v0.5.0 — I/O-free execution transactions, market inventory, and venue observation.
 - v0.4.1 — documentation only; no functional change.
@@ -94,7 +95,7 @@ dependency is limited to its asynchronous persistence helper:
 
 ```toml
 [dependencies]
-omsrs = "0.5"
+omsrs = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -148,7 +149,7 @@ Order lifecycle siblings (`execute_async` / `modify_async` / `cancel_async`) let
 
 ```toml
 [dependencies]
-omsrs = "0.5"
+omsrs = "0.6"
 
 # persistence = ["dep:rusqlite"]  — off by default
 # statistical-tests — test-only, gates tests/statistical
