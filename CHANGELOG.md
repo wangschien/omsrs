@@ -4,6 +4,17 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-09-30
+
+### Fixed
+
+- `prepare_order_state_resting` no longer rejects a resting re-proof of an
+  amended wire. After an amend proof clears the lineage the wire keeps a
+  non-zero generation, so every later resting proof (for example after a
+  partial fill) failed with `LineageMismatch` and the order stayed unresolved.
+  A non-zero generation is now accepted when the current client order id was
+  proved at that generation; any later own action clears that proof.
+
 ## [0.6.0] - 2026-09-27
 
 ### Added

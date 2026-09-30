@@ -511,8 +511,13 @@ impl WireRegistry {
             if evidence.initial != lineage.declared_remaining {
                 return Err(OrderStateProofError::QuantityMismatch);
             }
-        } else if ws.generation != 0 {
-            // Decrease and old own-action evidence must not regain Known.
+        } else if ws.generation != 0
+            && ws.proved_current_cid.as_ref() != Some(&evidence.client_order_id)
+        {
+            // Decrease and old own-action evidence must not regain Known. A wire
+            // whose current cid was proved at this generation (an amend proof
+            // clears the lineage but keeps the generation) may be re-proved after
+            // a fill; any later own action clears the proof and bumps again.
             return Err(OrderStateProofError::LineageMismatch);
         }
         let filled = ws.held.iter().try_fold(0_u64, |acc, id| {
@@ -1983,6 +1988,106 @@ mod tests {
         after_reconnect.initial = 99;
         assert_eq!(reg.prepare_user_order_received(&row.led, &vid("W1"),
             after_reconnect), Err(OrderStateProofError::StaleOrConflictingVersion));
+    }
+
+    // An amended wire (generation != 0, lineage cleared by its proof) must be
+    // re-provable after a partial fill; a later own action must not be.
+    fn amended_proved_wire(reg: &mut WireRegistry, row: &Row, cid_s: &str) {
+        let ws = reg.wires.get_mut(&(row.led.clone(), vid("W1"))).unwrap();
+        ws.generation = 1;
+        ws.amend_lineage = None;
+        ws.proved_current_cid = Some(cid(cid_s));
+        ws.remaining_observation = None;
+    }
+    fn resting_row(row: &Row, c: &str, filled: u64, remaining: u64) -> UserOrderEvidence {
+        UserOrderEvidence {
+            wire: vid("W1"), market: row.led.market.clone(), exchange_index: 5,
+            subaccount_number: 0, sid: 3, side: Side::BuyYes,
+            yes_price_e4: 4000, client_order_id: cid(c),
+            status: UserOrderStatus::Resting, filled, remaining,
+            initial: filled + remaining, updated_ts_ms: 2000,
+            connection_generation: 1, payload_digest: "p".into(),
+        }
+    }
+    fn admit_row(reg: &mut WireRegistry, row: &Row, inv: &MarketInventory, ev: UserOrderEvidence) {
+        let rec = reg.prepare_user_order_received(&row.led, &vid("W1"), ev).unwrap().unwrap();
+        reg.fold(50, &rec, inv).unwrap();
+    }
+
+    #[test]
+    fn amended_wire_resting_reprove_after_fill_is_known() {
+        let mut row = drive_to_accepted("c1", 1000, "W1");
+        let mut inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        amended_proved_wire(&mut reg, &row, "c1");
+        let n = row.logs.len();
+        ingest(&mut row, &mut inv, evd("F1", 600, Side::BuyYes));
+        fold_logs(&mut reg, &row.logs[n..], &inv);
+        assert_eq!(reg.get(&row.led, &vid("W1")).unwrap().generation, 1);
+        assert_eq!(reg.working_view(&row.led, &vid("W1")), WorkingView::Unresolved);
+        admit_row(&mut reg, &row, &inv, resting_row(&row, "c1", 600, 400));
+        let txn = reg.prepare_order_state_resting(&row.led, &vid("W1"), &inv).unwrap();
+        reg.apply_order_state_resting(&txn, &inv).unwrap();
+        assert_eq!(reg.working_view(&row.led, &vid("W1")), WorkingView::Known(400));
+        assert_eq!(reg.member_working_view(&row.led, &cid("c1")), WorkingView::Known(400));
+    }
+
+    #[test]
+    fn amended_wire_resting_reprove_rejected_after_second_own_action() {
+        let mut row = drive_to_accepted("c1", 1000, "W1");
+        let mut inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        amended_proved_wire(&mut reg, &row, "c1");
+        let n = row.logs.len();
+        ingest(&mut row, &mut inv, evd("F1", 600, Side::BuyYes));
+        fold_logs(&mut reg, &row.logs[n..], &inv);
+        admit_row(&mut reg, &row, &inv, resting_row(&row, "c1", 600, 400));
+        // second own action: bump_generation clears the proof
+        reg.bump_generation(&row.led, &cid("c1"));
+        assert_eq!(reg.prepare_order_state_resting(&row.led, &vid("W1"), &inv),
+            Err(OrderStateProofError::LineageMismatch));
+    }
+
+    #[test]
+    fn amended_wire_resting_reprove_stale_prefill_row_is_fill_mismatch() {
+        let mut row = drive_to_accepted("c1", 1000, "W1");
+        let mut inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        amended_proved_wire(&mut reg, &row, "c1");
+        let n = row.logs.len();
+        ingest(&mut row, &mut inv, evd("F1", 600, Side::BuyYes));
+        fold_logs(&mut reg, &row.logs[n..], &inv);
+        admit_row(&mut reg, &row, &inv, resting_row(&row, "c1", 0, 1000));
+        assert_eq!(reg.prepare_order_state_resting(&row.led, &vid("W1"), &inv),
+            Err(OrderStateProofError::FillMismatch));
+    }
+
+    #[test]
+    fn amended_wire_resting_reprove_rejects_unproved_cid_at_nonzero_generation() {
+        let row = drive_to_accepted("c1", 1000, "W1");
+        let inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        amended_proved_wire(&mut reg, &row, "c1");
+        reg.wires.get_mut(&(row.led.clone(), vid("W1"))).unwrap().proved_current_cid = None;
+        admit_row(&mut reg, &row, &inv, resting_row(&row, "c1", 0, 1000));
+        assert_eq!(reg.prepare_order_state_resting(&row.led, &vid("W1"), &inv),
+            Err(OrderStateProofError::LineageMismatch));
+    }
+
+    #[test]
+    fn generation_zero_resting_proof_is_unchanged() {
+        let row = drive_to_accepted("c1", 1000, "W1");
+        let inv = MarketInventory::new(row.led.clone());
+        let mut reg = WireRegistry::new();
+        fold_logs(&mut reg, &row.logs, &inv);
+        admit_row(&mut reg, &row, &inv, resting_row(&row, "c1", 0, 1000));
+        let txn = reg.prepare_order_state_resting(&row.led, &vid("W1"), &inv).unwrap();
+        reg.apply_order_state_resting(&txn, &inv).unwrap();
+        assert_eq!(reg.working_view(&row.led, &vid("W1")), WorkingView::Known(1000));
     }
 
     #[test]
