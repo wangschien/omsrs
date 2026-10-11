@@ -2041,6 +2041,7 @@ fn rebuild_event_with_fills(
                 .iter()
                 .zip(rec_fills)
                 .map(|(m, fills)| BackfillOrderRecord {
+                    other_members_filled: m.other_members_filled,
                     client_order_id: m.client_order_id.clone(),
                     venue_order_id: m.venue_order_id.clone(),
                     status: m.status,
@@ -2722,6 +2723,7 @@ mod tests {
                 OrderEvent::UnknownBackfillResult {
                     exhaustive: true,
                     matched: vec![BackfillOrderRecord {
+                        other_members_filled: 0,
                         client_order_id: cid("c1"),
                         venue_order_id: vid("W1"),
                         status: crate::lifecycle::BackfillOrderStatus::Partial,
@@ -4374,6 +4376,7 @@ mod tests {
         let ev = OrderEvent::UnknownBackfillResult {
             exhaustive: true,
             matched: vec![BackfillOrderRecord {
+                other_members_filled: 0,
                 client_order_id: cid("c1"),
                 venue_order_id: vid("W1"),
                 status: crate::lifecycle::BackfillOrderStatus::Filled,
@@ -4430,6 +4433,46 @@ mod tests {
             vec![fid("u1")],
             "exactly-once filtering must leave one FillCid"
         );
+    }
+
+    #[test]
+    fn member_offset_survives_execution_backfill_rebuild() {
+        let led = ledger("sub", "MKT");
+        let mut state = OrderState::New;
+        let mut ctx = base_ctx("MKT", Side::BuyYes, 100);
+        let mut cursor = OrderCursor { seq: 0 };
+        for event in [OrderEvent::PrepareSubmit,
+            OrderEvent::StartSubmit { attempt_id: AttemptId("member-attempt".into()) },
+            OrderEvent::SubmitTimeout] {
+            let txn = prepare_order_event(OrderRef {
+                ledger: &led, cursor, state: &state, ctx: &ctx,
+            }, &event).unwrap();
+            txn.apply(OrderTarget {
+                ledger: &led, state: &mut state, ctx: &mut ctx, cursor: &mut cursor,
+            }).unwrap();
+        }
+        let record = BackfillOrderRecord {
+            client_order_id: ctx.client_order_id.clone(), venue_order_id: vid("W1"),
+            status: crate::lifecycle::BackfillOrderStatus::Partial,
+            filled_qty: 50, remaining_qty: 50, other_members_filled: 30,
+            fills: vec![FillRecord {
+                fill_id: fid("member-fill"), qty: 20, price_cents: 50, ts_ns: 1,
+                venue_order_id: Some(vid("W1")), fee_cents: None,
+            }],
+        };
+        let event = OrderEvent::UnknownBackfillResult { exhaustive: true, matched: vec![record] };
+        let own_fill = evidence("MKT", "member-fill", Side::BuyYes, 20, 50, None);
+        let mut inv = MarketInventory::new(led.clone());
+        let txn = apply_exec(&led, &mut state, &mut ctx, &mut cursor, &mut inv, &event, &[own_fill]);
+        assert!(matches!(state, OrderState::Partial { filled_qty: 20, remaining_qty: 50, .. }), "{state:?}");
+        assert_eq!(ctx.fill_obligation, 20);
+        assert_eq!(ctx.attributed_fill_qty, 20);
+        assert_eq!(ctx.last_venue_remaining_qty, Some(50));
+        let Some(JournalRecord::ExecutionTxn(txn)) = txn.journal else { panic!("missing execution journal") };
+        let order = txn.order.unwrap();
+        assert!(order.core_records.iter().any(|record| matches!(record,
+            JournalRecord::ReconcileObserved { venue_filled_qty: 50, venue_remaining_qty: 50,
+                other_members_filled: 30, .. })));
     }
 
     #[test]

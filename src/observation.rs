@@ -384,6 +384,31 @@ impl WireRegistry {
         self.wire(ledger, wire)
     }
 
+    /// The unique wire for a registered member or an unbound amend lineage client.
+    pub fn wire_for_client(&self, ledger: &LedgerId, cid: &ClientOrderId) -> Option<&VenueOrderId> {
+        let mut matches = self.wires.iter().filter_map(|((candidate_ledger, wire), state)| {
+            Self::matches_client(ledger, cid, candidate_ledger, state).then_some(wire)
+        });
+        let wire = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(wire)
+    }
+
+    /// Whether any wire on this ledger contains this member or lineage client.
+    pub fn has_client(&self, ledger: &LedgerId, cid: &ClientOrderId) -> bool {
+        self.wires.iter().any(|((candidate_ledger, _), state)| {
+            Self::matches_client(ledger, cid, candidate_ledger, state)
+        })
+    }
+
+    fn matches_client(ledger: &LedgerId, cid: &ClientOrderId, candidate_ledger: &LedgerId, state: &WireState) -> bool {
+        candidate_ledger == ledger && (state.members.iter().any(|member| member.cid == *cid)
+            || state.amend_lineage.as_ref()
+                .is_some_and(|lineage| lineage.old_cid == *cid || lineage.new_cid == *cid))
+    }
+
     /// A lineage record is a prepared journal effect, not a mutation. The
     /// caller must append and commit it before fold and before venue dispatch.
     pub fn prepare_amend_lineage(
@@ -1653,6 +1678,40 @@ mod tests {
     }
     fn cid(s: &str) -> ClientOrderId {
         ClientOrderId(s.into())
+    }
+
+    #[test]
+    fn member_offset_wire_lookup_requires_unique_ledger_match() {
+        let ledger = led();
+        let inventory = MarketInventory::new(ledger.clone());
+        let mut registry = WireRegistry::new();
+        let child = cid("unbound-child");
+        for (index, (parent, wire)) in [("parent-one", "wire-one"), ("parent-two", "wire-two")]
+            .into_iter().enumerate() {
+            let row = drive_to_accepted(parent, 100, wire);
+            fold_logs(&mut registry, &row.logs, &inventory);
+            let wire = vid(wire);
+            let record = registry.prepare_amend_lineage(&ledger, &wire, AmendLineage {
+                old_cid: cid(parent), new_cid: child.clone(),
+                pre_generation: registry.marker(&ledger, &wire).0,
+                phase: AmendPhase::HttpPending, declared_remaining: 100, applied_at_utc_ns: None,
+            }).unwrap();
+            registry.fold(row.logs.len() as u64, &record, &inventory).unwrap();
+            assert!(!registry.get(&ledger, &wire).unwrap().members.iter().any(|member| member.cid == child));
+            if index == 0 {
+                assert_eq!(registry.wire_for_client(&ledger, &child), Some(&wire));
+                assert!(registry.has_client(&ledger, &child));
+                assert_eq!(registry.wire_for_client(&ledger, &cid(parent)), Some(&wire));
+                assert!(registry.has_client(&ledger, &cid(parent)));
+                assert_eq!(registry.wire_for_client(&ledger, &cid("unknown-client")), None);
+                assert!(!registry.has_client(&ledger, &cid("unknown-client")));
+                let other_ledger = LedgerId { market: "other-market".into(), ..ledger.clone() };
+                assert_eq!(registry.wire_for_client(&other_ledger, &child), None);
+                assert!(!registry.has_client(&other_ledger, &child));
+            }
+        }
+        assert_eq!(registry.wire_for_client(&ledger, &child), None);
+        assert!(registry.has_client(&ledger, &child));
     }
     fn fid(s: &str) -> FillId {
         FillId(s.into())

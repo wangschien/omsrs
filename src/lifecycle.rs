@@ -369,9 +369,19 @@ pub struct BackfillOrderRecord {
     pub client_order_id: ClientOrderId,
     pub venue_order_id: VenueOrderId,
     pub status: BackfillOrderStatus,
+    /// Raw cumulative venue fills, including all members of the wire.
     pub filled_qty: u64,
+    /// Raw venue resting quantity.
     pub remaining_qty: u64,
+    /// Fills already attributed to other members of this venue order.
+    /// Filled and remaining quantities above retain the venue's wire frame.
+    #[serde(default, skip_serializing_if = "quantity_is_zero")]
+    pub other_members_filled: u64,
     pub fills: Vec<FillRecord>,
+}
+
+fn quantity_is_zero(qty: &u64) -> bool {
+    *qty == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -577,6 +587,9 @@ pub enum JournalRecord {
         venue_order_id: VenueOrderId,
         venue_filled_qty: u64,
         venue_remaining_qty: u64,
+        /// Accounting offset for member fills; venue quantities stay raw.
+        #[serde(default, skip_serializing_if = "quantity_is_zero")]
+        other_members_filled: u64,
         shell_authority_complete: bool,
         authority_epoch: u64,
     },
@@ -1394,6 +1407,7 @@ pub fn apply_event(
                 *status,
                 *filled_qty,
                 *remaining_qty,
+                0,
                 fills,
                 *authority_complete,
                 /* from_submit_unknown */ false,
@@ -1467,6 +1481,7 @@ pub fn apply_event(
                 *status,
                 *filled_qty,
                 *remaining_qty,
+                0,
                 fills,
                 *authority_complete,
                 false,
@@ -3399,6 +3414,12 @@ fn apply_unknown_backfill(
                 return accept(OrderState::SubmitUnknown, effects);
             }
 
+            let (member_filled, _) = match backfill_member_quantities(
+                ctx, rec.filled_qty, rec.other_members_filled,
+            ) {
+                Ok(quantities) => quantities,
+                Err(reason) => return halt_with_reason(reason, vec![]),
+            };
             // Exhaustive + unique: bind venue, account fills, route.
             let mut effects = Vec::new();
             match bind_venue_id(ctx, &rec.venue_order_id) {
@@ -3412,12 +3433,13 @@ fn apply_unknown_backfill(
                 venue_order_id: rec.venue_order_id.clone(),
                 venue_filled_qty: rec.filled_qty,
                 venue_remaining_qty: rec.remaining_qty,
+                other_members_filled: rec.other_members_filled,
                 // Latch is applied via AuthorityLatched after fills; remaining is durable now.
                 shell_authority_complete: false,
                 authority_epoch: ctx.authority_epoch,
             }));
             // R2: venue_filled raises obligation (before authority latch so lag clears it).
-            match note_fill_evidence(ctx, rec.filled_qty) {
+            match note_fill_evidence(ctx, member_filled) {
                 Ok(jr) => push_journal(&mut effects, jr),
                 Err(reason) => return halt_with_reason(reason, effects),
             }
@@ -3456,6 +3478,7 @@ fn apply_unknown_backfill(
                 rec.status,
                 rec.filled_qty,
                 rec.remaining_qty,
+                rec.other_members_filled,
                 &[],
                 exhaustive, // shell exhaustive flag for SubmitUnknown routing
                 /* from_submit_unknown */ true,
@@ -3465,6 +3488,25 @@ fn apply_unknown_backfill(
             )
             .prepend_effects(effects)
         }
+    }
+}
+
+/// Translate a raw venue snapshot into this member's accounting frame.
+fn backfill_member_quantities(
+    ctx: &OrderCtx,
+    venue_filled_qty: u64,
+    other_members_filled: u64,
+) -> Result<(u64, u64), HaltReason> {
+    let member_filled = venue_filled_qty.checked_sub(other_members_filled);
+    let member_capacity = ctx.qty.checked_sub(other_members_filled);
+    match (member_filled, member_capacity) {
+        (Some(filled), Some(capacity)) => Ok((filled, capacity)),
+        _ => Err(HaltReason::CrossCheckMismatch {
+            detail: format!(
+                "other_members_filled={other_members_filled} exceeds venue_filled={venue_filled_qty} or order_qty={}",
+                ctx.qty,
+            ),
+        }),
     }
 }
 
@@ -3479,6 +3521,7 @@ fn route_from_backfill_status(
     status: BackfillOrderStatus,
     venue_filled_qty: u64,
     venue_remaining_qty: u64,
+    other_members_filled: u64,
     extra_fills: &[FillRecord],
     shell_authority_complete: bool,
     from_submit_unknown: bool,
@@ -3486,6 +3529,12 @@ fn route_from_backfill_status(
     _response_avg: Option<u64>,
     _response_fee: Option<u64>,
 ) -> TransitionOutcome {
+    let (member_filled, member_capacity) = match backfill_member_quantities(
+        ctx, venue_filled_qty, other_members_filled,
+    ) {
+        Ok(quantities) => quantities,
+        Err(reason) => return halt_with_reason(reason, vec![]),
+    };
     let mut effects = Vec::new();
     match bind_venue_id(ctx, &venue_order_id) {
         Ok(jr) => push_journal(&mut effects, jr),
@@ -3500,11 +3549,12 @@ fn route_from_backfill_status(
         venue_order_id: venue_order_id.clone(),
         venue_filled_qty,
         venue_remaining_qty,
+        other_members_filled,
         shell_authority_complete: false,
         authority_epoch: ctx.authority_epoch,
     }));
     // R2: venue filled raises obligation first (G1 may clear stale latch).
-    match note_fill_evidence(ctx, venue_filled_qty) {
+    match note_fill_evidence(ctx, member_filled) {
         Ok(jr) => push_journal(&mut effects, jr),
         Err(reason) => return halt_with_reason(reason, effects),
     }
@@ -3536,19 +3586,23 @@ fn route_from_backfill_status(
             venue_order_id: venue_order_id.clone(),
             venue_filled_qty,
             venue_remaining_qty,
+            other_members_filled,
             shell_authority_complete,
             authority_epoch: ctx.authority_epoch,
         }));
     }
 
     // Over-attribution vs venue (local has more than venue reports) → halt.
-    if ctx.attributed_fill_qty > venue_filled_qty {
+    if ctx.attributed_fill_qty > member_filled {
         return halt_with_reason(
             HaltReason::CrossCheckMismatch {
-                detail: format!(
-                    "attributed_fill_qty={} > venue_filled_qty={venue_filled_qty}",
-                    ctx.attributed_fill_qty
-                ),
+                detail: if other_members_filled == 0 {
+                    format!("attributed_fill_qty={} > venue_filled_qty={venue_filled_qty}",
+                        ctx.attributed_fill_qty)
+                } else {
+                    format!("attributed_fill_qty={} > member_filled_qty={member_filled}",
+                        ctx.attributed_fill_qty)
+                },
             },
             effects,
         );
@@ -3625,7 +3679,7 @@ fn route_from_backfill_status(
             // before committing a single match to Accepted/Partial.
             if from_submit_unknown && !shell_authority_complete {
                 let mut effects = effects;
-                if ctx.attributed_fill_qty < venue_filled_qty {
+                if ctx.attributed_fill_qty < member_filled {
                     effects.push(Effect::BackfillFills {
                         venue_order_id: venue_order_id.clone(),
                     });
@@ -3635,19 +3689,19 @@ fn route_from_backfill_status(
                 });
                 return accept(OrderState::SubmitUnknown, effects);
             }
-            let fills_fully_attributed = ctx.attributed_fill_qty == venue_filled_qty;
+            let fills_fully_attributed = ctx.attributed_fill_qty == member_filled;
             if !fills_fully_attributed {
                 return continue_reconcile_pending(
                     ctx,
                     venue_order_id,
-                    venue_filled_qty,
+                    member_filled,
                     effects,
                     from_submit_unknown,
                     shell_authority_complete,
                     None,
                 );
             }
-            let Some(remaining) = ctx.remaining_qty_checked() else {
+            let Some(remaining) = member_capacity.checked_sub(ctx.attributed_fill_qty) else {
                 return halt_with_reason(
                     HaltReason::OverFill {
                         attributed_fill_qty: ctx.attributed_fill_qty,
@@ -4167,6 +4221,7 @@ pub fn rebuild_ctx_from_journal(
                 venue_order_id,
                 venue_filled_qty,
                 venue_remaining_qty,
+                other_members_filled,
                 shell_authority_complete,
                 authority_epoch,
             } => {
@@ -4174,13 +4229,16 @@ pub fn rebuild_ctx_from_journal(
                 // A2: remaining is always durable (noted in memory before Halt-prone raise).
                 ctx.note_venue_remaining(*venue_remaining_qty);
                 ctx.authority_epoch = (*authority_epoch).max(ctx.authority_epoch);
-                // Venue filled > order qty: live path Halts without raising obligation —
+                // Member fills > order qty: live path Halts without raising obligation —
                 // still restore remaining/epoch so fold ≡ memory on obligation-exceed Halt.
-                if *venue_filled_qty > ctx.qty {
+                let (member_filled, _) = backfill_member_quantities(
+                    &ctx, *venue_filled_qty, *other_members_filled,
+                )?;
+                if member_filled > ctx.qty {
                     // leave fill_obligation unchanged (mirrors note_fill_evidence Err)
                 } else {
                     // M2: restore obligation without re-bump; epoch from explicit field.
-                    restore_fill_obligation(&mut ctx, *venue_filled_qty)?;
+                    restore_fill_obligation(&mut ctx, member_filled)?;
                     if *shell_authority_complete {
                         ctx.latch_authority_complete();
                     } else if ctx.attributed_fill_qty < ctx.fill_obligation {
@@ -4620,6 +4678,118 @@ mod tests {
         )
     }
 
+    fn member_offset_backfill(raw_filled: u64, remaining: u64, offset: u64) -> BackfillOrderRecord {
+        BackfillOrderRecord {
+            client_order_id: ctx_default().client_order_id,
+            venue_order_id: vid("member-wire"),
+            status: BackfillOrderStatus::Partial,
+            filled_qty: raw_filled,
+            remaining_qty: remaining,
+            other_members_filled: offset,
+            fills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn member_offset_backfill_preserves_raw_remaining_on_fold() {
+        let mut base = ctx_default();
+        base.qty = 100;
+        let mut ctx = base.clone();
+        let out = apply_event(&OrderState::SubmitUnknown, &mut ctx,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: vec![member_offset_backfill(30, 70, 30)],
+            });
+        assert!(matches!(out.new_state(), Some(OrderState::Accepted { .. })), "{out:?}");
+        assert_eq!(ctx.fill_obligation, 0);
+        assert_eq!(ctx.last_venue_remaining_qty, Some(70));
+        let journals: Vec<_> = out.effects().iter().filter_map(|effect| match effect {
+            Effect::AppendFsync(record) => Some(record.clone()),
+            _ => None,
+        }).collect();
+        assert!(journals.iter().any(|record| matches!(record,
+            JournalRecord::ReconcileObserved { venue_filled_qty: 30,
+                venue_remaining_qty: 70, other_members_filled: 30, .. })));
+        let encoded = serde_json::to_vec(&journals).unwrap();
+        let decoded = serde_json::from_slice::<Vec<JournalRecord>>(&encoded).unwrap();
+        let rebuilt = rebuild_ctx_from_journal(base, &decoded).unwrap();
+        assert_eq!(rebuilt.fill_obligation, 0);
+        assert_eq!(rebuilt.last_venue_remaining_qty, Some(70));
+    }
+
+    #[test]
+    fn member_offset_backfill_accounts_own_fills() {
+        let mut ctx = ctx_default();
+        ctx.qty = 100;
+        let mut record = member_offset_backfill(50, 50, 30);
+        record.fills.push(fill_rec_v("member-fill", 20, 45, 1, "member-wire"));
+        let out = apply_event(&OrderState::SubmitUnknown, &mut ctx,
+            &OrderEvent::UnknownBackfillResult { exhaustive: true, matched: vec![record] });
+        assert!(matches!(out.new_state(), Some(OrderState::Partial {
+            filled_qty: 20, remaining_qty: 50, .. })), "{out:?}");
+        assert_eq!(ctx.fill_obligation, 20);
+        assert_eq!(ctx.attributed_fill_qty, 20);
+        assert_eq!(ctx.last_venue_remaining_qty, Some(50));
+    }
+
+    #[test]
+    fn member_offset_zero_preserves_legacy_input_and_journal() {
+        let record = member_offset_backfill(0, 10, 0);
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert!(encoded.get("other_members_filled").is_none());
+        let legacy: BackfillOrderRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(legacy.other_members_filled, 0);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), encoded);
+        let mut explicit_ctx = ctx_default();
+        let mut legacy_ctx = explicit_ctx.clone();
+        let explicit = apply_event(&OrderState::SubmitUnknown, &mut explicit_ctx,
+            &OrderEvent::UnknownBackfillResult { exhaustive: true, matched: vec![record] });
+        let legacy = apply_event(&OrderState::SubmitUnknown, &mut legacy_ctx,
+            &OrderEvent::UnknownBackfillResult { exhaustive: true, matched: vec![legacy] });
+        assert_eq!(explicit, legacy);
+        assert_eq!(explicit_ctx, legacy_ctx);
+    }
+
+    #[test]
+    fn member_offset_legacy_reconcile_record_defaults_to_zero() {
+        let legacy_json = serde_json::json!({ "ReconcileObserved": {
+            "venue_order_id": "member-wire", "venue_filled_qty": 4,
+            "venue_remaining_qty": 6, "shell_authority_complete": true,
+            "authority_epoch": 1,
+        }});
+        let record: JournalRecord = serde_json::from_value(legacy_json.clone()).unwrap();
+        assert!(matches!(record, JournalRecord::ReconcileObserved { other_members_filled: 0, .. }));
+        assert_eq!(serde_json::to_value(&record).unwrap(), legacy_json);
+        let rebuilt = rebuild_ctx_from_journal(ctx_default(), &[record]).unwrap();
+        assert_eq!(rebuilt.fill_obligation, 4);
+        assert_eq!(rebuilt.last_venue_remaining_qty, Some(6));
+    }
+
+    #[test]
+    fn member_offset_underflow_halts_without_accounting() {
+        for (qty, raw_filled, offset) in [(100, 20, 30), (10, 20, 15)] {
+            let mut ctx = ctx_default();
+            ctx.qty = qty;
+            let out = apply_event(&OrderState::SubmitUnknown, &mut ctx,
+                &OrderEvent::UnknownBackfillResult {
+                    exhaustive: true,
+                    matched: vec![member_offset_backfill(raw_filled, 0, offset)],
+                });
+            assert!(matches!(out, TransitionOutcome::Halt {
+                reason: HaltReason::CrossCheckMismatch { .. }, .. }), "{out:?}");
+            assert_eq!(ctx.fill_obligation, 0);
+            assert_eq!(ctx.last_venue_remaining_qty, None);
+            assert_eq!(ctx.venue_order_id, None);
+            let record = JournalRecord::ReconcileObserved {
+                venue_order_id: vid("member-wire"), venue_filled_qty: raw_filled,
+                venue_remaining_qty: 0, other_members_filled: offset,
+                shell_authority_complete: false, authority_epoch: 0,
+            };
+            assert!(matches!(rebuild_ctx_from_journal(ctx, &[record]),
+                Err(HaltReason::CrossCheckMismatch { .. })));
+        }
+    }
+
     /// B2: fold `records` from a fresh identity-matched base and assert field-by-field
     /// equivalence with in-memory `mem` for durable fill/obligation/authority/venue state.
     /// Used by A1/M1 (and B3) so Halt paths prove rebuild ≡ live ctx, not a partial subset.
@@ -4956,6 +5126,7 @@ mod tests {
                     status: BackfillOrderStatus::Canceled,
                     filled_qty: 0,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -5875,6 +6046,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("F-bf", 10, 45, 9, "V-found")],
                 }],
             },
@@ -6019,6 +6191,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![], // no fill pages yet
                 }],
             },
@@ -6061,6 +6234,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("only-partial", 4, 45, 1, "V-miss")],
                 }],
             },
@@ -6402,6 +6576,7 @@ mod tests {
                         status: BackfillOrderStatus::Open,
                         filled_qty: 0,
                         remaining_qty: 10,
+                        other_members_filled: 0,
                         fills: vec![],
                     },
                     BackfillOrderRecord {
@@ -6410,6 +6585,7 @@ mod tests {
                         status: BackfillOrderStatus::Open,
                         filled_qty: 0,
                         remaining_qty: 10,
+                        other_members_filled: 0,
                         fills: vec![],
                     },
                 ],
@@ -6449,6 +6625,7 @@ mod tests {
                     status: BackfillOrderStatus::Partial,
                     filled_qty: 3,
                     remaining_qty: 7,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("F-sib", 3, 45, 1, "V-SIBLING")],
                 }],
             },
@@ -6944,6 +7121,7 @@ mod tests {
                     status: BackfillOrderStatus::Canceled,
                     filled_qty: 4,
                     remaining_qty: 6,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("F1", 2, 45, 1, "V-e5")],
                 }],
             },
@@ -7097,6 +7275,7 @@ mod tests {
                     status: BackfillOrderStatus::Open,
                     filled_qty: 0,
                     remaining_qty: 10,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -7127,6 +7306,7 @@ mod tests {
                         status: BackfillOrderStatus::Open,
                         filled_qty: 0,
                         remaining_qty: 10,
+                        other_members_filled: 0,
                         fills: vec![],
                     },
                     BackfillOrderRecord {
@@ -7135,6 +7315,7 @@ mod tests {
                         status: BackfillOrderStatus::Open,
                         filled_qty: 0,
                         remaining_qty: 10,
+                        other_members_filled: 0,
                         fills: vec![],
                     },
                 ],
@@ -7174,6 +7355,7 @@ mod tests {
                     status: BackfillOrderStatus::Open,
                     filled_qty: 0,
                     remaining_qty: 10,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -7295,6 +7477,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("Fall", 10, 45, 1, "V-iso")],
                 }],
             },
@@ -7544,6 +7727,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("Fall", 10, 45, 1, "V-a")],
                 }],
             },
@@ -7564,6 +7748,7 @@ mod tests {
                         status: BackfillOrderStatus::Filled,
                         filled_qty: 10,
                         remaining_qty: 0,
+                        other_members_filled: 0,
                         fills: vec![fill_rec_v("Fall", 10, 45, 1, "V-a")],
                     },
                     BackfillOrderRecord {
@@ -7572,6 +7757,7 @@ mod tests {
                         status: BackfillOrderStatus::Open,
                         filled_qty: 0,
                         remaining_qty: 10,
+                        other_members_filled: 0,
                         fills: vec![],
                     },
                 ],
@@ -8179,6 +8365,7 @@ mod tests {
                     status: BackfillOrderStatus::Open,
                     filled_qty: 0,
                     remaining_qty: 10,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -8216,6 +8403,7 @@ mod tests {
                     status: BackfillOrderStatus::Canceled,
                     filled_qty: 4,
                     remaining_qty: 6,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("F1", 2, 45, 1, "V-e5b")],
                 }],
             },
@@ -8559,6 +8747,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 1, // contradict Filled
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("Fall", 10, 45, 1, "V-f3")],
                 }],
             },
@@ -8591,6 +8780,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 12, // > qty=10
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -8962,6 +9152,7 @@ mod tests {
                     status: BackfillOrderStatus::Open,
                     filled_qty: 0,
                     remaining_qty: 10,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -9202,6 +9393,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 10,
                     remaining_qty: 1,
+                    other_members_filled: 0,
                     fills: vec![fill_rec_v("Fg3", 10, 45, 1, "V-g3")],
                 }],
             },
@@ -9268,6 +9460,7 @@ mod tests {
                     status: BackfillOrderStatus::Canceled,
                     filled_qty: 0,
                     remaining_qty: 10,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
@@ -9910,6 +10103,7 @@ mod tests {
                     status: BackfillOrderStatus::Open,
                     filled_qty: 4,
                     remaining_qty: 6,
+                    other_members_filled: 0,
                     fills: vec![FillRecord {
                         fill_id: fid("F-nov"),
                         qty: 4,
@@ -9993,6 +10187,7 @@ mod tests {
                     status: BackfillOrderStatus::Filled,
                     filled_qty: 12, // > qty=10
                     remaining_qty: 0,
+                    other_members_filled: 0,
                     fills: vec![],
                 }],
             },
