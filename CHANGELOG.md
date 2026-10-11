@@ -4,6 +4,19 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed (breaking)
+
+- `BackfillOrderRecord` and `JournalRecord::ReconcileObserved` carry
+  `other_members_filled`: raw venue quantities are kept, and obligation /
+  attribution use this member's share. Breaking for struct literals;
+  serialised journals without the field read as 0.
+
+### Added
+
+- `WireRegistry::wire_for_client` and `has_client`.
+
 ## [0.6.1] - 2026-09-30
 
 ### Fixed
