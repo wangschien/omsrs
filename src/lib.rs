@@ -43,3 +43,6 @@ pub use utils::{
 
 // Deterministic lifecycle core. Use `omsrs::lifecycle::*`; its names are
 // intentionally not aliased over the broker API.
+
+/// Versioned neutral order-host persistence contracts.
+pub mod host_v1;
