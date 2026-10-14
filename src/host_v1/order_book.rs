@@ -107,6 +107,145 @@ impl OrderBook {
         }
     }
 
+    fn visit_replay_identity(
+        record: &JournalRecord,
+        visit: &mut impl FnMut(&LedgerId, Option<&ClientOrderId>),
+    ) {
+        match record {
+            JournalRecord::OrderTxn(order) => visit(&order.ledger, Some(&order.client_order_id)),
+            JournalRecord::ExecutionTxn(execution) => visit(
+                &execution.ledger,
+                execution.order.as_ref().map(|order| &order.client_order_id),
+            ),
+            JournalRecord::ObservationTxn(observation) => {
+                visit(&observation.ledger, None);
+                for member in &observation.members_after {
+                    visit(&observation.ledger, Some(&member.client_order_id));
+                }
+            }
+            JournalRecord::SubmitPrepared { .. }
+            | JournalRecord::SubmitStarted { .. }
+            | JournalRecord::SubmitResponse { .. }
+            | JournalRecord::SubmitUnknown
+            | JournalRecord::SubmitUnknownCid { .. }
+            | JournalRecord::Fill { .. }
+            | JournalRecord::FillCid { .. }
+            | JournalRecord::FeeCorrection { .. }
+            | JournalRecord::CancelRequested
+            | JournalRecord::CancelOutcome(_)
+            | JournalRecord::CancelRequestedCid { .. }
+            | JournalRecord::CancelOutcomeCid { .. }
+            | JournalRecord::VenueBoundCid { .. }
+            | JournalRecord::ImmediateFillUnattributed { .. }
+            | JournalRecord::ImmediateFillUnresolved
+            | JournalRecord::ImmediateFillUnresolvedCid { .. }
+            | JournalRecord::UnknownNoMatch
+            | JournalRecord::UnknownNoMatchCid { .. }
+            | JournalRecord::Halted { .. }
+            | JournalRecord::VenueBound { .. }
+            | JournalRecord::ObligationRaised { .. }
+            | JournalRecord::AuthorityLatched { .. }
+            | JournalRecord::AuthorityInvalidated { .. }
+            | JournalRecord::ReconcileObserved { .. }
+            | JournalRecord::OrderTerminal { .. }
+            | JournalRecord::AmendLineage { .. }
+            | JournalRecord::UserOrderReceived { .. }
+            | JournalRecord::UserOrderQuarantined { .. }
+            | JournalRecord::OrderAuthorityHold { .. }
+            | JournalRecord::UserOrderStaged { .. }
+            | JournalRecord::OrderStateTxn(_)
+            | JournalRecord::RestOrderProofTxn(_)
+            | JournalRecord::OwnActionCid { .. } => {}
+        }
+    }
+
+    /// Rebuild the already-owned core in source order, preserving a prior stop.
+    /// Caller-owned staging/pending-wire replay remains an infallible post-step.
+    /// The fresh constructor is a separate operation and remains unchanged.
+    pub fn rebuild_in_place(&mut self, records: &[JournalRecord]) -> Result<(), HostError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut found = None;
+        super::persistence::for_each_journal_record(records, &mut |record| {
+            if found.is_none() {
+                Self::visit_replay_identity(record, &mut |ledger, _client| {
+                    if found.is_none() {
+                        found = Some(ledger.clone());
+                    }
+                });
+            }
+        });
+        let Some(ledger) = found else {
+            return Ok(());
+        };
+        if ledger.scope != self.ledger.scope {
+            return Err(HostError::JournalScopeMismatch {
+                expected: self.ledger.scope.clone(),
+                found: ledger.scope,
+            });
+        }
+        self.ledger = ledger.clone();
+        self.inventory = MarketInventory::rebuild(ledger.clone(), records).map_err(|source| {
+            self.stopped = true;
+            HostError::Replay {
+                stage: super::types::ReplayStage::Inventory,
+                source,
+            }
+        })?;
+        self.registry = WireRegistry::rebuild(records, &self.inventory).map_err(|source| {
+            self.stopped = true;
+            HostError::Replay {
+                stage: super::types::ReplayStage::Registry,
+                source,
+            }
+        })?;
+        let mut clients = BTreeSet::new();
+        super::persistence::for_each_journal_record(records, &mut |record| {
+            Self::visit_replay_identity(record, &mut |_ledger, client| {
+                if let Some(client) = client {
+                    clients.insert(client.clone());
+                }
+            });
+        });
+        let mut orders = BTreeMap::new();
+        for client in clients {
+            match rebuild_order_with_observations(&ledger, &client, records) {
+                Ok(Some((state, ctx, cursor))) => {
+                    orders.insert(client, OrderRow { state, ctx, cursor });
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    self.stopped = true;
+                    return Err(HostError::Replay {
+                        stage: super::types::ReplayStage::Order(client),
+                        source,
+                    });
+                }
+            }
+        }
+        self.orders = orders;
+        self.cancel_gone.clear();
+        // Supervisor 377a978b: retain the native immediate-pre-fill predicate
+        // for this ONE field; source replay defect stays named and open.
+        let (_timestamp, late) = Self::rebuild_execution_provenance(&ledger, records);
+        self.late_after_normal_terminal = late;
+        self.last_applied_execution_ts_ns = 0;
+        for record in records {
+            if let JournalRecord::ExecutionTxn(execution) = record {
+                for outcome in &execution.executions {
+                    if let Some(timestamp) = Self::applied_venue_time(outcome) {
+                        self.last_applied_execution_ts_ns =
+                            self.last_applied_execution_ts_ns.max(timestamp);
+                    }
+                }
+            }
+        }
+        self.fold_pos = records.len() as u64;
+        self.seed_proven = false;
+        Ok(())
+    }
+
     /// Restore canonical state from already committed records. This pure
     /// reconstruction does not validate a storage device or assert durability.
     pub fn from_committed_records(

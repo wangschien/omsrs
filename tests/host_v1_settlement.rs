@@ -791,3 +791,113 @@ fn private_seed_walk_uses_the_same_unknown_child_settlement_tail() {
     assert!(book.seed_proven());
     rebuilt_same(&book, &journal, &[&cid]);
 }
+
+// Exact sealed S helper for the supervisor-authorized one-field contrast.
+fn source_replay_late_flags(records: &[JournalRecord]) -> std::collections::BTreeSet<String> {
+    fn terminal_in(o: &omsrs::execution::OrderTxnRecord) -> bool {
+        o.core_records.iter().any(|r| {
+            matches!(
+                r,
+                JournalRecord::OrderTerminal {
+                    authority_complete: true,
+                    ..
+                }
+            )
+        })
+    }
+    let mut terminal = std::collections::BTreeSet::<String>::new();
+    let mut out = std::collections::BTreeSet::<String>::new();
+    for record in records {
+        match record {
+            JournalRecord::OrderTxn(o) => {
+                if terminal_in(o) {
+                    terminal.insert(o.client_order_id.0.clone());
+                }
+            }
+            // Observation-driven terminal (exhaustive Canceled/Filled page): the member itself carries
+            // its own post-state; the standalone OrderTerminal that follows has no owner.
+            JournalRecord::ObservationTxn(t) => {
+                for m in &t.members_after {
+                    if matches!(
+                        m.state_after,
+                        OrderState::Filled | OrderState::Canceled | OrderState::Terminal
+                    ) {
+                        terminal.insert(m.client_order_id.0.clone());
+                    }
+                }
+            }
+            JournalRecord::ExecutionTxn(e) => {
+                // #38 H1: keyed on the row the execution was COMMITTED to (order.client_order_id) + a genuinely
+                // LateBooked disposition, never on the claimed CID (an unclaimed unique-wire fill has none; a
+                // claimed CID on a wrong wire is NoRow and has no order part).
+                if let Some(owner) = e.order.as_ref().map(|o| &o.client_order_id) {
+                    if terminal.contains(&owner.0)
+                        && e.executions.iter().any(|o| {
+                            matches!(o.order, omsrs::execution::OrderDisposition::LateBooked)
+                        })
+                    {
+                        out.insert(owner.0.clone());
+                    }
+                }
+                if let Some(o) = e.order.as_ref() {
+                    if terminal_in(o) {
+                        terminal.insert(o.client_order_id.0.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn b4_supervisor_one_field_schedule_matches_native_live_and_both_replay_entries() {
+    for intervening_halt in [false, true] {
+        let mut book = OrderBook::new(ledger());
+        let mut journal = MemoryJournal::new();
+        let cid = bound(&mut book, "b4-provenance", &mut journal);
+        book.commit_event(&cid, &OrderEvent::CancelRequested, &mut journal)
+            .unwrap();
+        book.commit_canceled_response(&cid, &wire(), false, false, None, &mut journal)
+            .unwrap();
+        if intervening_halt {
+            book.commit_ingested_execution(&fill("overfill", Some(&cid), 101, 80), &mut journal)
+                .unwrap();
+        }
+        book.commit_ingested_execution(&fill("late", Some(&cid), 5, 90), &mut journal)
+            .unwrap();
+        let expected = !intervening_halt;
+        let fresh = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+        let mut inplace = OrderBook::new(ledger());
+        inplace.rebuild_in_place(journal.records()).unwrap();
+        assert_eq!(
+            book.post_terminal_booked_after_normal_terminal(&cid),
+            expected
+        );
+        assert_eq!(
+            fresh.post_terminal_booked_after_normal_terminal(&cid),
+            expected
+        );
+        assert_eq!(
+            inplace.post_terminal_booked_after_normal_terminal(&cid),
+            expected
+        );
+        assert!(
+            source_replay_late_flags(journal.records()).contains(&cid.0),
+            "S replay is true for the contrast and the known intervening-halt defect"
+        );
+        assert_eq!(fresh.inventory().view(), inplace.inventory().view());
+        assert_eq!(
+            fresh.registry().get(&ledger(), &wire()),
+            inplace.registry().get(&ledger(), &wire())
+        );
+        let f = fresh.order(&cid).unwrap();
+        let i = inplace.order(&cid).unwrap();
+        assert_eq!((f.state, f.ctx, f.cursor), (i.state, i.ctx, i.cursor));
+        assert_eq!(
+            fresh.last_applied_execution_ts_ns(),
+            inplace.last_applied_execution_ts_ns()
+        );
+    }
+}

@@ -1,7 +1,7 @@
 use omsrs::execution::{ExecutionEvidence, ExecutionScope, ExecutionSource, LedgerId};
 use omsrs::host_v1::{
-    CommitError, DurabilityAck, JournalError, JournalOperation, MemoryJournal, OmsJournal,
-    OrderBook,
+    CommitError, DurabilityAck, HostError, JournalError, JournalOperation, MemoryJournal,
+    OmsJournal, OrderBook, ReplayStage,
 };
 use omsrs::lifecycle::{
     AttemptId, BackfillOrderStatus, ClientOrderId, Effect, FillId, JournalRecord, OrderCtx,
@@ -860,4 +860,198 @@ fn b3_failing_fence_drain_pins_source_memory_and_file_anyhow_log_text() {
         "★ halt 证据落盘失败(Some(UnknownNoMatch)):fsync journal (commit_now): injected —— 重启后 journal 可能缺尾");
     assert!(book.take_fence_errors().is_empty());
     assert!(!book.stopped());
+}
+
+#[test]
+fn b4_in_place_rebuild_retains_prior_stop_while_fresh_constructor_stays_fresh() {
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    let prefix = journal.records().to_vec();
+    journal.fail_at = Some(journal.calls.len() + 1);
+    let close = OrderEvent::CloseSubmission {
+        reason: SubmissionCloseReason::LocalNotSent,
+    };
+    assert!(matches!(
+        book.commit_event(&client, &close, &mut journal),
+        Err(CommitError::Journal(_))
+    ));
+    assert!(book.stopped());
+    book.rebuild_in_place(&prefix).unwrap();
+    assert!(book.stopped());
+    assert!(matches!(
+        book.commit_event(&client, &close, &mut journal),
+        Err(CommitError::Stopped)
+    ));
+    let mut fresh = OrderBook::from_committed_records(ledger(), &prefix).unwrap();
+    assert!(!fresh.stopped());
+    journal.fail_at = None;
+    fresh.commit_event(&client, &close, &mut journal).unwrap();
+}
+
+#[test]
+fn b4_empty_no_ledger_and_wrong_scope_preserve_the_entire_existing_owner() {
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    assert!(book.commit_seed_walk(0, 1, true, [], &mut journal).unwrap());
+    let image = format!("{book:?}");
+    book.rebuild_in_place(&[]).unwrap();
+    assert_eq!(format!("{book:?}"), image);
+    let no_ledger = [omsrs::lifecycle::fill_journal_record(
+        client.clone(),
+        FillId("legacy".into()),
+        1,
+        40,
+        1,
+        None,
+        None,
+    )];
+    book.rebuild_in_place(&no_ledger).unwrap();
+    assert_eq!(format!("{book:?}"), image);
+    let mut foreign = journal.records().to_vec();
+    if let JournalRecord::OrderTxn(order) = &mut foreign[0] {
+        order.ledger.scope = ExecutionScope("other-account".into());
+    }
+    assert!(matches!(
+        book.rebuild_in_place(&foreign),
+        Err(HostError::JournalScopeMismatch { .. })
+    ));
+    assert_eq!(format!("{book:?}"), image);
+}
+
+#[test]
+fn b4_registry_failure_keeps_source_partial_inventory_mutation_and_old_order_map() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    book.commit_execution(Some(&client), &evidence(None), &mut journal)
+        .unwrap();
+    assert_eq!(book.inventory().net(), 40);
+    let registry_before = format!("{:?}", book.registry());
+    let mut prefix = journal.records()[..2].to_vec();
+    let mut divergent = prefix[0].clone();
+    if let JournalRecord::OrderTxn(order) = &mut divergent {
+        order.event.push_str("-divergent");
+    }
+    prefix.push(divergent);
+    assert!(matches!(
+        book.rebuild_in_place(&prefix),
+        Err(HostError::Replay {
+            stage: ReplayStage::Registry,
+            ..
+        })
+    ));
+    assert!(book.stopped());
+    assert_eq!(
+        book.inventory().net(),
+        0,
+        "inventory assignment precedes failed registry rebuild"
+    );
+    assert_eq!(format!("{:?}", book.registry()), registry_before);
+    assert_eq!(
+        book.order(&client).unwrap().ctx.attributed_fill_qty,
+        40,
+        "order map assignment follows all fallible per-CID rebuilds"
+    );
+}
+
+#[test]
+fn b4_success_rebuilds_owned_images_resets_g2_and_seeds_future_fold_position() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    book.commit_execution(Some(&client), &evidence(Some(0)), &mut journal)
+        .unwrap();
+    let mut recovered = OrderBook::new(ledger());
+    assert!(recovered
+        .commit_seed_walk(0, 1, true, [], &mut journal)
+        .unwrap());
+    recovered.rebuild_in_place(journal.records()).unwrap();
+    assert!(!recovered.seed_proven());
+    assert!(!recovered.stopped());
+    assert_eq!(recovered.inventory().view(), book.inventory().view());
+    assert_eq!(
+        recovered
+            .registry()
+            .get(&ledger(), &VenueOrderId("wire-a".into())),
+        book.registry()
+            .get(&ledger(), &VenueOrderId("wire-a".into()))
+    );
+    let actual = recovered.order(&client).unwrap();
+    let live = book.order(&client).unwrap();
+    assert_eq!(
+        (actual.state, actual.ctx, actual.cursor),
+        (live.state, live.ctx, live.cursor)
+    );
+    let prefix_len = journal.records().len() as u64;
+    let next = context("client-next");
+    let next_id = next.client_order_id.clone();
+    recovered.insert_initial(next).unwrap();
+    accepted(&mut recovered, &next_id, "wire-next", &mut journal);
+    assert_eq!(
+        recovered
+            .registry()
+            .get(&ledger(), &VenueOrderId("wire-next".into()))
+            .unwrap()
+            .members[0]
+            .bind_pos,
+        prefix_len + 2
+    );
+}
+
+#[test]
+fn b4_inventory_failure_assigns_source_ledger_before_preserving_previous_inventory() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    book.commit_execution(Some(&client), &evidence(None), &mut journal)
+        .unwrap();
+    let before_inventory = book.inventory().view();
+    let before_registry = format!("{:?}", book.registry());
+    let mut records = journal.records().to_vec();
+    let execution = records
+        .iter()
+        .find(|r| matches!(r, JournalRecord::ExecutionTxn(_)))
+        .unwrap()
+        .clone();
+    records.push(execution);
+    for record in &mut records {
+        match record {
+            JournalRecord::OrderTxn(order) => order.ledger.market = "recovered-market".into(),
+            JournalRecord::ExecutionTxn(execution) => {
+                execution.ledger.market = "recovered-market".into()
+            }
+            _ => {}
+        }
+    }
+    assert!(matches!(
+        book.rebuild_in_place(&records),
+        Err(HostError::Replay {
+            stage: ReplayStage::Inventory,
+            ..
+        })
+    ));
+    assert_eq!(book.ledger().market, "recovered-market");
+    assert_eq!(book.inventory().view(), before_inventory);
+    assert_eq!(format!("{:?}", book.registry()), before_registry);
+    assert!(book.stopped());
+}
+
+#[test]
+fn b4_order_failure_keeps_new_inventory_registry_and_previous_order_map() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    book.commit_execution(Some(&client), &evidence(None), &mut journal)
+        .unwrap();
+    let seq_gap = [journal.records()[1].clone()];
+    assert!(matches!(
+        book.rebuild_in_place(&seq_gap),
+        Err(HostError::Replay {
+            stage: ReplayStage::Order(_),
+            ..
+        })
+    ));
+    assert_eq!(book.inventory().net(), 0);
+    assert!(book
+        .registry()
+        .get(&ledger(), &VenueOrderId("wire-a".into()))
+        .is_none());
+    assert_eq!(book.order(&client).unwrap().ctx.attributed_fill_qty, 40);
+    assert!(book.stopped());
 }

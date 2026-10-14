@@ -398,7 +398,16 @@ use crate::lifecycle::{ClientOrderId, OrderCtx, OrderState};
 use crate::observation::{Readiness, ReadinessError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayStage {
+    Inventory,
+    Registry,
+    Order(ClientOrderId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
+    JournalScopeMismatch { expected: crate::execution::ExecutionScope, found: crate::execution::ExecutionScope },
+    Replay { stage: ReplayStage, source: RebuildError },
     DuplicateClient(ClientOrderId),
     ForeignMarket { expected: String, found: String },
     MissingClient(ClientOrderId),
