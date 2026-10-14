@@ -12,8 +12,9 @@ use crate::lifecycle::{
 };
 use crate::observation::{
     rebuild_order_with_observations, AmendLineage, AmendPhase, MemberRole, ObservationOutcome,
-    ObservationRound, OrderStateTxnRecord, PageMeta, Readiness, ReadinessError, RoundError, Route,
-    RowEvidence, UserOrderEvidence, UserOrderStatus, WireRegistry, WorkingView,
+    ObservationRound, OrderStateProofError, OrderStateTxnRecord, PageMeta, Readiness,
+    ReadinessError, RestOrderProofTxnRecord, RoundError, Route, RowEvidence, UserOrderEvidence,
+    UserOrderStatus, WireMarker, WireRegistry, WireState, WorkingView,
 };
 
 use super::coverage::CoverageMember;
@@ -38,6 +39,18 @@ struct OrderRow {
 struct CancelGone {
     venue_filled: u64,
     wire: VenueOrderId,
+}
+
+/// Source authority-read snapshot, scoped to this owner's ledger. This is not
+/// raw REST identity authentication or send authority. Callers still validate
+/// the returned wire/CID/market/index/subaccount and actual page completeness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityReadToken {
+    pub wire: VenueOrderId,
+    pub generation: u64,
+    pub current_cid: Option<ClientOrderId>,
+    pub inventory_generation: u64,
+    pub authority_hold_revision: u64,
 }
 
 /// Owns the existing lifecycle contexts, inventory and wire registry once.
@@ -259,6 +272,82 @@ impl OrderBook {
     }
     pub fn registry(&self) -> &WireRegistry {
         &self.registry
+    }
+
+    fn held_terminal_identity(state: &WireState) -> Option<&ClientOrderId> {
+        // S held_terminal_identity: last venue-bound member is used only for
+        // strict TERMINAL REST identity, never to re-prove resting authority.
+        if !state.authority_hold
+            || state.proved_current_cid.is_some()
+            || state.members.is_empty()
+            || state
+                .members
+                .iter()
+                .any(|member| member.role != MemberRole::Terminal)
+            || state
+                .amend_lineage
+                .as_ref()
+                .is_some_and(|lineage| match lineage.phase {
+                    AmendPhase::HttpPending => true,
+                    AmendPhase::AppliedNeedsObservation
+                    | AmendPhase::Unknown
+                    | AmendPhase::RestDue => false,
+                })
+        {
+            return None;
+        }
+        state
+            .members
+            .iter()
+            .max_by_key(|member| member.bind_pos)
+            .map(|member| &member.cid)
+    }
+
+    pub fn authority_terminal_identity(&self, wire: &VenueOrderId) -> Option<&ClientOrderId> {
+        self.registry
+            .get(&self.ledger, wire)
+            .and_then(Self::held_terminal_identity)
+    }
+
+    /// Snapshot canonical current identity/generations immediately before the
+    /// caller's authority read. A newer hold cannot be cleared by an old token.
+    pub fn authority_read_token(&self, wire: &VenueOrderId) -> Option<AuthorityReadToken> {
+        let state = self.registry.get(&self.ledger, wire)?;
+        let current_cid = state
+            .members
+            .iter()
+            .find(|member| member.role == MemberRole::Current)
+            .map(|member| member.cid.clone())
+            .or_else(|| {
+                // A newer hold may outlive a proved child's terminal claim.
+                // Retain only that proved terminal identity; no resting proof
+                // or earlier superseded CID is revived by this fallback.
+                if state.authority_hold {
+                    state
+                        .proved_current_cid
+                        .as_ref()
+                        .filter(|cid| {
+                            state.members.iter().any(|member| {
+                                &member.cid == *cid && member.role == MemberRole::Terminal
+                            })
+                        })
+                        .cloned()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| Self::held_terminal_identity(state).cloned());
+        Some(AuthorityReadToken {
+            wire: wire.clone(),
+            generation: state.generation,
+            current_cid,
+            inventory_generation: self.inventory.generation(),
+            authority_hold_revision: state.authority_hold_revision,
+        })
+    }
+
+    pub fn authority_token_still_current(&self, token: &AuthorityReadToken) -> bool {
+        self.authority_read_token(&token.wire).as_ref() == Some(token)
     }
 
     pub fn last_applied_execution_ts_ns(&self) -> u64 {
@@ -1160,6 +1249,144 @@ impl OrderBook {
             effects: Vec::new(),
             durability,
         })
+    }
+
+    /// Canonical per-wire hold, distinct from the channel/position hold. Append
+    /// and fence before folding; failure freezes the owner until reconstruction.
+    pub fn commit_wire_authority_hold(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        self.ensure_active()?;
+        let record = JournalRecord::OrderAuthorityHold {
+            ledger: self.ledger.clone(),
+            wire: wire.clone(),
+        };
+        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        self.fold_committed(Some(&record), journal)?;
+        Ok(CommitReceipt {
+            outcome: (),
+            effects: Vec::new(),
+            durability,
+        })
+    }
+
+    /// The existing canonical REST proof after caller identity/page validation.
+    /// This commits a RestOrderProofTxn, never a fabricated WS frame, timestamp
+    /// or subscription identity. The canonical preparer retains exact errors.
+    pub fn commit_rest_order_proof(
+        &mut self,
+        wire: &VenueOrderId,
+        client: &ClientOrderId,
+        filled: u64,
+        remaining: u64,
+        initial: u64,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<RestOrderProofTxnRecord>, CommitError> {
+        self.ensure_active()?;
+        let transaction = self
+            .registry
+            .prepare_rest_order_proof(
+                &self.ledger,
+                wire,
+                client,
+                filled,
+                remaining,
+                initial,
+                &self.inventory,
+            )
+            .map_err(CommitError::OrderStateProof)?;
+        let record = JournalRecord::RestOrderProofTxn(Box::new(transaction.clone()));
+        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        self.registry
+            .apply_rest_order_proof(&transaction, &self.inventory)
+            .map_err(|error| {
+                self.stopped = true;
+                CommitError::OrderStateProof(error)
+            })?;
+        Ok(CommitReceipt {
+            outcome: transaction,
+            effects: Vec::new(),
+            durability,
+        })
+    }
+
+    /// Source identity-bound REST observation/proof composition. row's CID is
+    /// the actual returned CID, not an inferred member. The caller has checked
+    /// raw market/index/subaccount and supplies real exhaustive/parse metadata.
+    /// A stale token/foreign row/wrong CID rejects before ALL journal operations.
+    pub fn commit_rest_order_page(
+        &mut self,
+        mut row: RowEvidence,
+        initial: u64,
+        token: &AuthorityReadToken,
+        page_outcomes: &[ExecutionOutcome],
+        page: PageMeta,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<ObservationOutcome>, CommitError> {
+        self.ensure_active()?;
+        if row.ledger != self.ledger {
+            return Err(CommitError::Observation(RoundError::ForeignRow));
+        }
+        if !self.authority_token_still_current(token) || token.wire != row.wire {
+            return Err(CommitError::OrderStateProof(
+                OrderStateProofError::GenerationChanged,
+            ));
+        }
+        if token.current_cid.is_none() || row.client_order_id != token.current_cid {
+            return Err(CommitError::OrderStateProof(
+                OrderStateProofError::WrongCurrent,
+            ));
+        }
+        row.marker = WireMarker(token.generation);
+        let wire = row.wire.clone();
+        let client = row.client_order_id.clone().expect("validated actual CID");
+        let status = row.status;
+        let filled = row.filled;
+        let remaining = row.remaining;
+        let mut round = ObservationRound::begin(self.ledger.clone(), wire.clone());
+        for outcome in page_outcomes {
+            // Source page outcomes come from its ledger-validated execution
+            // ingestion. Preserve that owner boundary on this public wrapper;
+            // ObservationRound::record itself filters wire identity only.
+            if outcome.evidence.scope != self.ledger.scope
+                || outcome.evidence.market != self.ledger.market
+            {
+                return Err(CommitError::Observation(RoundError::ForeignRow));
+            }
+            match round.record(outcome) {
+                Ok(()) => {}
+                // S observe_rest_order_page_with_identity ignores a foreign
+                // wire outcome. It never contributes a covered fill;
+                // canonical finish still checks actual held IDs and quantities.
+                Err(RoundError::ForeignRow) => {}
+                Err(error @ RoundError::MembersInvalid { .. }) => {
+                    return Err(CommitError::Observation(error))
+                }
+            }
+        }
+        let complete_page = page.exhaustive && page.parse_failures == 0;
+        round.page(page);
+        let mut result = self.commit_observation(round, row, journal)?;
+        let active_amend = self
+            .registry
+            .get(&self.ledger, &wire)
+            .and_then(|state| state.amend_lineage.as_ref())
+            .is_some_and(|lineage| lineage.new_cid == client);
+        if complete_page
+            && result.outcome
+                == (ObservationOutcome::Consistent {
+                    remaining_fresh: false,
+                })
+            && status == BackfillOrderStatus::Open
+            && active_amend
+        {
+            let receipt =
+                self.commit_rest_order_proof(&wire, &client, filled, remaining, initial, journal)?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        }
+        Ok(result)
     }
 
     /// Commit the existing canonical lineage declaration before external IO.
