@@ -193,13 +193,25 @@ impl WireState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireMarker(pub u64);
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WireRegistry {
     wires: BTreeMap<(LedgerId, VenueOrderId), WireState>,
     #[allow(dead_code)]
     id_index: BTreeMap<VenueOrderId, BTreeSet<FillId>>,
     seen_order: BTreeMap<(LedgerId, ClientOrderId, u64), OrderTxnRecord>,
     ordinals: crate::host_v1::identity::OrdinalIdentity,
+}
+
+// Preserve the existing source registry dump. Ordinal transport identity is
+// available through its dedicated borrowed view and is not a new dump field.
+impl std::fmt::Debug for WireRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireRegistry")
+            .field("wires", &self.wires)
+            .field("id_index", &self.id_index)
+            .field("seen_order", &self.seen_order)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

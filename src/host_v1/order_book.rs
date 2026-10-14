@@ -1428,7 +1428,7 @@ impl OrderBook {
     }
 
     /// Canonical per-wire hold, distinct from the channel/position hold. Append
-    /// and fence before folding; failure freezes the owner until reconstruction.
+    /// and fence before folding; errors preserve the existing stop latch.
     pub fn commit_wire_authority_hold(
         &mut self,
         wire: &VenueOrderId,
