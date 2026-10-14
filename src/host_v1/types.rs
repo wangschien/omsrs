@@ -392,3 +392,53 @@ mod tests {
         assert!(damaged_neg.validate().is_err());
     }
 }
+
+use crate::execution::{InventoryView, OrderCursor, PrepareError, RebuildError};
+use crate::lifecycle::{ClientOrderId, OrderCtx, OrderState};
+use crate::observation::{Readiness, ReadinessError};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostError {
+    DuplicateClient(ClientOrderId),
+    ForeignMarket { expected: String, found: String },
+    MissingClient(ClientOrderId),
+    Prepare(PrepareError),
+    Rebuild(RebuildError),
+}
+
+/// Borrowed canonical state; no additional order projection is stored.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderView<'a> {
+    pub state: &'a OrderState,
+    pub ctx: &'a OrderCtx,
+    pub cursor: OrderCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderHostView {
+    pub inventory: InventoryView,
+    pub registry_readiness: std::result::Result<Readiness, ReadinessError>,
+    pub orders: usize,
+}
+
+/// A committed transition's ordered effects and exact journal acknowledgements.
+/// Effects describe the canonical transition; they do not grant send authority.
+#[derive(Debug)]
+pub struct CommitReceipt<T> {
+    pub outcome: T,
+    pub effects: Vec<crate::lifecycle::Effect>,
+    pub durability: Vec<DurabilityAck>,
+}
+
+#[derive(Debug)]
+pub enum CommitError {
+    Stopped,
+    Host(HostError),
+    Rejected(crate::lifecycle::RejectReason),
+    Journal(JournalError),
+    Apply(crate::execution::ApplyMismatch),
+    Registry(crate::execution::RebuildError),
+    Observation(crate::observation::RoundError),
+    ObservationApply(crate::observation::ObservationApplyMismatch),
+    OrderStateProof(crate::observation::OrderStateProofError),
+}

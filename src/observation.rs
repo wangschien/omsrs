@@ -199,6 +199,7 @@ pub struct WireRegistry {
     #[allow(dead_code)]
     id_index: BTreeMap<VenueOrderId, BTreeSet<FillId>>,
     seen_order: BTreeMap<(LedgerId, ClientOrderId, u64), OrderTxnRecord>,
+    ordinals: crate::host_v1::identity::OrdinalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +365,49 @@ pub struct ObservationTransaction {
 impl WireRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn allocate_ordinal(&mut self) -> crate::host_v1::identity::LocalOrdinal {
+        self.ordinals.allocate()
+    }
+
+    pub fn bind_ordinal(
+        &mut self,
+        local: crate::host_v1::identity::LocalOrdinal,
+        wire: VenueOrderId,
+        client: Option<&str>,
+    ) {
+        self.ordinals.bind(local, wire, client);
+    }
+
+    pub fn wire_for_ordinal(
+        &self,
+        local: crate::host_v1::identity::LocalOrdinal,
+    ) -> Option<&VenueOrderId> {
+        self.ordinals.wire(local)
+    }
+
+    pub fn ordinal_for_wire(&self, wire: &str) -> Option<crate::host_v1::identity::LocalOrdinal> {
+        self.ordinals.local_for_wire(wire)
+    }
+
+    pub fn ordinal_for_client(&self, client: &str) -> Option<crate::host_v1::identity::LocalOrdinal> {
+        self.ordinals.local_for_client(client)
+    }
+
+    pub fn client_for_ordinal(
+        &self,
+        local: crate::host_v1::identity::LocalOrdinal,
+    ) -> Option<&ClientOrderId> {
+        self.ordinals.client(local)
+    }
+
+    pub fn forget_ordinal(&mut self, local: crate::host_v1::identity::LocalOrdinal) {
+        self.ordinals.forget(local);
+    }
+
+    pub fn ordinal_view(&self) -> crate::host_v1::identity::OrdinalView<'_> {
+        self.ordinals.view()
     }
 
     fn ensure(&mut self, ledger: &LedgerId, wire: &VenueOrderId) -> &mut WireState {
