@@ -1339,6 +1339,22 @@ impl OrderBook {
                 OrderStateProofError::WrongCurrent,
             ));
         }
+        // S runtime.rs:3503-3511: this fallback is for terminal evidence only.
+        // A lagged resting page must retain the hold, never install Known.
+        let resting = match row.status {
+            BackfillOrderStatus::Open | BackfillOrderStatus::Partial => true,
+            BackfillOrderStatus::Filled | BackfillOrderStatus::Canceled => false,
+        };
+        if resting
+            && token
+                .current_cid
+                .as_ref()
+                .is_some_and(|client| self.authority_terminal_identity(&row.wire) == Some(client))
+        {
+            return Err(CommitError::OrderStateProof(
+                OrderStateProofError::InvalidTransition,
+            ));
+        }
         row.marker = WireMarker(token.generation);
         let wire = row.wire.clone();
         let client = row.client_order_id.clone().expect("validated actual CID");

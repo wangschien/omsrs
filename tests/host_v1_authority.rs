@@ -643,3 +643,107 @@ fn foreign_ledger_page_outcome_rejects_before_every_journal_operation() {
         assert!(!book.stopped());
     }
 }
+
+#[test]
+fn terminal_only_fallback_rejects_lagged_open_or_partial_before_every_journal_operation() {
+    for status in [BackfillOrderStatus::Open, BackfillOrderStatus::Partial] {
+        let mut book = OrderBook::new(ledger());
+        let mut journal = TraceJournal::default();
+        let cid = bound(&mut book, "a", &mut journal);
+        terminal(&mut book, &cid, &mut journal);
+        book.commit_wire_authority_hold(&wire(), &mut journal)
+            .unwrap();
+        let token = book.authority_read_token(&wire()).unwrap();
+        assert_eq!(token.generation, 0);
+        assert_eq!(book.authority_terminal_identity(&wire()), Some(&cid));
+        assert_eq!(book.working_view(&wire()), WorkingView::Unresolved);
+        let registry_before = format!("{:?}", book.registry());
+        let records_before = journal.records().len();
+        let effects_before = journal.other_effects().len();
+        journal.calls.clear();
+        let response = RowEvidence {
+            ledger: ledger(),
+            wire: wire(),
+            status,
+            filled: 0,
+            remaining: 100,
+            client_order_id: Some(cid.clone()),
+            marker: WireMarker(token.generation),
+        };
+        let result =
+            book.commit_rest_order_page(response, 100, &token, &[], complete(), &mut journal);
+        assert!(
+            matches!(
+                &result,
+                Err(CommitError::OrderStateProof(
+                    OrderStateProofError::InvalidTransition
+                ))
+            ),
+            "lagged {status:?}: result={result:?}, calls={:?}, working={:?}",
+            journal.calls,
+            book.working_view(&wire())
+        );
+        assert!(journal.calls.is_empty());
+        assert_eq!(journal.records().len(), records_before);
+        assert_eq!(journal.other_effects().len(), effects_before);
+        assert_eq!(format!("{:?}", book.registry()), registry_before);
+        assert_eq!(book.authority_read_token(&wire()), Some(token.clone()));
+        assert!(book.authority_token_still_current(&token));
+        assert!(
+            book.registry()
+                .get(&ledger(), &wire())
+                .unwrap()
+                .authority_hold
+        );
+        assert_eq!(book.working_view(&wire()), WorkingView::Unresolved);
+        assert_eq!(book.order(&cid).unwrap().state, &OrderState::Canceled);
+        assert_eq!(book.inventory().net(), 0);
+        assert!(!book.stopped());
+    }
+}
+
+#[test]
+fn terminal_only_fallback_still_accepts_terminal_reconciliation() {
+    let mut book = OrderBook::new(ledger());
+    let mut journal = TraceJournal::default();
+    let cid = bound(&mut book, "a", &mut journal);
+    terminal(&mut book, &cid, &mut journal);
+    book.commit_wire_authority_hold(&wire(), &mut journal)
+        .unwrap();
+    let token = book.authority_read_token(&wire()).unwrap();
+    assert_eq!(book.authority_terminal_identity(&wire()), Some(&cid));
+    let response = RowEvidence {
+        ledger: ledger(),
+        wire: wire(),
+        status: BackfillOrderStatus::Canceled,
+        filled: 0,
+        remaining: 0,
+        client_order_id: Some(cid.clone()),
+        marker: WireMarker(token.generation),
+    };
+    let receipt = book
+        .commit_rest_order_page(response, 100, &token, &[], complete(), &mut journal)
+        .unwrap();
+    assert_eq!(
+        receipt.outcome,
+        ObservationOutcome::Consistent {
+            remaining_fresh: true
+        }
+    );
+    assert!(
+        !book
+            .registry()
+            .get(&ledger(), &wire())
+            .unwrap()
+            .authority_hold
+    );
+    assert_eq!(book.order(&cid).unwrap().state, &OrderState::Canceled);
+    assert_eq!(book.inventory().net(), 0);
+    assert_eq!(book.working_view(&wire()), WorkingView::Known(0));
+    let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    assert_eq!(
+        rebuilt.registry().get(&ledger(), &wire()),
+        book.registry().get(&ledger(), &wire())
+    );
+    assert_eq!(rebuilt.working_view(&wire()), WorkingView::Known(0));
+}
