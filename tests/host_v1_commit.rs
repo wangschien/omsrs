@@ -396,7 +396,7 @@ fn closure_fence_failure_never_applies_closure_or_retries_on_the_frozen_owner() 
     started(&mut book, &client, &mut journal);
     let before = book.order(&client).unwrap().state.clone();
     journal.calls.clear();
-    journal.fail_at = Some(2);
+    journal.fail_at = Some(3);
     let event = OrderEvent::CloseSubmission {
         reason: SubmissionCloseReason::LocalNotSent,
     };
@@ -404,7 +404,7 @@ fn closure_fence_failure_never_applies_closure_or_retries_on_the_frozen_owner() 
         book.commit_event(&client, &event, &mut journal),
         Err(CommitError::Journal(_))
     ));
-    assert_eq!(journal.calls, ["append", "fence"]);
+    assert_eq!(journal.calls, ["append", "effects", "fence"]);
     assert_eq!(book.order(&client).unwrap().state, &before);
     assert!(book.stopped());
     assert!(matches!(
@@ -461,6 +461,75 @@ fn committed_execution_duplicate_and_fee_upgrade_do_not_rebook_inventory() {
         book.registry()
             .get(&ledger(), &VenueOrderId("wire-a".into()))
     );
+}
+
+#[test]
+fn b1_duplicate_no_row_execution_calls_empty_effects_and_preserves_committed_image() {
+    let (mut book, _, mut journal) = initial();
+    let fill = evidence(None);
+    book.commit_execution(None, &fill, &mut journal).unwrap();
+    let prepared = book.prepare_execution(None, &fill).unwrap();
+    assert!(prepared.journal.is_none());
+    assert!(prepared.effects.is_empty());
+    let records = journal.records().to_vec();
+    let inventory = book.inventory().view();
+    let registry = format!("{:?}", book.registry());
+    journal.calls.clear();
+    let receipt = book.commit_execution(None, &fill, &mut journal).unwrap();
+    assert_eq!(journal.calls, ["effects"]);
+    assert_eq!(receipt.durability.len(), 1);
+    assert_eq!(journal.records(), records);
+    assert_eq!(book.inventory().view(), inventory);
+    assert_eq!(format!("{:?}", book.registry()), registry);
+}
+
+#[test]
+fn b1_duplicate_identified_execution_exposes_an_empty_effects_error() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    let fill = evidence(None);
+    book.commit_execution(Some(&client), &fill, &mut journal)
+        .unwrap();
+    let prepared = book.prepare_execution(Some(&client), &fill).unwrap();
+    assert!(prepared.journal.is_none());
+    assert!(prepared.effects.is_empty());
+    let before = book.order(&client).unwrap();
+    let image = (before.state.clone(), before.ctx.clone(), before.cursor);
+    let records = journal.records().to_vec();
+    journal.calls.clear();
+    journal.fail_at = Some(1);
+    assert!(matches!(
+        book.commit_execution(Some(&client), &fill, &mut journal),
+        Err(CommitError::Journal(_))
+    ));
+    assert_eq!(journal.calls, ["effects"]);
+    let after = book.order(&client).unwrap();
+    assert_eq!(
+        (after.state.clone(), after.ctx.clone(), after.cursor),
+        image
+    );
+    assert_eq!(journal.records(), records);
+    // Per-path stop-latch parity is B3, outside this B1 patch.
+}
+
+#[test]
+fn b1_record_bearing_close_has_append_empty_effects_fence_and_recordless_retry_has_none() {
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    let event = OrderEvent::CloseSubmission {
+        reason: SubmissionCloseReason::LocalNotSent,
+    };
+    let prepared = book.prepare_event(&client, &event).unwrap();
+    assert!(prepared.journal.is_some());
+    assert!(prepared.effects.is_empty());
+    journal.calls.clear();
+    book.commit_event(&client, &event, &mut journal).unwrap();
+    assert_eq!(journal.calls, ["append", "effects", "fence"]);
+    let prepared = book.prepare_event(&client, &event).unwrap();
+    assert!(prepared.journal.is_none());
+    journal.calls.clear();
+    book.commit_event(&client, &event, &mut journal).unwrap();
+    assert!(journal.calls.is_empty());
 }
 
 #[test]

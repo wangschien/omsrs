@@ -844,6 +844,7 @@ impl OrderBook {
         &mut self,
         record: Option<&JournalRecord>,
         effects: &[Effect],
+        call_effects: bool,
         fence: bool,
         journal: &mut dyn OmsJournal,
     ) -> Result<Vec<DurabilityAck>, CommitError> {
@@ -853,7 +854,7 @@ impl OrderBook {
                 acknowledgements
                     .push(journal.apply_effects(&[Effect::AppendFsync(record.clone())])?);
             }
-            if !effects.is_empty() {
+            if call_effects {
                 acknowledgements.push(journal.apply_effects(effects)?);
             }
             if fence && record.is_some() {
@@ -974,6 +975,7 @@ impl OrderBook {
         let mut durability = self.write_transition(
             record.as_ref(),
             &effects,
+            record.is_some() || !matches!(event, OrderEvent::CloseSubmission { .. }),
             matches!(event, OrderEvent::CloseSubmission { .. }),
             journal,
         )?;
@@ -1085,7 +1087,8 @@ impl OrderBook {
             .is_some_and(|row| Self::normal_terminal(&row.state));
         let record = transaction.journal.clone();
         let effects = transaction.effects.clone();
-        let mut durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
+        let mut durability =
+            self.write_transition(record.as_ref(), &effects, true, false, journal)?;
         self.fence_halt(record.as_ref(), journal, &mut durability);
         let target = owner.map(|client| {
             let row = self.orders.get_mut(client).expect("prepared owner exists");
@@ -1158,7 +1161,8 @@ impl OrderBook {
             .map_err(CommitError::Observation)?;
         let record = transaction.journal.clone();
         let mut effects = transaction.effects.clone();
-        let mut durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
+        let mut durability =
+            self.write_transition(record.as_ref(), &effects, true, false, journal)?;
         let mut targets: Vec<_> = self
             .orders
             .iter_mut()
@@ -1215,7 +1219,7 @@ impl OrderBook {
         let Some(record) = record else {
             return Ok(None);
         };
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.fold_committed(Some(&record), journal)?;
         Ok(Some(CommitReceipt {
             outcome: (),
@@ -1237,7 +1241,7 @@ impl OrderBook {
             .prepare_order_state_resting(&self.ledger, wire, &self.inventory)
             .map_err(CommitError::OrderStateProof)?;
         let record = JournalRecord::OrderStateTxn(Box::new(transaction.clone()));
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.registry
             .apply_order_state_resting(&transaction, &self.inventory)
             .map_err(|error| {
@@ -1263,7 +1267,7 @@ impl OrderBook {
             ledger: self.ledger.clone(),
             wire: wire.clone(),
         };
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.fold_committed(Some(&record), journal)?;
         Ok(CommitReceipt {
             outcome: (),
@@ -1298,7 +1302,7 @@ impl OrderBook {
             )
             .map_err(CommitError::OrderStateProof)?;
         let record = JournalRecord::RestOrderProofTxn(Box::new(transaction.clone()));
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.registry
             .apply_rest_order_proof(&transaction, &self.inventory)
             .map_err(|error| {
@@ -1419,7 +1423,7 @@ impl OrderBook {
             .registry
             .prepare_amend_lineage(&self.ledger, wire, lineage)
             .map_err(CommitError::OrderStateProof)?;
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.fold_committed(Some(&record), journal)?;
         Ok(CommitReceipt {
             outcome: (),
@@ -1449,7 +1453,7 @@ impl OrderBook {
             wire: wire.clone(),
             lineage: None,
         };
-        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
         self.fold_committed(Some(&record), journal)?;
         Ok(Some(CommitReceipt {
             outcome: before,
