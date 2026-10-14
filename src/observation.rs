@@ -410,6 +410,12 @@ impl WireRegistry {
         self.ordinals.view()
     }
 
+    /// Transfer the process-local transport identity as one object. Replaying
+    /// lifecycle membership does not reset handles, mappings or allocation.
+    pub(crate) fn carry_ordinal_identity_from(&mut self, previous: &mut Self) {
+        std::mem::swap(&mut self.ordinals, &mut previous.ordinals);
+    }
+
     fn ensure(&mut self, ledger: &LedgerId, wire: &VenueOrderId) -> &mut WireState {
         self.wires
             .entry((ledger.clone(), wire.clone()))

@@ -893,6 +893,7 @@ fn b4_empty_no_ledger_and_wrong_scope_preserve_the_entire_existing_owner() {
     let (mut book, client, mut journal) = initial();
     started(&mut book, &client, &mut journal);
     assert!(book.commit_seed_walk(0, 1, true, [], &mut journal).unwrap());
+    let identity_before = seed_b4_transport_identity(&mut book);
     let image = format!("{book:?}");
     book.rebuild_in_place(&[]).unwrap();
     assert_eq!(format!("{book:?}"), image);
@@ -916,6 +917,7 @@ fn b4_empty_no_ledger_and_wrong_scope_preserve_the_entire_existing_owner() {
         Err(HostError::JournalScopeMismatch { .. })
     ));
     assert_eq!(format!("{book:?}"), image);
+    assert_b4_transport_identity_preserved(&mut book, &identity_before);
 }
 
 #[test]
@@ -925,6 +927,7 @@ fn b4_registry_failure_keeps_source_partial_inventory_mutation_and_old_order_map
     book.commit_execution(Some(&client), &evidence(None), &mut journal)
         .unwrap();
     assert_eq!(book.inventory().net(), 40);
+    let identity_before = seed_b4_transport_identity(&mut book);
     let registry_before = format!("{:?}", book.registry());
     let mut prefix = journal.records()[..2].to_vec();
     let mut divergent = prefix[0].clone();
@@ -951,6 +954,7 @@ fn b4_registry_failure_keeps_source_partial_inventory_mutation_and_old_order_map
         40,
         "order map assignment follows all fallible per-CID rebuilds"
     );
+    assert_b4_transport_identity_preserved(&mut book, &identity_before);
 }
 
 #[test]
@@ -963,7 +967,20 @@ fn b4_success_rebuilds_owned_images_resets_g2_and_seeds_future_fold_position() {
     assert!(recovered
         .commit_seed_walk(0, 1, true, [], &mut journal)
         .unwrap());
+    let ordinal = recovered.allocate_ordinal();
+    recovered.bind_ordinal(ordinal, VenueOrderId("wire-a".into()), Some(&client.0));
+    assert_eq!(recovered.wire_for_ordinal(ordinal), Some(&VenueOrderId("wire-a".into())));
+    assert_eq!(recovered.ordinal_view().allocated, 1);
     recovered.rebuild_in_place(journal.records()).unwrap();
+    let mapped_after = recovered.wire_for_ordinal(ordinal).cloned();
+    let allocated_after = recovered.ordinal_view().allocated;
+    let counts_after = {
+        let view = recovered.ordinal_view();
+        (view.wire_by_local.len(), view.local_by_wire.len(), view.local_by_client.len(), view.client_by_local.len())
+    };
+    let next_ordinal = recovered.allocate_ordinal();
+    eprintln!("ASTRA145 ordinal before={} after={mapped_after:?} allocated_after={allocated_after} maps_after={counts_after:?} next={}", ordinal.raw(), next_ordinal.raw());
+    assert_eq!(mapped_after, Some(VenueOrderId("wire-a".into())), "in-place replay must preserve source transport identity");
     assert!(!recovered.seed_proven());
     assert!(!recovered.stopped());
     assert_eq!(recovered.inventory().view(), book.inventory().view());
@@ -1002,6 +1019,7 @@ fn b4_inventory_failure_assigns_source_ledger_before_preserving_previous_invento
     accepted(&mut book, &client, "wire-a", &mut journal);
     book.commit_execution(Some(&client), &evidence(None), &mut journal)
         .unwrap();
+    let identity_before = seed_b4_transport_identity(&mut book);
     let before_inventory = book.inventory().view();
     let before_registry = format!("{:?}", book.registry());
     let mut records = journal.records().to_vec();
@@ -1031,6 +1049,7 @@ fn b4_inventory_failure_assigns_source_ledger_before_preserving_previous_invento
     assert_eq!(book.inventory().view(), before_inventory);
     assert_eq!(format!("{:?}", book.registry()), before_registry);
     assert!(book.stopped());
+    assert_b4_transport_identity_preserved(&mut book, &identity_before);
 }
 
 #[test]
@@ -1039,6 +1058,7 @@ fn b4_order_failure_keeps_new_inventory_registry_and_previous_order_map() {
     accepted(&mut book, &client, "wire-a", &mut journal);
     book.commit_execution(Some(&client), &evidence(None), &mut journal)
         .unwrap();
+    let identity_before = seed_b4_transport_identity(&mut book);
     let seq_gap = [journal.records()[1].clone()];
     assert!(matches!(
         book.rebuild_in_place(&seq_gap),
@@ -1054,4 +1074,65 @@ fn b4_order_failure_keeps_new_inventory_registry_and_previous_order_map() {
         .is_none());
     assert_eq!(book.order(&client).unwrap().ctx.attributed_fill_qty, 40);
     assert!(book.stopped());
+    assert_b4_transport_identity_preserved(&mut book, &identity_before);
+}
+
+fn seed_b4_transport_identity(book: &mut OrderBook) -> (String, u64) {
+    let forgotten = book.allocate_ordinal();
+    book.bind_ordinal(forgotten, VenueOrderId("forgotten".into()), Some("forgotten"));
+    book.forget_ordinal(forgotten);
+    let known = book.allocate_ordinal();
+    book.bind_ordinal(known, VenueOrderId("wire-a".into()), Some("client-a"));
+    let transport_only = book.allocate_ordinal();
+    book.bind_ordinal(
+        transport_only,
+        VenueOrderId("transport-only-wire".into()),
+        Some("transport-only-client"),
+    );
+    // Neither forgotten nor unbound allocations may be reissued by rebuild.
+    book.allocate_ordinal();
+    let view = book.ordinal_view();
+    assert_eq!(view.allocated, 4);
+    assert_eq!(
+        (
+            view.wire_by_local.len(),
+            view.local_by_wire.len(),
+            view.local_by_client.len(),
+            view.client_by_local.len(),
+        ),
+        (2, 2, 2, 2)
+    );
+    (format!("{view:?}"), view.allocated)
+}
+
+fn assert_b4_transport_identity_preserved(book: &mut OrderBook, before: &(String, u64)) {
+    assert_eq!(format!("{:?}", book.ordinal_view()), before.0);
+    assert_eq!(book.allocate_ordinal().raw(), before.1 + 1);
+}
+
+#[test]
+fn b4_success_preserves_complete_transport_identity_including_allocation_holes() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    let identity_before = seed_b4_transport_identity(&mut book);
+    book.rebuild_in_place(journal.records()).unwrap();
+    assert_b4_transport_identity_preserved(&mut book, &identity_before);
+    let local = book.ordinal_for_wire("transport-only-wire").unwrap();
+    assert_eq!(book.ordinal_for_client("transport-only-client"), Some(local));
+    assert_eq!(
+        book.client_for_ordinal(local),
+        Some(&ClientOrderId("transport-only-client".into()))
+    );
+    assert!(book
+        .registry()
+        .get(&ledger(), &VenueOrderId("transport-only-wire".into()))
+        .is_none());
+    // Fresh reconstruction still has a fresh process-local transport index.
+    let fresh = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    let view = fresh.ordinal_view();
+    assert_eq!(view.allocated, 0);
+    assert!(view.wire_by_local.is_empty());
+    assert!(view.local_by_wire.is_empty());
+    assert!(view.local_by_client.is_empty());
+    assert!(view.client_by_local.is_empty());
 }

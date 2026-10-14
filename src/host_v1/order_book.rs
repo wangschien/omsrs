@@ -193,13 +193,16 @@ impl OrderBook {
                 source,
             }
         })?;
-        self.registry = WireRegistry::rebuild(records, &self.inventory).map_err(|source| {
-            self.stopped = true;
-            HostError::Replay {
-                stage: super::types::ReplayStage::Registry,
-                source,
-            }
-        })?;
+        let mut rebuilt_registry =
+            WireRegistry::rebuild(records, &self.inventory).map_err(|source| {
+                self.stopped = true;
+                HostError::Replay {
+                    stage: super::types::ReplayStage::Registry,
+                    source,
+                }
+            })?;
+        rebuilt_registry.carry_ordinal_identity_from(&mut self.registry);
+        self.registry = rebuilt_registry;
         let mut clients = BTreeSet::new();
         super::persistence::for_each_journal_record(records, &mut |record| {
             Self::visit_replay_identity(record, &mut |_ledger, client| {

@@ -901,3 +901,119 @@ fn b4_supervisor_one_field_schedule_matches_native_live_and_both_replay_entries(
         );
     }
 }
+
+#[test]
+fn b4_mixed_ledger_r2_preserves_owned_projection_except_ruled_foreign_raw_late() {
+    // Astra 99be2917 schedule; supervisor 17f5dd2a approves only this raw-set
+    // difference. Both histories use public owner calls, active then foreign.
+    let mut active_ledger = ledger();
+    active_ledger.scope = ExecutionScope("0".into());
+    let mut active = OrderBook::new(active_ledger.clone());
+    let mut active_journal = MemoryJournal::new();
+    let active_cid = bound(&mut active, "active", &mut active_journal);
+    let active_prefix = active_journal.records().to_vec();
+    let active_reference =
+        OrderBook::from_committed_records(active_ledger.clone(), &active_prefix).unwrap();
+    let mut foreign_ledger = active_ledger.clone();
+    foreign_ledger.market = "market-b".into();
+    let mut foreign = OrderBook::new(foreign_ledger);
+    let mut foreign_journal = MemoryJournal::new();
+    let foreign_cid = ClientOrderId("foreign-direct-late".into());
+    foreign
+        .insert_initial(OrderCtx::new(
+            foreign_cid.clone(),
+            "market-b",
+            "group-b",
+            Side::BuyYes,
+            40,
+            100,
+        ))
+        .unwrap();
+    started(&mut foreign, &foreign_cid, &mut foreign_journal);
+    accept(&mut foreign, &foreign_cid, &mut foreign_journal);
+    foreign
+        .commit_event(
+            &foreign_cid,
+            &OrderEvent::CancelRequested,
+            &mut foreign_journal,
+        )
+        .unwrap();
+    foreign
+        .commit_canceled_response(
+            &foreign_cid,
+            &wire(),
+            false,
+            false,
+            None,
+            &mut foreign_journal,
+        )
+        .unwrap();
+    assert_eq!(
+        foreign.order(&foreign_cid).unwrap().state,
+        &OrderState::Canceled
+    );
+    let mut late = fill("foreign-late", Some(&foreign_cid), 5, 90);
+    late.scope = ExecutionScope("0".into());
+    late.market = "market-b".into();
+    foreign
+        .commit_ingested_execution(&late, &mut foreign_journal)
+        .unwrap();
+    assert!(foreign.post_terminal_booked_after_normal_terminal(&foreign_cid));
+    let mut mixed = active_prefix;
+    mixed.extend_from_slice(foreign_journal.records());
+    assert_eq!(
+        source_replay_late_flags(&mixed),
+        std::collections::BTreeSet::from([foreign_cid.0.clone()])
+    );
+    active.rebuild_in_place(&mixed).unwrap();
+    let fresh = OrderBook::from_committed_records(active_ledger.clone(), &mixed).unwrap();
+    for (entry, rebuilt) in [("in-place", &active), ("fresh", &fresh)] {
+        let debug = format!("{rebuilt:?}");
+        let raw_late = debug
+            .split_once("late_after_normal_terminal: ")
+            .unwrap()
+            .1
+            .split_once(", cancel_gone:")
+            .unwrap()
+            .0;
+        assert_eq!(raw_late, "{}", "{entry}: foreign raw flag is excluded");
+        assert_eq!(rebuilt.ledger(), &active_ledger);
+        let expected = active_reference.order(&active_cid).unwrap();
+        let actual = rebuilt.order(&active_cid).unwrap();
+        assert_eq!(
+            (actual.state, actual.ctx, actual.cursor),
+            (expected.state, expected.ctx, expected.cursor)
+        );
+        assert!(rebuilt.order(&foreign_cid).is_none());
+        assert_eq!(
+            rebuilt.inventory().view(),
+            active_reference.inventory().view()
+        );
+        assert_eq!(
+            rebuilt.registry().get(&active_ledger, &wire()),
+            active_reference.registry().get(&active_ledger, &wire())
+        );
+        assert!(debug.contains("cancel_gone: {}, cancel_none: {},"));
+        // C2 compares in-place replay with S's unfiltered venue-time scan.
+        // C3 freezes fresh replay's ledger-filtered helper: its timestamp
+        // remains zero for this foreign-only execution, as on a6ce1ca9.
+        let expected_time = if entry == "in-place" { 90 } else { 0 };
+        assert_eq!(rebuilt.last_applied_execution_ts_ns(), expected_time);
+        assert!(debug.ends_with(&format!("fold_pos: {} }}", mixed.len())));
+        assert!(!rebuilt.seed_proven());
+        assert!(!rebuilt.stopped());
+        assert!(!rebuilt.post_terminal_booked_after_normal_terminal(&active_cid));
+        assert!(!rebuilt.post_terminal_booked_after_normal_terminal(&foreign_cid));
+        eprintln!("B4M2-C1/C2 {entry}: S reference raw={{foreign-direct-late}}, native raw={raw_late}; active row/inventory/registry/cancel provenance exact; venue_time={expected_time}/q={}/G2=false/stopped=false/public predicates=false", mixed.len());
+    }
+    // Compare every other owned substate, including private fields, against
+    // the unchanged fresh image. Only its separately pinned fresh clock is
+    // projected to S's in-place value; no production field is changed.
+    assert_eq!(
+        format!("{active:?}"),
+        format!("{fresh:?}").replace(
+            "last_applied_execution_ts_ns: 0,",
+            "last_applied_execution_ts_ns: 90,"
+        )
+    );
+}
