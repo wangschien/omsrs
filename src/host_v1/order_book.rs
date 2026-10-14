@@ -1,17 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::execution::{
-    prepare_execution, prepare_execution_batch, prepare_order_event, ExecutionEvidence,
-    ExecutionOutcome, ExecutionTransaction, LedgerId, MarketInventory, OrderCursor, OrderRef,
-    OrderTarget, OrderTransaction,
+    execution_debt, prepare_execution, prepare_execution_batch, prepare_order_event, BatchOutcome,
+    ExecutionEvidence, ExecutionOutcome, ExecutionSource, ExecutionTransaction, InventoryHealth,
+    LedgerId, MarketInventory, OrderCursor, OrderRef, OrderTarget, OrderTransaction,
 };
 use crate::lifecycle::{
     ClientOrderId, Effect, JournalRecord, OrderCtx, OrderEvent, OrderState, VenueOrderId,
 };
 use crate::observation::{
     rebuild_order_with_observations, MemberRole, ObservationOutcome, ObservationRound,
-    OrderStateTxnRecord, Readiness, ReadinessError, RowEvidence, UserOrderEvidence, WireRegistry,
-    WorkingView,
+    OrderStateTxnRecord, Readiness, ReadinessError, RoundError, RowEvidence, UserOrderEvidence,
+    WireRegistry, WorkingView,
 };
 
 use super::identity::{LocalOrdinal, OrdinalView};
@@ -19,7 +19,7 @@ use super::persistence::OmsJournal;
 use super::recovery::RecoveryCadence;
 use super::risk::{AdmissionReasons, AuthorityHold, BookGuard, StatusGuard};
 use super::types::{
-    CommitError, CommitReceipt, DurabilityAck, HostError, OrderHostView, OrderView,
+    CommitError, CommitReceipt, DurabilityAck, HostError, JournalError, OrderHostView, OrderView,
 };
 
 #[derive(Debug)]
@@ -44,6 +44,8 @@ pub struct OrderBook {
     book_guard: BookGuard,
     status_guard: StatusGuard,
     stopped: bool,
+    seed_proven: bool,
+    fence_errors: Vec<JournalError>,
 }
 
 impl OrderBook {
@@ -59,6 +61,8 @@ impl OrderBook {
             book_guard: BookGuard::default(),
             status_guard: StatusGuard::default(),
             stopped: false,
+            seed_proven: false,
+            fence_errors: Vec::new(),
         }
     }
 
@@ -113,6 +117,8 @@ impl OrderBook {
             book_guard: BookGuard::default(),
             status_guard: StatusGuard::default(),
             stopped: false,
+            seed_proven: false,
+            fence_errors: Vec::new(),
         })
     }
 
@@ -295,6 +301,99 @@ impl OrderBook {
         self.stopped
     }
 
+    pub fn seed_proven(&self) -> bool {
+        self.seed_proven
+    }
+
+    /// Consume already converted execution rows from an exhaustive seed walk.
+    /// None records a rejected input row; conversions must validate the venue's
+    /// account and quantity fields before producing Some. Earlier successful
+    /// rows remain committed when a later row fails, but never establish proof.
+    /// Journal reconstruction does not restore this process-local proof.
+    pub fn commit_seed_walk(
+        &mut self,
+        cutoff: i64,
+        created_ts: i64,
+        walked: bool,
+        rows: impl IntoIterator<Item = Option<ExecutionEvidence>>,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<bool, CommitError> {
+        self.seed_proven = false;
+        self.ensure_active()?;
+        if created_ts < cutoff || !walked {
+            return Ok(false);
+        }
+        for row in rows {
+            let Some(row) = row else { return Ok(false) };
+            if row.scope != self.ledger.scope
+                || row.market != self.ledger.market
+                || row.source != ExecutionSource::VenueSeed
+            {
+                return Ok(false);
+            }
+            self.commit_execution(None, &row, journal)?;
+        }
+        self.seed_proven = true;
+        Ok(true)
+    }
+
+    /// Canonical host readiness, with conflict taking precedence over seed,
+    /// stop and unknown-submission blockers. This is not send permission or
+    /// proof that the independent admission/transport guards have cleared.
+    pub fn host_readiness(&self, fill_apply_failed: bool) -> Readiness {
+        if fill_apply_failed
+            || matches!(
+                self.inventory.view().health,
+                InventoryHealth::Conflicted { .. }
+            )
+        {
+            return Readiness::Conflict;
+        }
+        if !self.seed_proven
+            || self.stopped
+            || self.orders.values().any(|row| {
+                matches!(
+                    row.state,
+                    OrderState::SubmitUnknown | OrderState::UnknownNoMatch
+                )
+            })
+        {
+            return Self::unresolved_host_readiness();
+        }
+        // A missing/mismatched registry member cannot establish readiness.
+        // Preserve fail-closed host semantics; registry_readiness still exposes
+        // the original typed error for diagnostics rather than hiding it.
+        self.registry_readiness()
+            .unwrap_or_else(|_| Self::unresolved_host_readiness())
+    }
+
+    fn unresolved_host_readiness() -> Readiness {
+        Readiness::Unresolved {
+            member_debt: 0,
+            wire_residual: 0,
+            unresolved_venue_only: 0,
+            tracked_scoped: 0,
+        }
+    }
+
+    pub fn outstanding_fill_debt(&self) -> u64 {
+        execution_debt(self.orders.values().map(|row| &row.ctx))
+    }
+
+    pub fn outstanding_fill_obligation_rows(&self) -> usize {
+        self.orders
+            .values()
+            .filter(|row| row.ctx.attributed_fill_qty < row.ctx.fill_obligation)
+            .count()
+    }
+
+    /// Halt fences are best-effort, as distinct from mandatory closure fences.
+    /// Return failures in occurrence order for the caller's diagnostics. They
+    /// never promote an append acknowledgement into stable-storage authority.
+    pub fn take_fence_errors(&mut self) -> Vec<JournalError> {
+        std::mem::take(&mut self.fence_errors)
+    }
+
     fn ensure_active(&self) -> Result<(), CommitError> {
         if self.stopped {
             Err(CommitError::Stopped)
@@ -336,14 +435,9 @@ impl OrderBook {
         journal: &dyn OmsJournal,
     ) -> Result<(), CommitError> {
         if let Some(record) = record {
-            let pos = if matches!(
-                record,
-                JournalRecord::OrderAuthorityHold { .. } | JournalRecord::UserOrderReceived { .. }
-            ) {
-                journal.len().saturating_sub(1) as u64
-            } else {
-                journal.len() as u64
-            };
+            // Rebuild enumerates records from zero. The just-appended record
+            // has index len - 1, including the order/member binding records.
+            let pos = journal.len().saturating_sub(1) as u64;
             self.registry
                 .fold(pos, record, &self.inventory)
                 .map_err(|error| {
@@ -354,10 +448,76 @@ impl OrderBook {
         Ok(())
     }
 
+    fn fence_halt(
+        &mut self,
+        record: Option<&JournalRecord>,
+        journal: &mut dyn OmsJournal,
+        durability: &mut Vec<DurabilityAck>,
+    ) {
+        let batch_halted = |outcome: &BatchOutcome| match outcome {
+            BatchOutcome::Halt(_) => true,
+            BatchOutcome::Accept | BatchOutcome::Reject(_) => false,
+        };
+        let halt = match record {
+            Some(JournalRecord::OrderTxn(order)) => batch_halted(&order.outcome),
+            Some(JournalRecord::ExecutionTxn(execution)) => execution
+                .order
+                .as_ref()
+                .is_some_and(|order| batch_halted(&order.outcome)),
+            // The canonical commit APIs emit normalized order/execution
+            // batches. Enumerate other current records so a future journal
+            // kind forces its fence policy to be reviewed at compile time.
+            None
+            | Some(
+                JournalRecord::SubmitPrepared { .. }
+                | JournalRecord::SubmitStarted { .. }
+                | JournalRecord::SubmitResponse { .. }
+                | JournalRecord::SubmitUnknown
+                | JournalRecord::SubmitUnknownCid { .. }
+                | JournalRecord::Fill { .. }
+                | JournalRecord::FillCid { .. }
+                | JournalRecord::FeeCorrection { .. }
+                | JournalRecord::CancelRequested
+                | JournalRecord::CancelOutcome(_)
+                | JournalRecord::CancelRequestedCid { .. }
+                | JournalRecord::CancelOutcomeCid { .. }
+                | JournalRecord::VenueBoundCid { .. }
+                | JournalRecord::ImmediateFillUnattributed { .. }
+                | JournalRecord::ImmediateFillUnresolved
+                | JournalRecord::ImmediateFillUnresolvedCid { .. }
+                | JournalRecord::UnknownNoMatch
+                | JournalRecord::UnknownNoMatchCid { .. }
+                | JournalRecord::Halted { .. }
+                | JournalRecord::VenueBound { .. }
+                | JournalRecord::ObligationRaised { .. }
+                | JournalRecord::AuthorityLatched { .. }
+                | JournalRecord::AuthorityInvalidated { .. }
+                | JournalRecord::ReconcileObserved { .. }
+                | JournalRecord::OrderTerminal { .. }
+                | JournalRecord::ObservationTxn(_)
+                | JournalRecord::AmendLineage { .. }
+                | JournalRecord::UserOrderReceived { .. }
+                | JournalRecord::UserOrderQuarantined { .. }
+                | JournalRecord::OrderAuthorityHold { .. }
+                | JournalRecord::UserOrderStaged { .. }
+                | JournalRecord::OrderStateTxn(_)
+                | JournalRecord::RestOrderProofTxn(_)
+                | JournalRecord::OwnActionCid { .. },
+            ) => false,
+        };
+        if halt {
+            match journal.commit_now() {
+                Ok(acknowledgement) => durability.push(acknowledgement),
+                Err(error) => self.fence_errors.push(error),
+            }
+        }
+    }
+
     /// Prepare and commit under the exclusive owner borrow. No externally
     /// mutable prepared transaction can cross the journal boundary.
     /// Submission closure is explicitly fenced before its canonical state is
-    /// applied. Other events retain the journal's configured append policy.
+    /// applied. Halt fences are best-effort; failures are separately drainable.
+    /// Other events retain the journal's configured append policy.
     pub fn commit_event(
         &mut self,
         client: &ClientOrderId,
@@ -373,12 +533,13 @@ impl OrderBook {
         }
         let record = transaction.journal.clone();
         let effects = transaction.effects.clone();
-        let durability = self.write_transition(
+        let mut durability = self.write_transition(
             record.as_ref(),
             &effects,
             matches!(event, OrderEvent::CloseSubmission { .. }),
             journal,
         )?;
+        self.fence_halt(record.as_ref(), journal, &mut durability);
         let row = self.orders.get_mut(client).expect("prepared owner exists");
         transaction
             .apply(OrderTarget {
@@ -438,7 +599,8 @@ impl OrderBook {
     ) -> Result<CommitReceipt<Vec<ExecutionOutcome>>, CommitError> {
         let record = transaction.journal.clone();
         let effects = transaction.effects.clone();
-        let durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
+        let mut durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
+        self.fence_halt(record.as_ref(), journal, &mut durability);
         let target = owner.map(|client| {
             let row = self.orders.get_mut(client).expect("prepared owner exists");
             OrderTarget {
@@ -471,6 +633,9 @@ impl OrderBook {
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<ObservationOutcome>, CommitError> {
         self.ensure_active()?;
+        if row.ledger != self.ledger {
+            return Err(CommitError::Observation(RoundError::ForeignRow));
+        }
         let clients: BTreeSet<_> = self
             .registry
             .get(&self.ledger, &row.wire)
@@ -509,6 +674,7 @@ impl OrderBook {
                 self.stopped = true;
                 CommitError::ObservationApply(error)
             })?;
+        self.fold_committed(record.as_ref(), journal)?;
         Ok(CommitReceipt {
             outcome,
             effects,

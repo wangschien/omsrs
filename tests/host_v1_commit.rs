@@ -8,8 +8,192 @@ use omsrs::lifecycle::{
     OrderEvent, OrderState, Side, SubmissionCloseReason, VenueOrderId,
 };
 use omsrs::observation::{
-    ObservationRound, PageMeta, RowEvidence, UserOrderEvidence, UserOrderStatus, WorkingView,
+    MemberRole, ObservationRound, PageMeta, RoundError, RowEvidence, UserOrderEvidence,
+    UserOrderStatus, WorkingView,
 };
+
+#[test]
+fn foreign_ledger_empty_member_observation_is_rejected_before_every_journal_operation() {
+    let mut book = OrderBook::new(ledger());
+    let mut journal = TraceJournal::default();
+    let mut foreign = ledger();
+    foreign.scope = ExecutionScope("account-b".into());
+    let wire = VenueOrderId("wire-b".into());
+    let registry_before = format!("{:?}", book.registry());
+    let mut round = ObservationRound::begin(foreign.clone(), wire.clone());
+    round.page(PageMeta {
+        exhaustive: true,
+        parse_failures: 0,
+    });
+    let row = RowEvidence {
+        ledger: foreign.clone(),
+        wire: wire.clone(),
+        status: BackfillOrderStatus::Open,
+        filled: 0,
+        remaining: 100,
+        client_order_id: None,
+        marker: book.registry().marker(&foreign, &wire),
+    };
+    assert!(matches!(
+        book.commit_observation(round, row, &mut journal),
+        Err(CommitError::Observation(RoundError::ForeignRow))
+    ));
+    assert!(journal.calls.is_empty());
+    assert!(journal.records().is_empty());
+    assert!(journal.other_effects().is_empty());
+    assert_eq!(format!("{:?}", book.registry()), registry_before);
+    assert!(!book.stopped());
+}
+
+#[test]
+fn terminal_observation_folds_membership_and_rebuilds_the_entire_registry_wire() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    let wire = VenueOrderId("wire-a".into());
+    let mut round = ObservationRound::begin(ledger(), wire.clone());
+    round.page(PageMeta {
+        exhaustive: true,
+        parse_failures: 0,
+    });
+    let row = RowEvidence {
+        ledger: ledger(),
+        wire: wire.clone(),
+        status: BackfillOrderStatus::Canceled,
+        filled: 0,
+        remaining: 0,
+        client_order_id: Some(client.clone()),
+        marker: book.registry().marker(&ledger(), &wire),
+    };
+    book.commit_observation(round, row, &mut journal).unwrap();
+    assert_eq!(book.order(&client).unwrap().state, &OrderState::Canceled);
+    assert_eq!(
+        book.registry().get(&ledger(), &wire).unwrap().members[0].role,
+        MemberRole::Terminal
+    );
+    let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    assert_eq!(
+        rebuilt.registry().get(&ledger(), &wire),
+        book.registry().get(&ledger(), &wire)
+    );
+}
+
+#[test]
+fn halt_fence_failure_is_best_effort_and_diagnostic_without_promoting_durability() {
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    book.commit_event(&client, &OrderEvent::SubmitTimeout, &mut journal)
+        .unwrap();
+    journal.calls.clear();
+    journal.fail_fences = true;
+    let receipt = book
+        .commit_event(
+            &client,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: vec![],
+            },
+            &mut journal,
+        )
+        .unwrap();
+    assert_eq!(journal.calls.last(), Some(&"fence"));
+    assert_eq!(
+        book.order(&client).unwrap().state,
+        &OrderState::UnknownNoMatch
+    );
+    assert!(!book.stopped());
+    assert!(receipt
+        .durability
+        .iter()
+        .all(|ack| matches!(ack, DurabilityAck::Volatile { .. })));
+    assert_eq!(book.take_fence_errors().len(), 1);
+    assert!(book.take_fence_errors().is_empty());
+    let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    assert_eq!(
+        rebuilt.order(&client).unwrap().ctx,
+        book.order(&client).unwrap().ctx
+    );
+    assert_eq!(
+        rebuilt.order(&client).unwrap().state,
+        book.order(&client).unwrap().state
+    );
+}
+
+#[test]
+fn seed_storage_failure_leaves_proof_false_and_storage_stop_unready() {
+    let (mut book, _, mut journal) = initial();
+    assert!(book.commit_seed_walk(0, 1, true, [], &mut journal).unwrap());
+    let mut seed = evidence(Some(0));
+    seed.source = ExecutionSource::VenueSeed;
+    journal.fail_at = Some(1);
+    assert!(matches!(
+        book.commit_seed_walk(0, 1, true, [Some(seed)], &mut journal),
+        Err(CommitError::Journal(_))
+    ));
+    assert!(!book.seed_proven());
+    assert!(book.stopped());
+    assert!(matches!(
+        book.host_readiness(false),
+        omsrs::observation::Readiness::Unresolved { .. }
+    ));
+    assert!(matches!(
+        book.commit_seed_walk(0, 1, true, [], &mut journal),
+        Err(CommitError::Stopped)
+    ));
+}
+
+#[test]
+fn late_execution_halt_fence_failure_still_books_the_canonical_batch() {
+    use omsrs::execution::{BatchOutcome, OrderDisposition, OrderTxnRecord};
+    let mut ctx = context("client-a");
+    let client = ctx.client_order_id.clone();
+    let wire = VenueOrderId("wire-a".into());
+    ctx.venue_order_id = Some(wire.clone());
+    ctx.latch_authority_complete();
+    let initial = JournalRecord::OrderTxn(Box::new(OrderTxnRecord {
+        ledger: ledger(),
+        client_order_id: client.clone(),
+        seq: 1,
+        event: "terminal-fixture".into(),
+        outcome: BatchOutcome::Accept,
+        core_records: vec![JournalRecord::VenueBoundCid {
+            client_order_id: client.clone(),
+            venue_order_id: wire,
+        }],
+        state_after: OrderState::Canceled,
+        ctx_after: ctx,
+    }));
+    let mut book =
+        OrderBook::from_committed_records(ledger(), std::slice::from_ref(&initial)).unwrap();
+    let mut journal = TraceJournal::default();
+    journal.inner.records.push(initial);
+    journal.fail_fences = true;
+    let fill = evidence(Some(0));
+    let event = OrderEvent::Fill {
+        fill_id: fill.execution_id.clone(),
+        qty: fill.qty,
+        price_cents: fill.price_cents,
+        ts_ns: fill.ts_ns,
+        venue_order_id: fill.venue_order_id.clone(),
+        fee_cents: fill.fee_cents,
+    };
+    let receipt = book
+        .commit_execution_batch(&client, &event, &[fill], &mut journal)
+        .unwrap();
+    assert!(matches!(
+        receipt.outcome[0].order,
+        OrderDisposition::LateBooked
+    ));
+    assert_eq!(journal.calls.last(), Some(&"fence"));
+    assert_eq!(book.inventory().net(), 40);
+    assert!(!book.stopped());
+    assert_eq!(book.take_fence_errors().len(), 1);
+    let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    assert_eq!(
+        rebuilt.order(&client).unwrap().ctx,
+        book.order(&client).unwrap().ctx
+    );
+    assert_eq!(rebuilt.inventory().view(), book.inventory().view());
+}
 
 fn ledger() -> LedgerId {
     LedgerId {
@@ -40,11 +224,12 @@ struct TraceJournal {
     inner: MemoryJournal,
     calls: Vec<&'static str>,
     fail_at: Option<usize>,
+    fail_fences: bool,
 }
 impl TraceJournal {
     fn step(&mut self, call: &'static str) -> Result<(), JournalError> {
         self.calls.push(call);
-        if self.fail_at == Some(self.calls.len()) {
+        if self.fail_at == Some(self.calls.len()) || (self.fail_fences && call == "fence") {
             Err(JournalError::Io {
                 operation: JournalOperation::AppendWrite,
                 source: std::io::Error::new(std::io::ErrorKind::Other, "injected"),
@@ -327,6 +512,12 @@ fn identified_batch_uses_canonical_validation_and_rebuilds_order_and_inventory()
     assert_eq!(
         rebuilt.order(&client).unwrap().state,
         book.order(&client).unwrap().state
+    );
+    let wire = VenueOrderId("wire-a".into());
+    assert_eq!(
+        rebuilt.registry().get(&ledger(), &wire),
+        book.registry().get(&ledger(), &wire),
+        "live and rebuilt membership must use the same journal record position"
     );
 }
 

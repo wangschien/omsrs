@@ -487,7 +487,10 @@ impl AuthorityHold {
                     command_id,
                     since_ns,
                 } if now_ns.saturating_sub(since_ns) >= bound_ns => Some((channel, command_id)),
-                _ => None,
+                ChannelState::Subscribing { .. }
+                | ChannelState::Absent
+                | ChannelState::Subscribed { .. }
+                | ChannelState::Lost { .. } => None,
             })
             .collect()
     }
@@ -509,6 +512,12 @@ impl AuthorityHold {
         }
     }
     pub fn next_channel_due_in_ns(&self, now_ns: u64, bound_ns: u64) -> u64 {
+        // Both channels Subscribed means no pending channel ACK/retry deadline.
+        // MAX is the neutral sentinel for the consumer contract wait.min(due),
+        // so other deadlines still wake the caller. This is an Option over the
+        // enumerated timer states, not a discarded failure. Position/order/
+        // lineage reconciliation and hold release remain separate checks;
+        // MAX neither proves their completion nor clears an authority hold.
         [self.fill, self.order_state]
             .into_iter()
             .filter_map(|state| match state {

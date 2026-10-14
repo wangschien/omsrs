@@ -60,6 +60,21 @@ fn channel_ack_and_elapsed_time_never_replace_authority_proof() {
 }
 
 #[test]
+fn healthy_channel_deadline_sentinel_is_neutral_for_waits_and_never_releases_a_hold() {
+    let mut hold = AuthorityHold::default();
+    hold.begin_generation(0);
+    acknowledge_both(&mut hold);
+    assert!(hold.channels_healthy());
+    let due = hold.next_channel_due_in_ns(100, 10);
+    assert_eq!(due, u64::MAX);
+    assert_eq!(50u64.min(due), 50);
+    assert!(hold.expiring_ack_channels(100, 10).is_empty());
+    assert!(hold.is_held());
+    assert!(!hold.try_release(proof()));
+    assert_eq!(hold.trusted_at(), None);
+}
+
+#[test]
 fn channel_errors_correlate_command_before_current_subscription() {
     let mut hold = AuthorityHold::default();
     hold.begin_generation(0);

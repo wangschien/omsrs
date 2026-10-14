@@ -9,3 +9,4 @@ pub mod order_book;
 pub mod recovery;
 pub mod risk;
 pub use order_book::OrderBook;
+pub mod coverage;
