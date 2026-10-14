@@ -406,19 +406,64 @@ fn child_partial_fill_retires_superseded_old_without_clearing_unproved_lineage()
 
 #[test]
 fn late_after_normal_terminal_is_owner_bound_and_reconstructed_from_record_order() {
-    let mut book = OrderBook::new(ledger());
-    let mut journal = MemoryJournal::new();
-    let cid = bound(&mut book, "a", &mut journal);
-    book.commit_event(&cid, &OrderEvent::CancelRequested, &mut journal)
-        .unwrap();
-    book.commit_canceled_response(&cid, &wire(), false, false, None, &mut journal)
-        .unwrap();
-    assert_eq!(book.order(&cid).unwrap().state, &OrderState::Canceled);
-    book.commit_ingested_execution(&fill("late-fill", Some(&cid), 40, 80), &mut journal)
-        .unwrap();
-    assert!(book.post_terminal_booked_after_normal_terminal(&cid));
-    assert_eq!(book.inventory().net(), 40);
-    rebuilt_same(&book, &journal, &[&cid]);
+    for intervening_halt in [false, true] {
+        let mut book = OrderBook::new(ledger());
+        let mut journal = MemoryJournal::new();
+        let cid = bound(&mut book, "a", &mut journal);
+        book.commit_event(&cid, &OrderEvent::CancelRequested, &mut journal)
+            .unwrap();
+        book.commit_canceled_response(&cid, &wire(), false, false, None, &mut journal)
+            .unwrap();
+        assert_eq!(book.order(&cid).unwrap().state, &OrderState::Canceled);
+        if intervening_halt {
+            book.commit_ingested_execution(&fill("overfill", Some(&cid), 101, 80), &mut journal)
+                .unwrap();
+            assert!(matches!(
+                book.order(&cid).unwrap().state,
+                OrderState::Halted {
+                    reason: HaltReason::OverFill { .. }
+                }
+            ));
+            assert_eq!(book.order(&cid).unwrap().ctx.attributed_fill_qty, 0);
+            assert_eq!(book.inventory().net(), 101);
+            assert!(!book.post_terminal_booked_after_normal_terminal(&cid));
+        } else {
+            book.commit_ingested_execution(&fill("late-fill", Some(&cid), 40, 80), &mut journal)
+                .unwrap();
+            assert!(book.post_terminal_booked_after_normal_terminal(&cid));
+            assert_eq!(book.inventory().net(), 40);
+            rebuilt_same(&book, &journal, &[&cid]);
+        }
+        let receipt = book
+            .commit_ingested_execution(&fill("later-fill", Some(&cid), 5, 90), &mut journal)
+            .unwrap();
+        assert!(matches!(
+            receipt.outcome[0].order,
+            omsrs::execution::OrderDisposition::LateBooked
+        ));
+        assert_eq!(
+            book.order(&cid).unwrap().state,
+            &OrderState::Halted {
+                reason: HaltReason::PostTerminalFill
+            }
+        );
+        assert_eq!(
+            book.order(&cid).unwrap().ctx.attributed_fill_qty,
+            if intervening_halt { 5 } else { 45 }
+        );
+        assert_eq!(
+            book.inventory().net(),
+            if intervening_halt { 106 } else { 45 }
+        );
+        assert_eq!(book.last_applied_execution_ts_ns(), 90);
+        // Immediate pre-fill OverFill cannot create the bit. Once established
+        // by a normal terminal, a subsequent non-normal halt cannot erase it.
+        assert_eq!(
+            book.post_terminal_booked_after_normal_terminal(&cid),
+            !intervening_halt
+        );
+        rebuilt_same(&book, &journal, &[&cid]);
+    }
 }
 
 #[test]

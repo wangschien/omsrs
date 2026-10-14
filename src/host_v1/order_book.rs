@@ -204,18 +204,15 @@ impl OrderBook {
         ledger: &LedgerId,
         records: &[JournalRecord],
     ) -> (u64, BTreeSet<ClientOrderId>) {
-        let terminal_in = |order: &crate::execution::OrderTxnRecord| {
-            order.core_records.iter().any(|record| {
-                matches!(
-                    record,
-                    JournalRecord::OrderTerminal {
-                        authority_complete: true,
-                        ..
-                    }
-                )
-            })
-        };
-        let mut terminal = BTreeSet::new();
+        let update_normal =
+            |normal: &mut BTreeSet<ClientOrderId>, client: &ClientOrderId, state: &OrderState| {
+                if Self::normal_terminal(state) {
+                    normal.insert(client.clone());
+                } else {
+                    normal.remove(client);
+                }
+            };
+        let mut normal = BTreeSet::new();
         let mut late = BTreeSet::new();
         let mut timestamp = 0;
         for record in records {
@@ -223,15 +220,11 @@ impl OrderBook {
             // transactions/observations establish these two provenances.
             match record {
                 JournalRecord::OrderTxn(order) if &order.ledger == ledger => {
-                    if terminal_in(order) {
-                        terminal.insert(order.client_order_id.clone());
-                    }
+                    update_normal(&mut normal, &order.client_order_id, &order.state_after);
                 }
                 JournalRecord::ObservationTxn(observation) if &observation.ledger == ledger => {
                     for member in &observation.members_after {
-                        if Self::normal_terminal(&member.state_after) {
-                            terminal.insert(member.client_order_id.clone());
-                        }
+                        update_normal(&mut normal, &member.client_order_id, &member.state_after);
                     }
                 }
                 JournalRecord::ExecutionTxn(execution) if &execution.ledger == ledger => {
@@ -241,16 +234,15 @@ impl OrderBook {
                         }
                     }
                     if let Some(order) = &execution.order {
-                        if terminal.contains(&order.client_order_id)
+                        if normal.contains(&order.client_order_id)
                             && execution.executions.iter().any(Self::late_booked)
                         {
                             late.insert(order.client_order_id.clone());
                         }
-                        // A fill in the same transaction as its terminal is not
-                        // post-terminal; update this set only after late checks.
-                        if terminal_in(order) {
-                            terminal.insert(order.client_order_id.clone());
-                        }
+                        // Match live's immediate pre-fill state, not any earlier
+                        // terminal. Update only after the late check; once set,
+                        // the separate provenance bit survives later halts.
+                        update_normal(&mut normal, &order.client_order_id, &order.state_after);
                     }
                 }
                 _ => {}
