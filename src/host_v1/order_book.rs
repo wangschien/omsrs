@@ -2,16 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::execution::{
     execution_debt, prepare_execution, prepare_execution_batch, prepare_order_event, BatchOutcome,
-    ExecutionEvidence, ExecutionOutcome, ExecutionSource, ExecutionTransaction, InventoryHealth,
-    LedgerId, MarketInventory, OrderCursor, OrderRef, OrderTarget, OrderTransaction,
+    ExecutionEvidence, ExecutionOutcome, ExecutionSource, ExecutionTransaction,
+    InventoryDisposition, InventoryHealth, LedgerId, MarketInventory, OrderCursor,
+    OrderDisposition, OrderRef, OrderTarget, OrderTransaction,
 };
 use crate::lifecycle::{
-    ClientOrderId, Effect, JournalRecord, OrderCtx, OrderEvent, OrderState, VenueOrderId,
+    BackfillOrderRecord, BackfillOrderStatus, CancelOutcome, ClientOrderId, Effect, JournalRecord,
+    OrderCtx, OrderEvent, OrderState, SubmissionCloseReason, VenueOrderId,
 };
 use crate::observation::{
-    rebuild_order_with_observations, AmendLineage, MemberRole, ObservationOutcome,
-    ObservationRound, OrderStateTxnRecord, Readiness, ReadinessError, RoundError, Route,
-    RowEvidence, UserOrderEvidence, WireRegistry, WorkingView,
+    rebuild_order_with_observations, AmendLineage, AmendPhase, MemberRole, ObservationOutcome,
+    ObservationRound, OrderStateTxnRecord, PageMeta, Readiness, ReadinessError, RoundError, Route,
+    RowEvidence, UserOrderEvidence, UserOrderStatus, WireRegistry, WorkingView,
 };
 
 use super::coverage::CoverageMember;
@@ -28,6 +30,14 @@ struct OrderRow {
     state: OrderState,
     ctx: OrderCtx,
     cursor: OrderCursor,
+}
+
+/// Source positive-DELETE provenance, not an execution or remaining proof.
+/// Like the source row's cancel_gone, this transient fact is not reconstructed.
+#[derive(Debug)]
+struct CancelGone {
+    venue_filled: u64,
+    wire: VenueOrderId,
 }
 
 /// Owns the existing lifecycle contexts, inventory and wire registry once.
@@ -47,6 +57,10 @@ pub struct OrderBook {
     stopped: bool,
     seed_proven: bool,
     fence_errors: Vec<JournalError>,
+    last_applied_execution_ts_ns: u64,
+    late_after_normal_terminal: BTreeSet<ClientOrderId>,
+    cancel_gone: BTreeMap<ClientOrderId, CancelGone>,
+    cancel_none: BTreeSet<VenueOrderId>,
 }
 
 impl OrderBook {
@@ -64,6 +78,10 @@ impl OrderBook {
             stopped: false,
             seed_proven: false,
             fence_errors: Vec::new(),
+            last_applied_execution_ts_ns: 0,
+            late_after_normal_terminal: BTreeSet::new(),
+            cancel_gone: BTreeMap::new(),
+            cancel_none: BTreeSet::new(),
         }
     }
 
@@ -107,6 +125,8 @@ impl OrderBook {
                 orders.insert(client, OrderRow { state, ctx, cursor });
             }
         }
+        let (last_applied_execution_ts_ns, late_after_normal_terminal) =
+            Self::rebuild_execution_provenance(&ledger, records);
         Ok(Self {
             ledger,
             orders,
@@ -120,7 +140,123 @@ impl OrderBook {
             stopped: false,
             seed_proven: false,
             fence_errors: Vec::new(),
+            last_applied_execution_ts_ns,
+            late_after_normal_terminal,
+            cancel_gone: BTreeMap::new(),
+            cancel_none: BTreeSet::new(),
         })
+    }
+
+    fn normal_terminal(state: &OrderState) -> bool {
+        match state {
+            OrderState::Filled | OrderState::Canceled | OrderState::Terminal => true,
+            OrderState::New
+            | OrderState::SubmitPrepared
+            | OrderState::SubmitStarted { .. }
+            | OrderState::SubmitUnknown
+            | OrderState::Accepted { .. }
+            | OrderState::Partial { .. }
+            | OrderState::CancelPending { .. }
+            | OrderState::ReconcilePending { .. }
+            | OrderState::ImmediateFillUnattributed { .. }
+            | OrderState::ImmediateFillUnresolved
+            | OrderState::UnknownNoMatch
+            | OrderState::Halted { .. }
+            | OrderState::SubmissionClosed { .. } => false,
+        }
+    }
+
+    fn late_booked(outcome: &ExecutionOutcome) -> bool {
+        match outcome.order {
+            OrderDisposition::LateBooked => true,
+            OrderDisposition::Attributed
+            | OrderDisposition::Enriched
+            | OrderDisposition::Duplicate
+            | OrderDisposition::Ignored(_)
+            | OrderDisposition::NotAttributedByOrder(_)
+            | OrderDisposition::NoRow
+            | OrderDisposition::Refused(_) => false,
+        }
+    }
+
+    fn applied_venue_time(outcome: &ExecutionOutcome) -> Option<u64> {
+        let ingested = match outcome.inventory {
+            InventoryDisposition::Ingested(_) => true,
+            InventoryDisposition::Duplicate
+            | InventoryDisposition::Upgraded
+            | InventoryDisposition::Conflict(_)
+            | InventoryDisposition::Unchanged => false,
+        };
+        let venue_clock = match outcome.evidence.source {
+            ExecutionSource::WsFill | ExecutionSource::RestFill => true,
+            ExecutionSource::CreateResponseBackfill | ExecutionSource::VenueSeed => false,
+        };
+        if !ingested || !venue_clock {
+            return None;
+        }
+        // Only a nonnegative venue timestamp may certify this boundary.
+        // An invalid timestamp cannot substitute the host clock or advance L;
+        // its evidence remains in the canonical outcome/journal for diagnosis.
+        u64::try_from(outcome.evidence.ts_ns).ok()
+    }
+
+    fn rebuild_execution_provenance(
+        ledger: &LedgerId,
+        records: &[JournalRecord],
+    ) -> (u64, BTreeSet<ClientOrderId>) {
+        let terminal_in = |order: &crate::execution::OrderTxnRecord| {
+            order.core_records.iter().any(|record| {
+                matches!(
+                    record,
+                    JournalRecord::OrderTerminal {
+                        authority_complete: true,
+                        ..
+                    }
+                )
+            })
+        };
+        let mut terminal = BTreeSet::new();
+        let mut late = BTreeSet::new();
+        let mut timestamp = 0;
+        for record in records {
+            // Startup census, not event dispatch: only owner-bound normalized
+            // transactions/observations establish these two provenances.
+            match record {
+                JournalRecord::OrderTxn(order) if &order.ledger == ledger => {
+                    if terminal_in(order) {
+                        terminal.insert(order.client_order_id.clone());
+                    }
+                }
+                JournalRecord::ObservationTxn(observation) if &observation.ledger == ledger => {
+                    for member in &observation.members_after {
+                        if Self::normal_terminal(&member.state_after) {
+                            terminal.insert(member.client_order_id.clone());
+                        }
+                    }
+                }
+                JournalRecord::ExecutionTxn(execution) if &execution.ledger == ledger => {
+                    for outcome in &execution.executions {
+                        if let Some(value) = Self::applied_venue_time(outcome) {
+                            timestamp = timestamp.max(value);
+                        }
+                    }
+                    if let Some(order) = &execution.order {
+                        if terminal.contains(&order.client_order_id)
+                            && execution.executions.iter().any(Self::late_booked)
+                        {
+                            late.insert(order.client_order_id.clone());
+                        }
+                        // A fill in the same transaction as its terminal is not
+                        // post-terminal; update this set only after late checks.
+                        if terminal_in(order) {
+                            terminal.insert(order.client_order_id.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (timestamp, late)
     }
 
     pub fn ledger(&self) -> &LedgerId {
@@ -131,6 +267,24 @@ impl OrderBook {
     }
     pub fn registry(&self) -> &WireRegistry {
         &self.registry
+    }
+
+    pub fn last_applied_execution_ts_ns(&self) -> u64 {
+        self.last_applied_execution_ts_ns
+    }
+
+    /// The latest halt label alone is insufficient. This also requires a fill
+    /// actually committed after THIS client's own normal terminal event.
+    pub fn post_terminal_booked_after_normal_terminal(&self, client: &ClientOrderId) -> bool {
+        self.late_after_normal_terminal.contains(client)
+            && self.orders.get(client).is_some_and(|row| {
+                matches!(
+                    row.state,
+                    OrderState::Halted {
+                        reason: crate::lifecycle::HaltReason::PostTerminalFill
+                    }
+                )
+            })
     }
 
     pub fn allocate_ordinal(&mut self) -> LocalOrdinal {
@@ -400,9 +554,8 @@ impl OrderBook {
         })
     }
 
-    /// Base coverage facts from the one canonical owner. Positive-cancel
-    /// provenance is deliberately a separate fact until its owner API lands;
-    /// callers must not use this base view to discard such a known residual.
+    /// Coverage quantity facts from the one canonical owner, including the
+    /// source positive-DELETE residual. This is still not an admission decision.
     /// Role/price/strategy policy is not selected here; reducing direction uses
     /// the supplied signed net in the same quantity unit as the canonical rows.
     pub fn base_coverage_members(&self, net: i128) -> Vec<CoverageMember<'_>> {
@@ -435,8 +588,18 @@ impl OrderBook {
                 // This iterator comes directly from the owned map, so lookup cannot
                 // be missing. Any future structural failure explicitly marks the
                 // quantity unresolvable, which refuses the UPPER coverage proof.
-                let (quantity, unresolvable) =
-                    self.member_working_capacity(client).unwrap_or((0, true));
+                let (quantity, unresolvable) = if let Some(gone) = self.cancel_gone.get(client) {
+                    // S risk_guards live_reducing_row_qty: unknown held quantity
+                    // subtracts zero, preserving the whole known venue residual.
+                    // This conservative cover never grants send/remaining proof.
+                    (
+                        gone.venue_filled
+                            .saturating_sub(self.wire_held_quantity(&gone.wire).unwrap_or(0)),
+                        false,
+                    )
+                } else {
+                    self.member_working_capacity(client).unwrap_or((0, true))
+                };
                 CoverageMember {
                     client,
                     wire: self.coverage_wire_for_client(client),
@@ -525,7 +688,7 @@ impl OrderBook {
             {
                 return Ok(false);
             }
-            self.commit_routed_execution(&row, journal)?;
+            self.commit_ingested_execution(&row, journal)?;
         }
         self.seed_proven = true;
         Ok(true)
@@ -836,6 +999,9 @@ impl OrderBook {
         transaction: ExecutionTransaction,
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<Vec<ExecutionOutcome>>, CommitError> {
+        let normal_before = owner
+            .and_then(|client| self.orders.get(client))
+            .is_some_and(|row| Self::normal_terminal(&row.state));
         let record = transaction.journal.clone();
         let effects = transaction.effects.clone();
         let mut durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
@@ -855,7 +1021,18 @@ impl OrderBook {
                 self.stopped = true;
                 CommitError::Apply(error)
             })?;
+        if normal_before && outcome.iter().any(Self::late_booked) {
+            if let Some(client) = owner {
+                self.late_after_normal_terminal.insert(client.clone());
+            }
+        }
         self.fold_committed(record.as_ref(), journal)?;
+        for execution in &outcome {
+            if let Some(timestamp) = Self::applied_venue_time(execution) {
+                self.last_applied_execution_ts_ns =
+                    self.last_applied_execution_ts_ns.max(timestamp);
+            }
+        }
         Ok(CommitReceipt {
             outcome,
             effects,
@@ -875,6 +1052,11 @@ impl OrderBook {
         if row.ledger != self.ledger {
             return Err(CommitError::Observation(RoundError::ForeignRow));
         }
+        let wire = row.wire.clone();
+        let terminal_status = match row.status {
+            BackfillOrderStatus::Open | BackfillOrderStatus::Partial => false,
+            BackfillOrderStatus::Filled | BackfillOrderStatus::Canceled => true,
+        };
         let clients: BTreeSet<_> = self
             .registry
             .get(&self.ledger, &row.wire)
@@ -894,8 +1076,8 @@ impl OrderBook {
             .finish(&self.registry, &self.inventory, &members, row)
             .map_err(CommitError::Observation)?;
         let record = transaction.journal.clone();
-        let effects = transaction.effects.clone();
-        let durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
+        let mut effects = transaction.effects.clone();
+        let mut durability = self.write_transition(record.as_ref(), &effects, false, journal)?;
         let mut targets: Vec<_> = self
             .orders
             .iter_mut()
@@ -914,6 +1096,22 @@ impl OrderBook {
                 CommitError::ObservationApply(error)
             })?;
         self.fold_committed(record.as_ref(), journal)?;
+        // Source complete_terminal_amend_lineage runs after observation/apply:
+        // only terminal venue status, every canonical member terminal, no hold.
+        let complete = terminal_status
+            && self.registry.get(&self.ledger, &wire).is_some_and(|state| {
+                state.amend_lineage.is_some()
+                    && !state.authority_hold
+                    && state
+                        .members
+                        .iter()
+                        .all(|member| member.role == MemberRole::Terminal)
+            });
+        if complete {
+            if let Some(receipt) = self.commit_clear_amend_lineage(&wire, journal)? {
+                Self::append_commit(&mut effects, &mut durability, receipt);
+            }
+        }
         Ok(CommitReceipt {
             outcome,
             effects,
@@ -993,5 +1191,629 @@ impl OrderBook {
             effects: Vec::new(),
             durability,
         })
+    }
+
+    /// Clear the canonical lineage only after a caller has established its
+    /// resolution. The returned former lineage supplies owner identity to the
+    /// caller's ordered notification; no clock or resolution source is guessed.
+    pub fn commit_clear_amend_lineage(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<Option<CommitReceipt<AmendLineage>>, CommitError> {
+        self.ensure_active()?;
+        let before = self
+            .registry
+            .get(&self.ledger, wire)
+            .and_then(|state| state.amend_lineage.clone());
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        let record = JournalRecord::AmendLineage {
+            ledger: self.ledger.clone(),
+            wire: wire.clone(),
+            lineage: None,
+        };
+        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        self.fold_committed(Some(&record), journal)?;
+        Ok(Some(CommitReceipt {
+            outcome: before,
+            effects: Vec::new(),
+            durability,
+        }))
+    }
+
+    fn append_commit<T>(
+        effects: &mut Vec<Effect>,
+        durability: &mut Vec<DurabilityAck>,
+        mut receipt: CommitReceipt<T>,
+    ) {
+        effects.append(&mut receipt.effects);
+        durability.append(&mut receipt.durability);
+    }
+
+    fn retire_superseded_old(
+        &mut self,
+        old: &ClientOrderId,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        let mut result = CommitReceipt {
+            outcome: (),
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let Some(row) = self.orders.get(old) else {
+            return Ok(result);
+        };
+        if row.state.is_terminal_or_halt() || row.state.is_submission_closed() {
+            return Ok(result);
+        }
+        let filled = row.ctx.attributed_fill_qty;
+        if matches!(
+            row.state,
+            OrderState::Accepted { .. } | OrderState::Partial { .. }
+        ) {
+            let receipt = self.commit_event(old, &OrderEvent::CancelRequested, journal)?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            let receipt = self.commit_event(
+                old,
+                &OrderEvent::CancelOutcome(CancelOutcome::Canceled),
+                journal,
+            )?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        }
+        if self.orders.get(old).is_some_and(|row| {
+            matches!(
+                row.state,
+                OrderState::CancelPending { .. } | OrderState::ReconcilePending { .. }
+            )
+        }) {
+            let receipt = self.commit_event(
+                old,
+                &OrderEvent::ReconcileResult {
+                    status: BackfillOrderStatus::Canceled,
+                    venue_order_id: Some(wire.clone()),
+                    filled_qty: filled,
+                    remaining_qty: 0,
+                    fills: Vec::new(),
+                    authority_complete: true,
+                },
+                journal,
+            )?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        }
+        Ok(result)
+    }
+
+    /// A terminal frame creates no fill. Only the same-wire row whose actual
+    /// attributed quantity equals the venue cumulative can claim its terminal.
+    /// A terminal amend child retires the old member BEFORE lineage clearing.
+    pub fn commit_terminal_frame_if_complete(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<bool>, CommitError> {
+        self.ensure_active()?;
+        let mut result = CommitReceipt {
+            outcome: false,
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let Some(frame) = self
+            .registry
+            .get(&self.ledger, wire)
+            .and_then(|state| state.latest_user_order.clone())
+        else {
+            return Ok(result);
+        };
+        let executed = match frame.status {
+            UserOrderStatus::Canceled => false,
+            UserOrderStatus::Executed => true,
+            UserOrderStatus::Resting | UserOrderStatus::Unknown => return Ok(result),
+        };
+        let Some(row) = self.orders.get(&frame.client_order_id) else {
+            return Ok(result);
+        };
+        if !matches!(
+            row.state,
+            OrderState::Accepted { .. }
+                | OrderState::Partial { .. }
+                | OrderState::CancelPending { .. }
+                | OrderState::ReconcilePending { .. }
+        ) || row.ctx.venue_order_id.as_ref() != Some(wire)
+            || row.ctx.attributed_fill_qty != frame.filled
+        {
+            return Ok(result);
+        }
+        let receipt = self.commit_event(
+            &frame.client_order_id,
+            &OrderEvent::UserOrderTerminalClaim {
+                venue_order_id: wire.clone(),
+                filled: frame.filled,
+                executed,
+            },
+            journal,
+        )?;
+        Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        result.outcome = true;
+        if self
+            .orders
+            .get(&frame.client_order_id)
+            .is_some_and(|row| Self::normal_terminal(&row.state))
+        {
+            let lineage = self
+                .registry
+                .get(&self.ledger, wire)
+                .and_then(|state| state.amend_lineage.clone())
+                .filter(|lineage| lineage.new_cid == frame.client_order_id);
+            if let Some(lineage) = lineage {
+                let receipt = self.retire_superseded_old(&lineage.old_cid, wire, journal)?;
+                Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+                if let Some(receipt) = self.commit_clear_amend_lineage(wire, journal)? {
+                    Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Reprove a stored resting frame when the canonical execution ledger has
+    /// caught up. A not-yet-valid proof is a no-op, never synthetic authority;
+    /// commit_resting_proof still exposes the exact typed error on explicit use.
+    pub fn commit_resting_reproof_if_ready(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<bool>, CommitError> {
+        self.ensure_active()?;
+        let mut result = CommitReceipt {
+            outcome: false,
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let Some(state) = self.registry.get(&self.ledger, wire) else {
+            return Ok(result);
+        };
+        if !state
+            .latest_user_order
+            .as_ref()
+            .is_some_and(|frame| frame.status == UserOrderStatus::Resting)
+        {
+            return Ok(result);
+        }
+        // Source ingestion retries this proof only when it is valid. A failed
+        // preparation changes nothing; it remains independently queryable via
+        // the canonical preparer and explicitly committing primitive.
+        if self
+            .registry
+            .prepare_order_state_resting(&self.ledger, wire, &self.inventory)
+            .is_err()
+        {
+            return Ok(result);
+        }
+        let before = state.amend_lineage.clone();
+        let receipt = self.commit_resting_proof(wire, journal)?;
+        Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        result.outcome = true;
+        if let Some(lineage) = before {
+            let proven =
+                self.registry.get(&self.ledger, wire).is_some_and(|state| {
+                    state.proved_current_cid.as_ref() == Some(&lineage.new_cid)
+                }) || self.orders.get(&lineage.new_cid).is_some_and(|row| {
+                    row.ctx.attributed_fill_qty > 0 || matches!(row.state, OrderState::Filled)
+                });
+            if proven {
+                let receipt = self.retire_superseded_old(&lineage.old_cid, wire, journal)?;
+                Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            }
+        }
+        Ok(result)
+    }
+
+    fn amend_child_proven(&self, child: &ClientOrderId, wire: &VenueOrderId) -> bool {
+        self.registry
+            .get(&self.ledger, wire)
+            .is_some_and(|state| state.proved_current_cid.as_ref() == Some(child))
+            || self.orders.get(child).is_some_and(|row| {
+                row.ctx.attributed_fill_qty > 0 || matches!(row.state, OrderState::Filled)
+            })
+    }
+
+    fn clear_terminal_lineages(
+        &mut self,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        let mut result = CommitReceipt {
+            outcome: (),
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let wires: Vec<_> = self
+            .orders
+            .values()
+            .filter_map(|row| row.ctx.venue_order_id.clone())
+            .collect();
+        let mut seen = BTreeSet::new();
+        for wire in wires {
+            if !seen.insert(wire.clone()) {
+                continue;
+            }
+            let Some(state) = self.registry.get(&self.ledger, &wire) else {
+                continue;
+            };
+            let Some(lineage) = state.amend_lineage.as_ref() else {
+                continue;
+            };
+            let after_http = match lineage.phase {
+                AmendPhase::HttpPending => false,
+                AmendPhase::AppliedNeedsObservation | AmendPhase::Unknown | AmendPhase::RestDue => {
+                    true
+                }
+            };
+            let child_unknown = lineage.phase == AmendPhase::Unknown
+                && self
+                    .orders
+                    .get(&lineage.new_cid)
+                    .is_some_and(|row| matches!(row.state, OrderState::SubmitUnknown))
+                && self.amend_child_proven(&lineage.new_cid, &wire);
+            if after_http
+                && !state.authority_hold
+                && state
+                    .members
+                    .iter()
+                    .all(|member| member.role == MemberRole::Terminal)
+                && !child_unknown
+            {
+                if let Some(receipt) = self.commit_clear_amend_lineage(&wire, journal)? {
+                    Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn resolve_fully_filled_unknown_child(
+        &mut self,
+        child: &ClientOrderId,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        let empty = || CommitReceipt {
+            outcome: (),
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let Some(row) = self.orders.get(child) else {
+            return Ok(empty());
+        };
+        if !matches!(row.state, OrderState::SubmitUnknown)
+            || row.ctx.qty == 0
+            || row.ctx.attributed_fill_qty < row.ctx.qty
+            || row
+                .ctx
+                .venue_order_id
+                .as_ref()
+                .is_some_and(|bound| bound != wire)
+        {
+            return Ok(empty());
+        }
+        let record = BackfillOrderRecord {
+            other_members_filled: 0,
+            client_order_id: child.clone(),
+            venue_order_id: wire.clone(),
+            status: BackfillOrderStatus::Filled,
+            filled_qty: row.ctx.qty,
+            remaining_qty: 0,
+            fills: Vec::new(),
+        };
+        self.commit_event(
+            child,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: vec![record],
+            },
+            journal,
+        )
+    }
+
+    fn resolve_child_after_old_filled(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        let empty = || CommitReceipt {
+            outcome: (),
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let Some(lineage) = self
+            .registry
+            .get(&self.ledger, wire)
+            .and_then(|state| state.amend_lineage.clone())
+        else {
+            return Ok(empty());
+        };
+        match lineage.phase {
+            AmendPhase::Unknown | AmendPhase::RestDue => {}
+            AmendPhase::HttpPending | AmendPhase::AppliedNeedsObservation => return Ok(empty()),
+        }
+        let (Some(old), Some(new)) = (
+            self.orders.get(&lineage.old_cid),
+            self.orders.get(&lineage.new_cid),
+        ) else {
+            return Ok(empty());
+        };
+        if !matches!(new.state, OrderState::SubmitUnknown)
+            || new.ctx.venue_order_id.is_some()
+            || new.ctx.attributed_fill_qty != 0
+            || new.ctx.qty == 0
+            || new.ctx.qty != lineage.declared_remaining
+            || old.ctx.qty == 0
+            || old
+                .ctx
+                .venue_order_id
+                .as_ref()
+                .is_some_and(|bound| bound != wire)
+            || old.ctx.attributed_fill_qty < old.ctx.qty.max(lineage.declared_remaining)
+        {
+            return Ok(empty());
+        }
+        let mut result = self.commit_event(
+            &lineage.new_cid,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::ExhaustiveAbsent,
+            },
+            journal,
+        )?;
+        let receipt = self.clear_terminal_lineages(journal)?;
+        Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        Ok(result)
+    }
+
+    /// Source route (ii): a successful positive DELETE without a live total
+    /// remains unresolved while any bound row is nonterminal. Transient only;
+    /// rebuilding requires fresh venue evidence, as in the source owner.
+    pub fn cancel_without_proof_member(&self, wire: &VenueOrderId) -> bool {
+        self.cancel_none.contains(wire)
+            && self.orders.values().any(|row| {
+                row.ctx.venue_order_id.as_ref() == Some(wire) && !row.state.is_terminal_or_halt()
+            })
+    }
+
+    pub fn deficit_member_wires(&self) -> Vec<&VenueOrderId> {
+        self.orders
+            .values()
+            .filter_map(|row| row.ctx.venue_order_id.as_ref())
+            .filter(|wire| self.wire_known_deficit(wire) || self.cancel_without_proof_member(wire))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn positive_cancel_residual(&self, client: &ClientOrderId) -> Option<u64> {
+        let row = self.orders.get(client)?;
+        if row.state.is_terminal_or_halt() || row.state.is_submission_closed() {
+            return None;
+        }
+        let gone = self.cancel_gone.get(client)?;
+        // Unknown held quantity subtracts zero, retaining the known residual
+        // rather than declaring a fill booked. Canonical inventory remains exact.
+        Some(
+            gone.venue_filled
+                .saturating_sub(self.wire_held_quantity(&gone.wire).unwrap_or(0)),
+        )
+    }
+
+    fn commit_cancel_observation(
+        &mut self,
+        wire: &VenueOrderId,
+        filled: u64,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<ObservationOutcome>, CommitError> {
+        let mut round = ObservationRound::begin(self.ledger.clone(), wire.clone());
+        round.page(PageMeta {
+            exhaustive: true,
+            parse_failures: 0,
+        });
+        let row = RowEvidence {
+            ledger: self.ledger.clone(),
+            wire: wire.clone(),
+            status: BackfillOrderStatus::Canceled,
+            filled,
+            remaining: 0,
+            client_order_id: None,
+            marker: self.registry.marker(&self.ledger, wire),
+        };
+        self.commit_observation(round, row, journal)
+    }
+
+    /// Empty inventory and successful cancel do not prove fill completeness.
+    /// A known venue deficit refuses the source 0/0 synthesis with no journal op.
+    pub fn commit_canceled_empty_if_no_deficit(
+        &mut self,
+        wire: &VenueOrderId,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<ObservationOutcome>, CommitError> {
+        self.ensure_active()?;
+        if self.wire_known_deficit(wire) {
+            return Ok(CommitReceipt {
+                outcome: ObservationOutcome::NotCovered,
+                effects: Vec::new(),
+                durability: Vec::new(),
+            });
+        }
+        self.commit_cancel_observation(wire, 0, journal)
+    }
+
+    /// Source Canceled response composition. The caller supplies actual DELETE
+    /// classification/reduced-by evidence. Capture the current total and held
+    /// inventory BEFORE cancel invalidates the proof; never synthesize a fill.
+    pub fn commit_canceled_response(
+        &mut self,
+        client: &ClientOrderId,
+        wire: &VenueOrderId,
+        delete_reduced_positive: bool,
+        cancel_not_found: bool,
+        reduced_by: Option<u64>,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<ObservationOutcome>, CommitError> {
+        self.ensure_active()?;
+        let mut result = CommitReceipt {
+            outcome: ObservationOutcome::NotCovered,
+            effects: Vec::new(),
+            durability: Vec::new(),
+        };
+        let row = self
+            .orders
+            .get(client)
+            .ok_or_else(|| CommitError::Host(HostError::MissingClient(client.clone())))?;
+        if row.state.is_terminal_or_halt() || row.state.is_submission_closed() {
+            return Ok(result);
+        }
+        let positive = delete_reduced_positive && !cancel_not_found;
+        let gone_pre = if positive {
+            reduced_by.map(|reduced| (reduced, self.wire_total_at_proof(wire)))
+        } else {
+            None
+        };
+        let held_pre = if positive {
+            self.wire_held_quantity(wire)
+        } else {
+            None
+        };
+        let receipt = self.commit_event(
+            client,
+            &OrderEvent::CancelOutcome(CancelOutcome::Canceled),
+            journal,
+        )?;
+        Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        if positive {
+            let lineage = self
+                .registry
+                .get(&self.ledger, wire)
+                .and_then(|state| state.amend_lineage.clone())
+                .filter(|lineage| &lineage.new_cid == client);
+            if let Some(lineage) = lineage {
+                let receipt = self.retire_superseded_old(&lineage.old_cid, wire, journal)?;
+                Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            }
+        }
+        let bound = self
+            .orders
+            .get(client)
+            .and_then(|row| row.ctx.venue_order_id.clone());
+        if let Some(bound) = bound {
+            let shared = self.orders.iter().any(|(other, row)| {
+                other != client
+                    && !row.state.is_terminal_or_halt()
+                    && row.ctx.venue_order_id.as_ref() == Some(&bound)
+            });
+            let held_empty = match self.registry.get(&self.ledger, &bound) {
+                Some(state) => state.held.is_empty(),
+                None => true,
+            };
+            if !shared && held_empty {
+                // S book_cancel_terminals: missing held baseline uses zero only
+                // to preserve a larger venue fill obligation, never book inventory.
+                let receipt = match gone_pre {
+                    Some((reduced, Some(total)))
+                        if reduced <= total && total - reduced > held_pre.unwrap_or(0) =>
+                    {
+                        let attributed = self
+                            .orders
+                            .get(client)
+                            .expect("committed client exists")
+                            .ctx
+                            .attributed_fill_qty;
+                        self.commit_cancel_observation(
+                            &bound,
+                            (total - reduced).max(attributed),
+                            journal,
+                        )?
+                    }
+                    Some((_, None)) if !self.wire_known_deficit(&bound) => {
+                        self.cancel_none.insert(bound.clone());
+                        CommitReceipt {
+                            outcome: ObservationOutcome::NotCovered,
+                            effects: Vec::new(),
+                            durability: Vec::new(),
+                        }
+                    }
+                    Some(_) | None => self.commit_canceled_empty_if_no_deficit(&bound, journal)?,
+                };
+                result.outcome = receipt.outcome;
+                Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            }
+        }
+        if let Some((reduced, Some(total))) = gone_pre {
+            let live = self.orders.get(client).is_some_and(|row| {
+                !row.state.is_terminal_or_halt() && !row.state.is_submission_closed()
+            });
+            if reduced <= total && live {
+                self.cancel_gone.insert(
+                    client.clone(),
+                    CancelGone {
+                        venue_filled: total - reduced,
+                        wire: wire.clone(),
+                    },
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// Ordered source ingestion tail: commit/route the fill, terminal frame,
+    /// resting reproof, Unknown-child resolution, then superseded-old settlement.
+    /// Transport checks, fee queues and external notifications remain caller work.
+    pub fn commit_ingested_execution(
+        &mut self,
+        evidence: &ExecutionEvidence,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<Vec<ExecutionOutcome>>, CommitError> {
+        let mut result = self.commit_routed_execution(evidence, journal)?;
+        if let Some(wire) = evidence.venue_order_id.as_ref() {
+            let receipt = self.commit_terminal_frame_if_complete(wire, journal)?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        }
+        let wire = evidence.venue_order_id.clone().or_else(|| {
+            evidence
+                .claimed_client_order_id
+                .as_ref()
+                .and_then(|client| self.orders.get(client))
+                .and_then(|row| row.ctx.venue_order_id.clone())
+        });
+        if let Some(wire) = wire {
+            let receipt = self.commit_resting_reproof_if_ready(&wire, journal)?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+        }
+        if let (Some(client), Some(wire)) = (
+            evidence.claimed_client_order_id.as_ref(),
+            evidence.venue_order_id.as_ref(),
+        ) {
+            let receipt = self.resolve_fully_filled_unknown_child(client, wire, journal)?;
+            Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            let is_old = self
+                .registry
+                .get(&self.ledger, wire)
+                .and_then(|state| state.amend_lineage.as_ref())
+                .is_some_and(|lineage| &lineage.old_cid == client);
+            if is_old {
+                let receipt = self.resolve_child_after_old_filled(wire, journal)?;
+                Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+            }
+            let lineage = self
+                .registry
+                .get(&self.ledger, wire)
+                .and_then(|state| state.amend_lineage.clone())
+                .filter(|lineage| &lineage.new_cid == client);
+            if let Some(lineage) = lineage {
+                if self.amend_child_proven(client, wire) {
+                    let receipt = self.retire_superseded_old(&lineage.old_cid, wire, journal)?;
+                    Self::append_commit(&mut result.effects, &mut result.durability, receipt);
+                }
+            }
+        }
+        Ok(result)
     }
 }

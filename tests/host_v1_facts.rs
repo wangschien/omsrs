@@ -341,6 +341,10 @@ fn missing_or_wrong_wire_claim_never_selects_a_different_known_wire_owner() {
         } else {
             "wire-a"
         };
+        let before = book.order(&client).unwrap();
+        let state_before = before.state.clone();
+        let context_before = before.ctx.clone();
+        let cursor_before = before.cursor;
         book.commit_routed_execution(&fill("fill-a", Some(&claim), wire, 40), &mut journal)
             .unwrap();
         assert_eq!(
@@ -351,6 +355,11 @@ fn missing_or_wrong_wire_claim_never_selects_a_different_known_wire_owner() {
             None
         );
         assert_eq!(book.order(&client).unwrap().ctx.attributed_fill_qty, 0);
+        let after = book.order(&client).unwrap();
+        assert_eq!(after.state, &state_before);
+        assert_eq!(after.ctx, &context_before);
+        assert_eq!(after.cursor, cursor_before);
+        assert_eq!(book.inventory().net(), 40);
     }
 }
 
