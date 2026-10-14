@@ -856,6 +856,7 @@ impl OrderBook {
         effects: &[Effect],
         call_effects: bool,
         fence: bool,
+        stop_on_error: bool,
         journal: &mut dyn OmsJournal,
     ) -> Result<Vec<DurabilityAck>, CommitError> {
         let result = (|| {
@@ -873,7 +874,9 @@ impl OrderBook {
             Ok(acknowledgements)
         })();
         result.map_err(|error| {
-            self.stopped = true;
+            if stop_on_error {
+                self.stopped = true;
+            }
             CommitError::Journal(error)
         })
     }
@@ -893,7 +896,9 @@ impl OrderBook {
             self.registry
                 .fold(pos, record, &self.inventory)
                 .map_err(|error| {
-                    self.stopped = true;
+                    if matches!(coordinate, FoldCoordinate::Transaction) {
+                        self.stopped = true;
+                    }
                     CommitError::Registry(error)
                 })?;
             if matches!(coordinate, FoldCoordinate::Transaction) {
@@ -993,6 +998,7 @@ impl OrderBook {
             &effects,
             record.is_some() || !matches!(event, OrderEvent::CloseSubmission { .. }),
             matches!(event, OrderEvent::CloseSubmission { .. }),
+            matches!(event, OrderEvent::CloseSubmission { .. }),
             journal,
         )?;
         self.fence_halt(record.as_ref(), journal, &mut durability);
@@ -1004,11 +1010,18 @@ impl OrderBook {
                 ctx: &mut row.ctx,
                 cursor: &mut row.cursor,
             })
-            .map_err(|error| {
-                self.stopped = true;
-                CommitError::Apply(error)
-            })?;
+            .map_err(CommitError::Apply)?;
         self.fold_committed(record.as_ref(), journal, FoldCoordinate::Transaction)?;
+        if !matches!(event, OrderEvent::CloseSubmission { .. }) {
+            if let Some(JournalRecord::OrderTxn(order)) = record.as_ref() {
+                if let BatchOutcome::Halt(reason) = &order.outcome {
+                    return Err(CommitError::SemanticHalt {
+                        event: Box::new(event.clone()),
+                        reason: Box::new(reason.clone()),
+                    });
+                }
+            }
+        }
         Ok(CommitReceipt {
             outcome: (),
             effects,
@@ -1104,7 +1117,7 @@ impl OrderBook {
         let record = transaction.journal.clone();
         let effects = transaction.effects.clone();
         let mut durability =
-            self.write_transition(record.as_ref(), &effects, true, false, journal)?;
+            self.write_transition(record.as_ref(), &effects, true, false, false, journal)?;
         self.fence_halt(record.as_ref(), journal, &mut durability);
         let target = owner.map(|client| {
             let row = self.orders.get_mut(client).expect("prepared owner exists");
@@ -1117,10 +1130,7 @@ impl OrderBook {
         });
         let outcome = transaction
             .apply(target, &mut self.inventory)
-            .map_err(|error| {
-                self.stopped = true;
-                CommitError::Apply(error)
-            })?;
+            .map_err(CommitError::Apply)?;
         if normal_before && outcome.iter().any(Self::late_booked) {
             if let Some(client) = owner {
                 self.late_after_normal_terminal.insert(client.clone());
@@ -1165,20 +1175,29 @@ impl OrderBook {
             .filter(|member| member.role != MemberRole::Terminal)
             .map(|member| member.cid.clone())
             .collect();
-        let members = clients
+        let collected = clients
             .iter()
             .map(|client| {
                 self.order_ref(client)
                     .ok_or_else(|| CommitError::Host(HostError::MissingClient(client.clone())))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let transaction = round
-            .finish(&self.registry, &self.inventory, &members, row)
-            .map_err(CommitError::Observation)?;
+            .collect::<Result<Vec<_>, _>>();
+        let members = match collected {
+            Ok(members) => members,
+            Err(error) => {
+                self.stopped = true;
+                return Err(error);
+            }
+        };
+        let prepared = round.finish(&self.registry, &self.inventory, &members, row);
+        let transaction = prepared.map_err(|error| {
+            self.stopped = true;
+            CommitError::Observation(error)
+        })?;
         let record = transaction.journal.clone();
         let mut effects = transaction.effects.clone();
         let mut durability =
-            self.write_transition(record.as_ref(), &effects, true, false, journal)?;
+            self.write_transition(record.as_ref(), &effects, true, false, true, journal)?;
         let mut targets: Vec<_> = self
             .orders
             .iter_mut()
@@ -1227,7 +1246,6 @@ impl OrderBook {
         evidence: UserOrderEvidence,
         journal: &mut dyn OmsJournal,
     ) -> Result<Option<CommitReceipt<()>>, CommitError> {
-        self.ensure_active()?;
         let record = self
             .registry
             .prepare_user_order_received(&self.ledger, &evidence.wire.clone(), evidence)
@@ -1235,7 +1253,7 @@ impl OrderBook {
         let Some(record) = record else {
             return Ok(None);
         };
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.fold_committed(Some(&record), journal, FoldCoordinate::LastRecord)?;
         Ok(Some(CommitReceipt {
             outcome: (),
@@ -1251,19 +1269,15 @@ impl OrderBook {
         wire: &VenueOrderId,
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<OrderStateTxnRecord>, CommitError> {
-        self.ensure_active()?;
         let transaction = self
             .registry
             .prepare_order_state_resting(&self.ledger, wire, &self.inventory)
             .map_err(CommitError::OrderStateProof)?;
         let record = JournalRecord::OrderStateTxn(Box::new(transaction.clone()));
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.registry
             .apply_order_state_resting(&transaction, &self.inventory)
-            .map_err(|error| {
-                self.stopped = true;
-                CommitError::OrderStateProof(error)
-            })?;
+            .map_err(CommitError::OrderStateProof)?;
         Ok(CommitReceipt {
             outcome: transaction,
             effects: Vec::new(),
@@ -1278,12 +1292,11 @@ impl OrderBook {
         wire: &VenueOrderId,
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<()>, CommitError> {
-        self.ensure_active()?;
         let record = JournalRecord::OrderAuthorityHold {
             ledger: self.ledger.clone(),
             wire: wire.clone(),
         };
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.fold_committed(Some(&record), journal, FoldCoordinate::LastRecord)?;
         Ok(CommitReceipt {
             outcome: (),
@@ -1304,7 +1317,6 @@ impl OrderBook {
         initial: u64,
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<RestOrderProofTxnRecord>, CommitError> {
-        self.ensure_active()?;
         let transaction = self
             .registry
             .prepare_rest_order_proof(
@@ -1318,13 +1330,10 @@ impl OrderBook {
             )
             .map_err(CommitError::OrderStateProof)?;
         let record = JournalRecord::RestOrderProofTxn(Box::new(transaction.clone()));
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.registry
             .apply_rest_order_proof(&transaction, &self.inventory)
-            .map_err(|error| {
-                self.stopped = true;
-                CommitError::OrderStateProof(error)
-            })?;
+            .map_err(CommitError::OrderStateProof)?;
         Ok(CommitReceipt {
             outcome: transaction,
             effects: Vec::new(),
@@ -1434,12 +1443,11 @@ impl OrderBook {
         lineage: AmendLineage,
         journal: &mut dyn OmsJournal,
     ) -> Result<CommitReceipt<()>, CommitError> {
-        self.ensure_active()?;
         let record = self
             .registry
             .prepare_amend_lineage(&self.ledger, wire, lineage)
             .map_err(CommitError::OrderStateProof)?;
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.fold_committed(Some(&record), journal, FoldCoordinate::JournalEnd)?;
         Ok(CommitReceipt {
             outcome: (),
@@ -1456,7 +1464,6 @@ impl OrderBook {
         wire: &VenueOrderId,
         journal: &mut dyn OmsJournal,
     ) -> Result<Option<CommitReceipt<AmendLineage>>, CommitError> {
-        self.ensure_active()?;
         let before = self
             .registry
             .get(&self.ledger, wire)
@@ -1469,7 +1476,7 @@ impl OrderBook {
             wire: wire.clone(),
             lineage: None,
         };
-        let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
+        let durability = self.write_transition(Some(&record), &[], false, true, false, journal)?;
         self.fold_committed(Some(&record), journal, FoldCoordinate::JournalEnd)?;
         Ok(Some(CommitReceipt {
             outcome: before,

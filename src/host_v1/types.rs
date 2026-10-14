@@ -432,6 +432,12 @@ pub struct CommitReceipt<T> {
 
 #[derive(Debug)]
 pub enum CommitError {
+    /// The order state was applied and folded before returning this semantic halt.
+    /// The caller maps it to its existing event/reason error text.
+    SemanticHalt {
+        event: Box<crate::lifecycle::OrderEvent>,
+        reason: Box<crate::lifecycle::HaltReason>,
+    },
     Stopped,
     Host(HostError),
     Rejected(crate::lifecycle::RejectReason),

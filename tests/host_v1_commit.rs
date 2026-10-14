@@ -85,26 +85,27 @@ fn halt_fence_failure_is_best_effort_and_diagnostic_without_promoting_durability
         .unwrap();
     journal.calls.clear();
     journal.fail_fences = true;
-    let receipt = book
-        .commit_event(
-            &client,
-            &OrderEvent::UnknownBackfillResult {
-                exhaustive: true,
-                matched: vec![],
-            },
-            &mut journal,
-        )
-        .unwrap();
+    let event = OrderEvent::UnknownBackfillResult {
+        exhaustive: true,
+        matched: vec![],
+    };
+    let error = book
+        .commit_event(&client, &event, &mut journal)
+        .unwrap_err();
+    let message = match error {
+        CommitError::SemanticHalt { event, reason } => format!("oms halt on {event:?}: {reason:?}"),
+        other => panic!("wrong source Halt result {other:?}"),
+    };
+    assert_eq!(
+        message,
+        "oms halt on UnknownBackfillResult { exhaustive: true, matched: [] }: UnknownNoMatch"
+    );
     assert_eq!(journal.calls.last(), Some(&"fence"));
     assert_eq!(
         book.order(&client).unwrap().state,
         &OrderState::UnknownNoMatch
     );
     assert!(!book.stopped());
-    assert!(receipt
-        .durability
-        .iter()
-        .all(|ack| matches!(ack, DurabilityAck::Volatile { .. })));
     assert_eq!(book.take_fence_errors().len(), 1);
     assert!(book.take_fence_errors().is_empty());
     let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
@@ -119,7 +120,7 @@ fn halt_fence_failure_is_best_effort_and_diagnostic_without_promoting_durability
 }
 
 #[test]
-fn seed_storage_failure_leaves_proof_false_and_storage_stop_unready() {
+fn b3_seed_storage_error_leaves_proof_false_without_inventing_a_global_stop() {
     let (mut book, _, mut journal) = initial();
     assert!(book.commit_seed_walk(0, 1, true, [], &mut journal).unwrap());
     let mut seed = evidence(Some(0));
@@ -130,15 +131,13 @@ fn seed_storage_failure_leaves_proof_false_and_storage_stop_unready() {
         Err(CommitError::Journal(_))
     ));
     assert!(!book.seed_proven());
-    assert!(book.stopped());
+    assert!(!book.stopped());
     assert!(matches!(
         book.host_readiness(false),
         omsrs::observation::Readiness::Unresolved { .. }
     ));
-    assert!(matches!(
-        book.commit_seed_walk(0, 1, true, [], &mut journal),
-        Err(CommitError::Stopped)
-    ));
+    journal.fail_at = None;
+    assert!(book.commit_seed_walk(0, 1, true, [], &mut journal).unwrap());
 }
 
 #[test]
@@ -231,7 +230,11 @@ impl TraceJournal {
         self.calls.push(call);
         if self.fail_at == Some(self.calls.len()) || (self.fail_fences && call == "fence") {
             Err(JournalError::Io {
-                operation: JournalOperation::AppendWrite,
+                operation: if call == "fence" {
+                    JournalOperation::ExplicitFence
+                } else {
+                    JournalOperation::AppendWrite
+                },
                 source: std::io::Error::new(std::io::ErrorKind::Other, "injected"),
             })
         } else {
@@ -348,7 +351,7 @@ fn event_commit_preserves_effect_order_and_rebuilds_the_same_canonical_row() {
 }
 
 #[test]
-fn append_failure_leaves_state_uncommitted_and_freezes_subsequent_commits() {
+fn b3_ordinary_append_failure_preserves_state_and_permits_source_retry() {
     let (mut book, client, mut journal) = initial();
     journal.fail_at = Some(1);
     assert!(matches!(
@@ -358,17 +361,15 @@ fn append_failure_leaves_state_uncommitted_and_freezes_subsequent_commits() {
     assert_eq!(book.order(&client).unwrap().state, &OrderState::New);
     assert_eq!(book.order(&client).unwrap().cursor.seq, 0);
     assert!(journal.records().is_empty());
-    assert!(book.stopped());
+    assert!(!book.stopped());
     journal.fail_at = None;
-    assert!(matches!(
-        book.commit_event(&client, &OrderEvent::PrepareSubmit, &mut journal),
-        Err(CommitError::Stopped)
-    ));
-    assert_eq!(journal.calls.len(), 1);
+    book.commit_event(&client, &OrderEvent::PrepareSubmit, &mut journal)
+        .unwrap();
+    assert_eq!(journal.calls.len(), 3);
 }
 
 #[test]
-fn effects_failure_after_append_keeps_the_owner_frozen_and_requires_reconstruction() {
+fn b3_ordinary_effect_error_leaves_source_owner_unstopped_with_committed_prefix() {
     let (mut book, client, mut journal) = initial();
     started(&mut book, &client, &mut journal);
     let before = book.order(&client).unwrap().state.clone();
@@ -380,7 +381,7 @@ fn effects_failure_after_append_keeps_the_owner_frozen_and_requires_reconstructi
     ));
     assert_eq!(journal.calls, ["append", "effects"]);
     assert_eq!(book.order(&client).unwrap().state, &before);
-    assert!(book.stopped());
+    assert!(!book.stopped());
     assert_eq!(journal.records().len(), 3);
     assert!(journal.other_effects().is_empty());
     let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
@@ -533,7 +534,7 @@ fn b1_record_bearing_close_has_append_empty_effects_fence_and_recordless_retry_h
 }
 
 #[test]
-fn execution_append_failure_preserves_inventory_and_blocks_later_execution() {
+fn b3_execution_append_error_preserves_inventory_and_permits_source_retry() {
     let (mut book, _, mut journal) = initial();
     journal.fail_at = Some(1);
     assert!(matches!(
@@ -542,10 +543,11 @@ fn execution_append_failure_preserves_inventory_and_blocks_later_execution() {
     ));
     assert_eq!(book.inventory().net(), 0);
     assert_eq!(book.inventory().view().executions, 0);
-    assert!(matches!(
-        book.commit_execution(None, &evidence(None), &mut journal),
-        Err(CommitError::Stopped)
-    ));
+    assert!(!book.stopped());
+    journal.fail_at = None;
+    book.commit_execution(None, &evidence(None), &mut journal)
+        .unwrap();
+    assert_eq!(book.inventory().net(), 40);
 }
 
 #[test]
@@ -750,4 +752,112 @@ fn b2_direct_registry_appends_do_not_advance_transaction_fold_coordinates() {
         replay_prefix + 2,
         "S sets q to journal length on replay before further transactions"
     );
+}
+
+#[test]
+fn b3_direct_hold_helper_remains_callable_after_a_closure_stop() {
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    journal.fail_at = Some(journal.calls.len() + 1);
+    assert!(matches!(
+        book.commit_event(
+            &client,
+            &OrderEvent::CloseSubmission {
+                reason: SubmissionCloseReason::LocalNotSent,
+            },
+            &mut journal
+        ),
+        Err(CommitError::Journal(_))
+    ));
+    assert!(book.stopped());
+    journal.fail_at = None;
+    journal.calls.clear();
+    let wire = VenueOrderId("wire-for-diagnostic-hold".into());
+    book.commit_wire_authority_hold(&wire, &mut journal)
+        .unwrap();
+    assert_eq!(journal.calls, ["append", "fence"]);
+    assert!(
+        book.registry()
+            .get(&ledger(), &wire)
+            .unwrap()
+            .authority_hold
+    );
+    assert!(
+        book.stopped(),
+        "successful helper must not clear the prior source stop"
+    );
+}
+
+#[test]
+fn b3_observation_finish_error_latches_before_any_journal_call() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    journal.calls.clear();
+    let round = ObservationRound::begin(ledger(), VenueOrderId("wrong-round-wire".into()));
+    let row = RowEvidence {
+        ledger: ledger(),
+        wire: VenueOrderId("wire-a".into()),
+        status: BackfillOrderStatus::Open,
+        filled: 0,
+        remaining: 100,
+        client_order_id: Some(client),
+        marker: book
+            .registry()
+            .marker(&ledger(), &VenueOrderId("wire-a".into())),
+    };
+    assert!(matches!(
+        book.commit_observation(round, row, &mut journal),
+        Err(CommitError::Observation(RoundError::ForeignRow))
+    ));
+    assert!(journal.calls.is_empty());
+    assert!(book.stopped());
+}
+
+#[test]
+fn b3_failing_fence_drain_pins_source_memory_and_file_anyhow_log_text() {
+    use std::error::Error;
+    fn memory_anyhow_alternate(error: &dyn Error) -> String {
+        let mut text = error.to_string();
+        let mut next = error.source();
+        while let Some(source) = next {
+            text.push_str(": ");
+            text.push_str(&source.to_string());
+            next = source.source();
+        }
+        text
+    }
+    let (mut book, client, mut journal) = initial();
+    started(&mut book, &client, &mut journal);
+    book.commit_event(&client, &OrderEvent::SubmitTimeout, &mut journal)
+        .unwrap();
+    journal.fail_fences = true;
+    let event = OrderEvent::UnknownBackfillResult {
+        exhaustive: true,
+        matched: vec![],
+    };
+    let error = book
+        .commit_event(&client, &event, &mut journal)
+        .unwrap_err();
+    let halt_reason = match error {
+        CommitError::SemanticHalt { reason, .. } => Some(reason),
+        other => panic!("unexpected semantic result {other:?}"),
+    };
+    let queued = book.take_fence_errors();
+    assert_eq!(queued.len(), 1);
+    let memory = memory_anyhow_alternate(&queued[0]);
+    assert_eq!(memory, "journal ExplicitFence: injected: injected");
+    let file = match &queued[0] {
+        JournalError::Io {
+            operation: JournalOperation::ExplicitFence,
+            source,
+        } => format!("fsync journal (commit_now): {source}"),
+        other => panic!("unexpected fence error {other:?}"),
+    };
+    assert_eq!(file, "fsync journal (commit_now): injected");
+    assert_eq!(format!("★ halt 证据落盘失败({halt_reason:?}):{memory} —— 重启后 journal 可能缺尾"),
+        "★ halt 证据落盘失败(Some(UnknownNoMatch)):journal ExplicitFence: injected: injected —— 重启后 journal 可能缺尾");
+    assert_eq!(format!("★ halt 证据落盘失败({halt_reason:?}):{file} —— 重启后 journal 可能缺尾"),
+        "★ halt 证据落盘失败(Some(UnknownNoMatch)):fsync journal (commit_now): injected —— 重启后 journal 可能缺尾");
+    assert!(book.take_fence_errors().is_empty());
+    assert!(!book.stopped());
 }

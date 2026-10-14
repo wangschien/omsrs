@@ -515,7 +515,7 @@ fn wrong_initial_keeps_committed_observation_but_never_prepares_a_rest_proof() {
 }
 
 #[test]
-fn rest_proof_fence_failure_stops_before_applying_proof_and_preserves_observation_prefix() {
+fn b3_rest_proof_fence_error_preserves_observation_without_global_stop() {
     let mut book = OrderBook::new(ledger());
     let mut journal = TraceJournal::default();
     let (cid, out) = applied(&mut book, &mut journal);
@@ -532,7 +532,7 @@ fn rest_proof_fence_failure_stops_before_applying_proof_and_preserves_observatio
         ),
         Err(CommitError::Journal(_))
     ));
-    assert!(book.stopped());
+    assert!(!book.stopped());
     assert!(
         book.registry()
             .get(&ledger(), &wire())
@@ -542,15 +542,15 @@ fn rest_proof_fence_failure_stops_before_applying_proof_and_preserves_observatio
     assert_eq!(book.working_view(&wire()), WorkingView::Unresolved);
     assert_eq!(book.inventory().net(), 40);
     let before = journal.calls.len();
-    assert!(matches!(
-        book.commit_wire_authority_hold(&wire(), &mut journal),
-        Err(CommitError::Stopped)
-    ));
-    assert_eq!(journal.calls.len(), before);
+    journal.fail_fence = false;
+    book.commit_wire_authority_hold(&wire(), &mut journal)
+        .unwrap();
+    assert!(journal.calls.len() > before);
+    assert!(!book.stopped());
 }
 
 #[test]
-fn hold_fence_failure_never_folds_a_hold_or_continues_on_the_owner() {
+fn b3_hold_fence_error_leaves_hold_unfolded_and_allows_source_retry() {
     let mut book = OrderBook::new(ledger());
     let mut journal = TraceJournal::default();
     bound(&mut book, "a", &mut journal);
@@ -560,7 +560,7 @@ fn hold_fence_failure_never_folds_a_hold_or_continues_on_the_owner() {
         book.commit_wire_authority_hold(&wire(), &mut journal),
         Err(CommitError::Journal(_))
     ));
-    assert!(book.stopped());
+    assert!(!book.stopped());
     assert_eq!(book.authority_read_token(&wire()), Some(before));
     assert!(
         !book
@@ -569,6 +569,16 @@ fn hold_fence_failure_never_folds_a_hold_or_continues_on_the_owner() {
             .unwrap()
             .authority_hold
     );
+    journal.fail_fence = false;
+    book.commit_wire_authority_hold(&wire(), &mut journal)
+        .unwrap();
+    assert!(
+        book.registry()
+            .get(&ledger(), &wire())
+            .unwrap()
+            .authority_hold
+    );
+    assert!(!book.stopped());
 }
 
 #[test]

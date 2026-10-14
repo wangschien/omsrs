@@ -150,11 +150,33 @@ fn prove(book: &mut OrderBook, cid: &ClientOrderId, journal: &mut dyn OmsJournal
     book.commit_observation(round, row, journal).unwrap();
 }
 fn rebuilt_same(book: &OrderBook, journal: &dyn OmsJournal, cids: &[&ClientOrderId]) {
+    rebuilt_with_source_positions(book, journal, cids, false);
+}
+fn rebuilt_with_source_positions(
+    book: &OrderBook,
+    journal: &dyn OmsJournal,
+    cids: &[&ClientOrderId],
+    direct_lineage_before_child_bind: bool,
+) {
     let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
     assert_eq!(rebuilt.inventory().view(), book.inventory().view());
+    let mut expected_wire = book.registry().get(&ledger(), &wire()).cloned();
+    if direct_lineage_before_child_bind {
+        // S q skips the direct lineage append; S replay still enumerates it.
+        // Pin BOTH exact coordinates, then compare the complete wire image.
+        let member = expected_wire
+            .as_mut()
+            .unwrap()
+            .members
+            .iter_mut()
+            .find(|m| m.cid.0 == "new")
+            .unwrap();
+        assert_eq!(member.bind_pos, 5);
+        member.bind_pos = 6;
+    }
     assert_eq!(
         rebuilt.registry().get(&ledger(), &wire()),
-        book.registry().get(&ledger(), &wire())
+        expected_wire.as_ref()
     );
     assert_eq!(
         rebuilt.last_applied_execution_ts_ns(),
@@ -301,7 +323,7 @@ fn terminal_child_retires_old_before_lineage_clear_and_preserves_ack_order() {
     }
     assert!(ends.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(ends.last(), Some(&(journal.records().len() as u64)));
-    rebuilt_same(&book, &journal, &[&old, &new]);
+    rebuilt_with_source_positions(&book, &journal, &[&old, &new], true);
 }
 
 #[test]
@@ -401,7 +423,7 @@ fn child_partial_fill_retires_superseded_old_without_clearing_unproved_lineage()
         .amend_lineage
         .is_some());
     assert_eq!(book.inventory().net(), 20);
-    rebuilt_same(&book, &journal, &[&old, &new]);
+    rebuilt_with_source_positions(&book, &journal, &[&old, &new], true);
 }
 
 #[test]
@@ -474,15 +496,17 @@ fn frozen_unknown_no_match_late_book_is_not_a_normal_terminal_provenance() {
     started(&mut book, &cid, &mut journal);
     book.commit_event(&cid, &OrderEvent::SubmitTimeout, &mut journal)
         .unwrap();
-    book.commit_event(
-        &cid,
-        &OrderEvent::UnknownBackfillResult {
-            exhaustive: true,
-            matched: Vec::new(),
-        },
-        &mut journal,
-    )
-    .unwrap();
+    assert!(matches!(
+        book.commit_event(
+            &cid,
+            &OrderEvent::UnknownBackfillResult {
+                exhaustive: true,
+                matched: Vec::new()
+            },
+            &mut journal,
+        ),
+        Err(CommitError::SemanticHalt { .. })
+    ));
     book.commit_ingested_execution(&fill("late-fill", Some(&cid), 40, 80), &mut journal)
         .unwrap();
     assert_eq!(
@@ -679,7 +703,7 @@ impl OmsJournal for FailTerminalJournal {
     }
 }
 #[test]
-fn terminal_tail_storage_failure_preserves_committed_fill_prefix_and_stops_owner() {
+fn b3_terminal_tail_error_preserves_committed_fill_prefix_without_global_stop() {
     let mut book = OrderBook::new(ledger());
     let mut journal = FailTerminalJournal::default();
     let cid = bound(&mut book, "a", &mut journal);
@@ -690,7 +714,7 @@ fn terminal_tail_storage_failure_preserves_committed_fill_prefix_and_stops_owner
         book.commit_ingested_execution(&fill("fill-a", Some(&cid), 40, 80), &mut journal),
         Err(CommitError::Journal(_))
     ));
-    assert!(book.stopped());
+    assert!(!book.stopped());
     assert_eq!(book.inventory().net(), 40);
     assert_eq!(book.order(&cid).unwrap().ctx.attributed_fill_qty, 40);
     assert!(!matches!(
@@ -722,7 +746,7 @@ fn positive_current_cancel_retires_old_but_notfound_never_does() {
         );
         assert_eq!(book.cancel_without_proof_member(&wire()), !not_found);
         assert_eq!(book.inventory().net(), 0);
-        rebuilt_same(&book, &journal, &[&old, &new]);
+        rebuilt_with_source_positions(&book, &journal, &[&old, &new], true);
     }
 }
 
