@@ -10,3 +10,4 @@ pub mod recovery;
 pub mod risk;
 pub use order_book::OrderBook;
 pub mod coverage;
+pub mod fee;
