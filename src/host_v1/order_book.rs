@@ -9,11 +9,12 @@ use crate::lifecycle::{
     ClientOrderId, Effect, JournalRecord, OrderCtx, OrderEvent, OrderState, VenueOrderId,
 };
 use crate::observation::{
-    rebuild_order_with_observations, MemberRole, ObservationOutcome, ObservationRound,
-    OrderStateTxnRecord, Readiness, ReadinessError, RoundError, RowEvidence, UserOrderEvidence,
-    WireRegistry, WorkingView,
+    rebuild_order_with_observations, AmendLineage, MemberRole, ObservationOutcome,
+    ObservationRound, OrderStateTxnRecord, Readiness, ReadinessError, RoundError, Route,
+    RowEvidence, UserOrderEvidence, WireRegistry, WorkingView,
 };
 
+use super::coverage::CoverageMember;
 use super::identity::{LocalOrdinal, OrdinalView};
 use super::persistence::OmsJournal;
 use super::recovery::RecoveryCadence;
@@ -255,6 +256,199 @@ impl OrderBook {
         self.registry.working_view(&self.ledger, wire)
     }
 
+    /// A missing wire/held execution or overflowing total is unknown, not zero.
+    pub fn wire_held_quantity(&self, wire: &VenueOrderId) -> Option<u64> {
+        let state = self.registry.get(&self.ledger, wire)?;
+        state
+            .held
+            .iter()
+            .try_fold(0u64, |sum, id| sum.checked_add(self.inventory.get(id)?.qty))
+    }
+
+    /// Total at the last canonical remaining proof. An own action invalidates
+    /// that proof; missing covered executions never become a fabricated total.
+    pub fn wire_total_at_proof(&self, wire: &VenueOrderId) -> Option<u64> {
+        let proof = self
+            .registry
+            .get(&self.ledger, wire)?
+            .remaining_observation
+            .as_ref()?;
+        proof.covered.iter().try_fold(proof.remaining, |sum, id| {
+            sum.checked_add(self.inventory.get(id)?.qty)
+        })
+    }
+
+    /// Compare venue cumulative fills with canonical inventory held by this
+    /// wire. Unknown held inventory counts as zero for this deficit predicate
+    /// only, preserving the conservative requirement for further recovery.
+    pub fn wire_known_deficit(&self, wire: &VenueOrderId) -> bool {
+        let Some(state) = self.registry.get(&self.ledger, wire) else {
+            return false;
+        };
+        let venue_filled = state
+            .latest_user_order
+            .as_ref()
+            .map_or(0, |frame| frame.filled);
+        venue_filled > self.wire_held_quantity(wire).unwrap_or(0)
+    }
+
+    fn other_member_attribution(
+        &self,
+        wire: &VenueOrderId,
+        client: &ClientOrderId,
+    ) -> Option<(u64, bool)> {
+        let Some(state) = self.registry.get(&self.ledger, wire) else {
+            return Some((0, false));
+        };
+        let mut attributed = 0u64;
+        let mut debt = false;
+        for member in &state.members {
+            if &member.cid == client {
+                continue;
+            }
+            let row = self.orders.get(&member.cid)?;
+            attributed = attributed.checked_add(row.ctx.attributed_fill_qty)?;
+            debt |= row.ctx.fill_obligation > row.ctx.attributed_fill_qty;
+        }
+        Some((attributed, debt))
+    }
+
+    /// Translate a cumulative wire obligation into this member's obligation.
+    /// Other-member debt, missing rows or negative differences remain unknown.
+    pub fn backfill_member_quantity(
+        &self,
+        wire: &VenueOrderId,
+        client: &ClientOrderId,
+        cumulative: u64,
+    ) -> Option<u64> {
+        let (other_attributed, other_debt) = self.other_member_attribution(wire, client)?;
+        if other_debt {
+            return None;
+        }
+        cumulative.checked_sub(other_attributed)
+    }
+
+    /// Canonical working proof, otherwise checked member capacity and an
+    /// explicit unresolvable flag. Capacity is not exact venue remaining and
+    /// does not grant create/decrease authority. A missing client is an error.
+    pub fn member_working_capacity(
+        &self,
+        client: &ClientOrderId,
+    ) -> Result<(u64, bool), HostError> {
+        let row = self
+            .orders
+            .get(client)
+            .ok_or_else(|| HostError::MissingClient(client.clone()))?;
+        if let WorkingView::Known(quantity) =
+            self.registry.member_working_view(&self.ledger, client)
+        {
+            return Ok((quantity, false));
+        }
+        let wire = row
+            .ctx
+            .venue_order_id
+            .as_ref()
+            .or_else(|| self.registry.wire_for_client(&self.ledger, client));
+        let (other_attributed, other_debt) = match wire {
+            Some(wire) => match self.other_member_attribution(wire, client) {
+                Some(facts) => facts,
+                None => return Ok((0, true)),
+            },
+            None if self.registry.has_client(&self.ledger, client) => return Ok((0, true)),
+            None => (0, false),
+        };
+        Ok(
+            match row
+                .ctx
+                .qty
+                .checked_sub(other_attributed)
+                .and_then(|capacity| capacity.checked_sub(row.ctx.attributed_fill_qty))
+            {
+                Some(quantity) => (quantity, other_debt),
+                None => (0, true),
+            },
+        )
+    }
+
+    /// Borrow canonical wire association, including an unbound amend child.
+    /// This coverage identity is not evidence that the child was accepted.
+    pub fn coverage_wire_for_client(&self, client: &ClientOrderId) -> Option<&VenueOrderId> {
+        let row = self.orders.get(client)?;
+        row.ctx
+            .venue_order_id
+            .as_ref()
+            .or_else(|| self.registry.wire_for_client(&self.ledger, client))
+    }
+
+    pub fn coverage_client_superseded(&self, client: &ClientOrderId) -> bool {
+        self.orders.values().any(|row| {
+            let Some(wire) = row.ctx.venue_order_id.as_ref() else {
+                return false;
+            };
+            let Some(lineage) = self
+                .registry
+                .get(&self.ledger, wire)
+                .and_then(|state| state.amend_lineage.as_ref())
+            else {
+                return false;
+            };
+            &lineage.old_cid == client
+                && self
+                    .orders
+                    .get(&lineage.new_cid)
+                    .is_some_and(|new| new.ctx.venue_order_id.as_ref() == Some(wire))
+        })
+    }
+
+    /// Base coverage facts from the one canonical owner. Positive-cancel
+    /// provenance is deliberately a separate fact until its owner API lands;
+    /// callers must not use this base view to discard such a known residual.
+    /// Role/price/strategy policy is not selected here; reducing direction uses
+    /// the supplied signed net in the same quantity unit as the canonical rows.
+    pub fn base_coverage_members(&self, net: i128) -> Vec<CoverageMember<'_>> {
+        self.orders
+            .iter()
+            .map(|(client, row)| {
+                let reducing = match row.ctx.side {
+                    crate::lifecycle::Side::BuyYes => net < 0,
+                    crate::lifecycle::Side::SellYes => net > 0,
+                };
+                let (live, cancelling) = match row.state {
+                    OrderState::New
+                    | OrderState::SubmitPrepared
+                    | OrderState::SubmitStarted { .. }
+                    | OrderState::SubmitUnknown
+                    | OrderState::Accepted { .. }
+                    | OrderState::Partial { .. }
+                    | OrderState::ImmediateFillUnattributed { .. } => (true, false),
+                    OrderState::CancelPending { .. } | OrderState::ReconcilePending { .. } => {
+                        (true, true)
+                    }
+                    OrderState::Filled
+                    | OrderState::Canceled
+                    | OrderState::Terminal
+                    | OrderState::ImmediateFillUnresolved
+                    | OrderState::UnknownNoMatch
+                    | OrderState::Halted { .. }
+                    | OrderState::SubmissionClosed { .. } => (false, false),
+                };
+                // This iterator comes directly from the owned map, so lookup cannot
+                // be missing. Any future structural failure explicitly marks the
+                // quantity unresolvable, which refuses the UPPER coverage proof.
+                let (quantity, unresolvable) =
+                    self.member_working_capacity(client).unwrap_or((0, true));
+                CoverageMember {
+                    client,
+                    wire: self.coverage_wire_for_client(client),
+                    quantity: (live && reducing).then_some(quantity),
+                    unresolvable,
+                    cancelling,
+                    superseded: self.coverage_client_superseded(client),
+                }
+            })
+            .collect()
+    }
+
     pub fn view(&self) -> OrderHostView {
         OrderHostView {
             inventory: self.inventory.view(),
@@ -331,7 +525,7 @@ impl OrderBook {
             {
                 return Ok(false);
             }
-            self.commit_execution(None, &row, journal)?;
+            self.commit_routed_execution(&row, journal)?;
         }
         self.seed_proven = true;
         Ok(true)
@@ -573,6 +767,51 @@ impl OrderBook {
         self.commit_execution_transaction(owner, transaction, journal)
     }
 
+    /// Source-defined owner selection: a known claimed client must not conflict
+    /// with its bound wire; an unknown/mismatched claim never falls back to a
+    /// different wire owner. Unclaimed evidence uses the canonical route.
+    /// Closed submissions remain NoRow. This commits the execution transaction;
+    /// post-fill REST/lineage/terminal convergence remains a separate operation.
+    pub fn commit_routed_execution(
+        &mut self,
+        evidence: &ExecutionEvidence,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<Vec<ExecutionOutcome>>, CommitError> {
+        self.ensure_active()?;
+        let eligible = |client: &ClientOrderId| {
+            self.orders.get(client).is_some_and(|row| {
+                let mismatch = match (
+                    row.ctx.venue_order_id.as_ref(),
+                    evidence.venue_order_id.as_ref(),
+                ) {
+                    (Some(bound), Some(found)) => bound != found,
+                    (None, None) | (None, Some(_)) | (Some(_), None) => false,
+                };
+                !mismatch && !row.state.is_submission_closed()
+            })
+        };
+        let owner = if let Some(client) = evidence.claimed_client_order_id.as_ref() {
+            eligible(client).then(|| client.clone())
+        } else if let Some(wire) = evidence.venue_order_id.as_ref() {
+            match self
+                .registry
+                .route(&self.ledger, wire, &evidence.execution_id, &self.inventory)
+            {
+                Route::ExistingOwner(client)
+                | Route::NewUnique(client)
+                | Route::UnownedUnique(client) => self
+                    .orders
+                    .get(&client)
+                    .is_some_and(|row| !row.state.is_submission_closed())
+                    .then_some(client),
+                Route::NewAmbiguous | Route::UnownedAmbiguous | Route::VenueOnly => None,
+            }
+        } else {
+            None
+        };
+        self.commit_execution(owner.as_ref(), evidence, journal)
+    }
+
     /// Identified fills and their lifecycle event use the existing canonical
     /// batch transaction, including positional evidence validation.
     pub fn commit_execution_batch(
@@ -728,6 +967,29 @@ impl OrderBook {
             })?;
         Ok(CommitReceipt {
             outcome: transaction,
+            effects: Vec::new(),
+            durability,
+        })
+    }
+
+    /// Commit the existing canonical lineage declaration before external IO.
+    /// The canonical preparer validates current/phase/generation bindings;
+    /// declaring HttpPending/Unknown is not an accepted child or send permit.
+    pub fn commit_amend_lineage(
+        &mut self,
+        wire: &VenueOrderId,
+        lineage: AmendLineage,
+        journal: &mut dyn OmsJournal,
+    ) -> Result<CommitReceipt<()>, CommitError> {
+        self.ensure_active()?;
+        let record = self
+            .registry
+            .prepare_amend_lineage(&self.ledger, wire, lineage)
+            .map_err(CommitError::OrderStateProof)?;
+        let durability = self.write_transition(Some(&record), &[], true, journal)?;
+        self.fold_committed(Some(&record), journal)?;
+        Ok(CommitReceipt {
+            outcome: (),
             effects: Vec::new(),
             durability,
         })
