@@ -671,3 +671,83 @@ fn frame_duplicate_stale_and_resting_proof_preserve_distinct_canonical_boundarie
     let rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
     assert_eq!(rebuilt.working_view(&wire), book.working_view(&wire));
 }
+
+#[test]
+fn b2_direct_registry_appends_do_not_advance_transaction_fold_coordinates() {
+    let (mut book, client, mut journal) = initial();
+    accepted(&mut book, &client, "wire-a", &mut journal);
+    assert_eq!(journal.records().len(), 3);
+    let wire = VenueOrderId("wire-a".into());
+    let frame = UserOrderEvidence {
+        wire: wire.clone(),
+        market: ledger().market,
+        exchange_index: 1,
+        subaccount_number: 1,
+        sid: 2,
+        side: Side::BuyYes,
+        yes_price_e4: 400_000,
+        client_order_id: client.clone(),
+        status: UserOrderStatus::Resting,
+        filled: 0,
+        remaining: 100,
+        initial: 100,
+        updated_ts_ms: 10,
+        connection_generation: 1,
+        payload_digest: "digest-a".into(),
+    };
+    book.commit_user_order(frame, &mut journal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        book.registry()
+            .get(&ledger(), &wire)
+            .unwrap()
+            .latest_user_order_revision,
+        4
+    );
+    book.commit_wire_authority_hold(&wire, &mut journal)
+        .unwrap();
+    assert_eq!(
+        book.registry()
+            .get(&ledger(), &wire)
+            .unwrap()
+            .authority_hold_revision,
+        5
+    );
+    let second = context("client-b");
+    let second_id = second.client_order_id.clone();
+    book.insert_initial(second).unwrap();
+    accepted(&mut book, &second_id, "wire-b", &mut journal);
+    let second_wire = VenueOrderId("wire-b".into());
+    let live = book.registry().get(&ledger(), &second_wire).unwrap();
+    assert_eq!(
+        live.members[0].bind_pos, 5,
+        "S q counts only successful transaction folds"
+    );
+    let mut rebuilt = OrderBook::from_committed_records(ledger(), journal.records()).unwrap();
+    assert_eq!(
+        rebuilt
+            .registry()
+            .get(&ledger(), &second_wire)
+            .unwrap()
+            .members[0]
+            .bind_pos,
+        7,
+        "S replay enumerates the complete journal, distinct from live q after direct appends"
+    );
+    let replay_prefix = journal.records().len() as u64;
+    let third = context("client-c");
+    let third_id = third.client_order_id.clone();
+    rebuilt.insert_initial(third).unwrap();
+    accepted(&mut rebuilt, &third_id, "wire-c", &mut journal);
+    assert_eq!(
+        rebuilt
+            .registry()
+            .get(&ledger(), &VenueOrderId("wire-c".into()))
+            .unwrap()
+            .members[0]
+            .bind_pos,
+        replay_prefix + 2,
+        "S sets q to journal length on replay before further transactions"
+    );
+}

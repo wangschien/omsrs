@@ -41,6 +41,13 @@ struct CancelGone {
     wire: VenueOrderId,
 }
 
+#[derive(Clone, Copy)]
+enum FoldCoordinate {
+    Transaction,
+    LastRecord,
+    JournalEnd,
+}
+
 /// Source authority-read snapshot, scoped to this owner's ledger. This is not
 /// raw REST identity authentication or send authority. Callers still validate
 /// the returned wire/CID/market/index/subaccount and actual page completeness.
@@ -74,6 +81,7 @@ pub struct OrderBook {
     late_after_normal_terminal: BTreeSet<ClientOrderId>,
     cancel_gone: BTreeMap<ClientOrderId, CancelGone>,
     cancel_none: BTreeSet<VenueOrderId>,
+    fold_pos: u64,
 }
 
 impl OrderBook {
@@ -95,6 +103,7 @@ impl OrderBook {
             late_after_normal_terminal: BTreeSet::new(),
             cancel_gone: BTreeMap::new(),
             cancel_none: BTreeSet::new(),
+            fold_pos: 0,
         }
     }
 
@@ -157,6 +166,7 @@ impl OrderBook {
             late_after_normal_terminal,
             cancel_gone: BTreeMap::new(),
             cancel_none: BTreeSet::new(),
+            fold_pos: records.len() as u64,
         })
     }
 
@@ -872,17 +882,23 @@ impl OrderBook {
         &mut self,
         record: Option<&JournalRecord>,
         journal: &dyn OmsJournal,
+        coordinate: FoldCoordinate,
     ) -> Result<(), CommitError> {
         if let Some(record) = record {
-            // Rebuild enumerates records from zero. The just-appended record
-            // has index len - 1, including the order/member binding records.
-            let pos = journal.len().saturating_sub(1) as u64;
+            let pos = match coordinate {
+                FoldCoordinate::Transaction => self.fold_pos,
+                FoldCoordinate::LastRecord => journal.len().saturating_sub(1) as u64,
+                FoldCoordinate::JournalEnd => journal.len() as u64,
+            };
             self.registry
                 .fold(pos, record, &self.inventory)
                 .map_err(|error| {
                     self.stopped = true;
                     CommitError::Registry(error)
                 })?;
+            if matches!(coordinate, FoldCoordinate::Transaction) {
+                self.fold_pos = self.fold_pos.saturating_add(1);
+            }
         }
         Ok(())
     }
@@ -992,7 +1008,7 @@ impl OrderBook {
                 self.stopped = true;
                 CommitError::Apply(error)
             })?;
-        self.fold_committed(record.as_ref(), journal)?;
+        self.fold_committed(record.as_ref(), journal, FoldCoordinate::Transaction)?;
         Ok(CommitReceipt {
             outcome: (),
             effects,
@@ -1110,7 +1126,7 @@ impl OrderBook {
                 self.late_after_normal_terminal.insert(client.clone());
             }
         }
-        self.fold_committed(record.as_ref(), journal)?;
+        self.fold_committed(record.as_ref(), journal, FoldCoordinate::Transaction)?;
         for execution in &outcome {
             if let Some(timestamp) = Self::applied_venue_time(execution) {
                 self.last_applied_execution_ts_ns =
@@ -1180,7 +1196,7 @@ impl OrderBook {
                 self.stopped = true;
                 CommitError::ObservationApply(error)
             })?;
-        self.fold_committed(record.as_ref(), journal)?;
+        self.fold_committed(record.as_ref(), journal, FoldCoordinate::Transaction)?;
         // Source complete_terminal_amend_lineage runs after observation/apply:
         // only terminal venue status, every canonical member terminal, no hold.
         let complete = terminal_status
@@ -1220,7 +1236,7 @@ impl OrderBook {
             return Ok(None);
         };
         let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
-        self.fold_committed(Some(&record), journal)?;
+        self.fold_committed(Some(&record), journal, FoldCoordinate::LastRecord)?;
         Ok(Some(CommitReceipt {
             outcome: (),
             effects: Vec::new(),
@@ -1268,7 +1284,7 @@ impl OrderBook {
             wire: wire.clone(),
         };
         let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
-        self.fold_committed(Some(&record), journal)?;
+        self.fold_committed(Some(&record), journal, FoldCoordinate::LastRecord)?;
         Ok(CommitReceipt {
             outcome: (),
             effects: Vec::new(),
@@ -1424,7 +1440,7 @@ impl OrderBook {
             .prepare_amend_lineage(&self.ledger, wire, lineage)
             .map_err(CommitError::OrderStateProof)?;
         let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
-        self.fold_committed(Some(&record), journal)?;
+        self.fold_committed(Some(&record), journal, FoldCoordinate::JournalEnd)?;
         Ok(CommitReceipt {
             outcome: (),
             effects: Vec::new(),
@@ -1454,7 +1470,7 @@ impl OrderBook {
             lineage: None,
         };
         let durability = self.write_transition(Some(&record), &[], false, true, journal)?;
-        self.fold_committed(Some(&record), journal)?;
+        self.fold_committed(Some(&record), journal, FoldCoordinate::JournalEnd)?;
         Ok(Some(CommitReceipt {
             outcome: before,
             effects: Vec::new(),
