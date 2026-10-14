@@ -229,8 +229,7 @@ impl OrderBook {
         }
         self.orders = orders;
         self.cancel_gone.clear();
-        // Supervisor 377a978b: retain the native immediate-pre-fill predicate
-        // for this ONE field; source replay defect stays named and open.
+        // Retain the native immediate-pre-fill predicate for this field.
         let (_timestamp, late) = Self::rebuild_execution_provenance(&ledger, records);
         self.late_after_normal_terminal = late;
         self.last_applied_execution_ts_ns = 0;

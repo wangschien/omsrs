@@ -792,7 +792,7 @@ fn private_seed_walk_uses_the_same_unknown_child_settlement_tail() {
     rebuilt_same(&book, &journal, &[&cid]);
 }
 
-// Exact sealed S helper for the supervisor-authorized one-field contrast.
+// Reference replay helper for the single-field contrast.
 fn source_replay_late_flags(records: &[JournalRecord]) -> std::collections::BTreeSet<String> {
     fn terminal_in(o: &omsrs::execution::OrderTxnRecord) -> bool {
         o.core_records.iter().any(|r| {
@@ -852,7 +852,7 @@ fn source_replay_late_flags(records: &[JournalRecord]) -> std::collections::BTre
 }
 
 #[test]
-fn b4_supervisor_one_field_schedule_matches_native_live_and_both_replay_entries() {
+fn b4_one_field_schedule_matches_native_live_and_both_replay_entries() {
     for intervening_halt in [false, true] {
         let mut book = OrderBook::new(ledger());
         let mut journal = MemoryJournal::new();
@@ -904,8 +904,8 @@ fn b4_supervisor_one_field_schedule_matches_native_live_and_both_replay_entries(
 
 #[test]
 fn b4_mixed_ledger_r2_preserves_owned_projection_except_ruled_foreign_raw_late() {
-    // Astra 99be2917 schedule; supervisor 17f5dd2a approves only this raw-set
-    // difference. Both histories use public owner calls, active then foreign.
+    // This schedule permits only the raw-set difference. Both histories use
+    // public owner calls, active then foreign.
     let mut active_ledger = ledger();
     active_ledger.scope = ExecutionScope("0".into());
     let mut active = OrderBook::new(active_ledger.clone());

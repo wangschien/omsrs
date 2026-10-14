@@ -1,6 +1,6 @@
 //! Original live OMS state moved without interpreting caller payloads.
 //! The role and trace handle remain the caller's real types. Journal, transport,
-//! clock and notification operations stay in the existing kbot caller.
+//! clock and notification operations stay in the existing host caller.
 use crate::execution::{
     ExecutionOutcome, ExecutionScope, ExecutionSource, InventoryDisposition, InventoryHealth,
     LedgerId, MarketInventory, OrderCursor, OrderRef,
@@ -19,20 +19,19 @@ pub struct CancelGone {
 pub struct LiveOmsOrder<R> {
     pub state: OrderState,
     pub ctx: OrderCtx,
-    /// 撤/成竞态（2026-08-15 spec）：gc **首次**见到本行处于 `Canceled` 的时刻。
-    /// `None` = 尚未被 gc 观察到。宽限期内保留行，让迟到私有 fill 走 omsrs D2
-    /// 响亮路径（记账 + Halted + `PostTerminalFill`），而非 `NoRow` 静默丢。
+    /// First time garbage collection observes a canceled row. Retaining the row
+    /// during its grace period allows late executions to be accounted and halted.
     pub canceled_gc_seen_ns: Option<u64>,
     /// Venue decrease 后的剩余 centi。omsrs `qty` 不能缩，open 投影认这个。
     /// `Some(0)` = 场上没了，勿再当活单。
     pub venue_working_centi: Option<u64>,
     /// Venue `initial_count` last admitted for this row (in-memory). The venue
-    /// keeps the ORIGINAL initial through Decrease and shrinking amends (demo
-    /// probe 09-29), so an amend child inherits its parent's value.
+    /// keeps the original initial through decreases and shrinking amendments,
+    /// so an amendment child inherits its parent's value.
     pub venue_initial_centi: Option<u64>,
     pub role: R,
     pub reduce_only: bool,
-    /// v22: create ACK `Some(now_ns)`; REST seed `None`; amend reset `Some(now_ns)`.
+    /// Create acknowledgement `Some(now_ns)`; REST seed `None`; amendment reset `Some(now_ns)`.
     pub order_age_anchor_ns: Option<u64>,
     /// A's order cursor (seq). Required by prepare/apply; rebuilt from journal.
     pub cursor: OrderCursor,
@@ -79,33 +78,32 @@ pub struct LineageClear {
 
 pub struct LiveOmsBookState<R, Stage> {
     pub by_client: BTreeMap<String, LiveOmsOrder<R>>,
-    /// Spec Step C: fill_ids booked with `fee_cents: None` awaiting F5 enrichment.
+    /// Execution identifiers booked with unknown fees and awaiting enrichment.
     pub pending_fee_fill_ids: std::collections::BTreeSet<String>,
-    /// 撤/成竞态 spec B + 复审 grok HIGH-2：**已入账/已补记**的 fill trade_id 集合
-    /// （Booked / D2 late / off-book 都登记；session 起动时从 journal 播种以跨
-    /// crash）。NoRow 且已见 = 重投/redelivery ⇒ 幂等静默（不闩不双记）。
+    /// Accounted execution identifiers, including late and unowned executions.
+    /// Seeded from the journal on startup to preserve redelivery idempotency.
     pub seen_fill_ids: std::collections::BTreeSet<String>,
     pub staged_user_orders: BTreeMap<String, UserOrderEvidence>,
     pub amend_applied_mono: BTreeMap<String, std::time::Instant>,
-    /// WO-UA R2-3: every lineage clear with its instant and writer (drained by `LiveSession::ua_sync`).
+    /// Lineage clears with their timestamps and writers, drained by the caller.
     pub lineage_clears: Vec<LineageClear>,
     pub replayed_http_pending: BTreeSet<VenueOrderId>,
     pub lagged_unknown_creates: BTreeSet<String>,
     pub ledger: LedgerId,
     pub public_fields: LiveOmsPublicFields,
-    /// cids whose late fill was booked on a row that was already normal-terminal (ledger #33 r1).
+    /// Clients whose late execution was accounted after a normal terminal state.
     pub late_after_terminal: BTreeSet<String>,
     pub fold_pos: u64,
-    /// Closure pending-wire index (§3.2 β): wires only, not persisted.
+    /// Pending closure wire identifiers, not persisted.
     pub pending_wires: BTreeSet<VenueOrderId>,
-    /// #55 route (ii): wires whose positive DELETE found no live proof total (and no D3R1-1 deficit), so the Canceled
-    /// arm refused the 0/0 synthesis; a D3 member while a row bound to the wire is open (not persisted).
+    /// Wires whose cancellation had no live proof total or known deficit and
+    /// could not synthesize an empty terminal proof; not persisted.
     pub d3_cancel_none: BTreeSet<VenueOrderId>,
     /// Per-venue-id budget for the amended-hold protective cancel (not persisted).
     pub protective_cancel: BTreeMap<String, ProtectiveCancelState>,
     /// Per-venue-id cadence of the authority official-order GET (not persisted).
     pub authority_read: BTreeMap<String, AuthorityReadState>,
-    /// #56: newest venue exec ts (ns, second-precision) among executions APPLIED to inventory (`Ingested`); duplicates,
+    /// Newest venue execution time among executions applied to inventory (`Ingested`); duplicates,
     /// refusals and conflicts never move it. Rebuilt from the journal through the same predicate.
     pub last_applied_exec_ts_ns: u64,
     pub stage: Option<Stage>,
@@ -122,8 +120,8 @@ pub struct LiveOmsPublicFields {
     pub user_orders_connection_generation: u64,
     pub expected_exchange_index: Option<i64>,
     pub expected_subaccount: i64,
-    /// Tickers of the adjacent authorized WinX windows (start∓900); a same-subaccount
-    /// WS fill on one of them is a neighbour's fill, not invalid evidence (ledger #35).
+    /// Authorized adjacent markets; same-subaccount executions on these markets
+    /// belong to their respective markets rather than being invalid evidence.
     pub adjacent_markets: Vec<String>,
     pub protective_cancel_suppressed: u64,
     pub authority_read_suppressed: u64,

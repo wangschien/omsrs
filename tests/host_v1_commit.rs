@@ -979,7 +979,7 @@ fn b4_success_rebuilds_owned_images_resets_g2_and_seeds_future_fold_position() {
         (view.wire_by_local.len(), view.local_by_wire.len(), view.local_by_client.len(), view.client_by_local.len())
     };
     let next_ordinal = recovered.allocate_ordinal();
-    eprintln!("ASTRA145 ordinal before={} after={mapped_after:?} allocated_after={allocated_after} maps_after={counts_after:?} next={}", ordinal.raw(), next_ordinal.raw());
+    let _ = (ordinal.raw(), mapped_after.as_ref(), allocated_after, counts_after, next_ordinal.raw());
     assert_eq!(mapped_after, Some(VenueOrderId("wire-a".into())), "in-place replay must preserve source transport identity");
     assert!(!recovered.seed_proven());
     assert!(!recovered.stopped());
