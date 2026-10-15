@@ -4,6 +4,17 @@ All notable changes to `omsrs` are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - Unreleased
+
+### Changed (breaking)
+
+- `host_v1::LiveOmsBookState` now contains an internal monotonic clock used by
+  amend observation recovery. Downstream struct literals must use `Default`
+  or an existing constructor instead. The default clock remains
+  `std::time::Instant::now`.
+- A clock setter is available only for tests or with `host-test-support`.
+  This unreleased note does not change the current package version.
+
 ## [0.6.1] - 2026-09-30
 
 ### Fixed
