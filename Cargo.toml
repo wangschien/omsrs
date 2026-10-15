@@ -18,8 +18,10 @@ include = [
 default = []
 persistence = ["dep:rusqlite"]
 statistical-tests = []
+host-test-support = []
 
 [dependencies]
+anyhow = "1"
 rust_decimal = { version = "1.40", features = ["serde-str"] }
 rust_decimal_macros = "1.40"
 chrono = { version = "0.4", features = ["clock", "serde"] }
