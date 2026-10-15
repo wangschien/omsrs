@@ -85,6 +85,7 @@ pub struct LiveOmsBookState<R, Stage> {
     pub seen_fill_ids: std::collections::BTreeSet<String>,
     pub staged_user_orders: BTreeMap<String, UserOrderEvidence>,
     pub amend_applied_mono: BTreeMap<String, std::time::Instant>,
+    pub(super) amend_clock: fn() -> std::time::Instant,
     /// Lineage clears with their timestamps and writers, drained by the caller.
     pub lineage_clears: Vec<LineageClear>,
     pub replayed_http_pending: BTreeSet<VenueOrderId>,
@@ -153,6 +154,7 @@ impl<R, Stage> Default for LiveOmsBookState<R, Stage> {
             seen_fill_ids: Default::default(),
             staged_user_orders: BTreeMap::new(),
             amend_applied_mono: BTreeMap::new(),
+            amend_clock: std::time::Instant::now,
             lineage_clears: Vec::new(),
             replayed_http_pending: BTreeSet::new(),
             lagged_unknown_creates: BTreeSet::new(),
@@ -186,6 +188,11 @@ impl<R, Stage> Default for LiveOmsBookState<R, Stage> {
 }
 
 impl<R, Stage> LiveOmsBookState<R, Stage> {
+    #[cfg(any(test, feature = "host-test-support"))]
+    pub fn set_amend_clock_for_test(&mut self, clock: fn() -> std::time::Instant) {
+        self.amend_clock = clock;
+    }
+
     pub fn fill_id_seen(&self, trade_id: &str) -> bool {
         self.seen_fill_ids.contains(trade_id)
     }

@@ -932,7 +932,10 @@ impl<R, Stage> LiveOmsBookState<R, Stage> {
                 .is_some_and(|lineage| lineage.phase == AmendPhase::AppliedNeedsObservation)
             {
                 if self.amend_applied_mono.get(&req.wire.0).is_some_and(|at| {
-                    at.elapsed().as_nanos() < u128::from(LIVE_RECOVERY_INTERVAL_NS)
+                    (self.amend_clock)()
+                        .saturating_duration_since(*at)
+                        .as_nanos()
+                        < u128::from(LIVE_RECOVERY_INTERVAL_NS)
                 }) {
                     continue;
                 }
@@ -1561,5 +1564,210 @@ impl<R, Stage> LiveOmsBookState<R, Stage> {
             journal,
         )
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use crate::host_v1::live_cover::CoverageClient;
+    use crate::lifecycle::{AttemptId, Side};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static NOW: Cell<Option<Instant>> = Cell::new(None);
+    }
+
+    fn clock_now() -> Instant {
+        NOW.with(|now| now.get().expect("test clock initialized"))
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    struct Client(String);
+
+    impl CoverageClient for Client {
+        fn from_string(value: String) -> Option<Self> {
+            Some(Self(value))
+        }
+        fn try_from_string(value: String) -> Result<Self> {
+            Ok(Self(value))
+        }
+        fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl AdmissionClient<()> for Client {
+        fn permits_entry_cancel(&self, _: &()) -> bool {
+            true
+        }
+        fn is_exit_tag(_: &str) -> bool {
+            false
+        }
+        fn is_entry_tag(_: &str) -> bool {
+            false
+        }
+        fn restored_role(_: &str) -> ((), bool) {
+            ((), false)
+        }
+    }
+
+    #[derive(Default)]
+    struct Journal {
+        records: Vec<JournalRecord>,
+        authority: Vec<Effect>,
+    }
+
+    impl TransactionIo for Journal {
+        fn apply_effects(&mut self, effects: &[Effect]) -> Result<()> {
+            for effect in effects {
+                match effect {
+                    Effect::AppendFsync(record) => self.records.push(record.clone()),
+                    Effect::RequestAuthorityReconcile { .. }
+                    | Effect::ReconcileCancel { .. }
+                    | Effect::BackfillFills { .. } => self.authority.push(effect.clone()),
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        fn commit_now(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn len(&self) -> usize {
+            self.records.len()
+        }
+        fn has_fill_id(&self, _: &str) -> bool {
+            false
+        }
+        fn wall_now_ns(&self) -> u64 {
+            1
+        }
+    }
+
+    impl AuthorityEffectsIo for Journal {
+        fn drain_authority_effects(&mut self) -> Vec<Effect> {
+            std::mem::take(&mut self.authority)
+        }
+        fn requeue_authority_effects(&mut self, effects: Vec<Effect>) {
+            self.authority.extend(effects);
+        }
+    }
+
+    fn submit(
+        book: &mut LiveOmsBookState<(), ()>,
+        journal: &mut Journal,
+        cid: &str,
+        amended: bool,
+    ) {
+        let mut state = OrderState::New;
+        let mut ctx = OrderCtx::new(
+            OmsClientOrderId(cid.into()),
+            "market",
+            "group",
+            Side::BuyYes,
+            40,
+            100,
+        );
+        let mut cursor = OrderCursor { seq: 0 };
+        for event in [
+            OrderEvent::PrepareSubmit,
+            OrderEvent::StartSubmit {
+                attempt_id: AttemptId(cid.into()),
+            },
+            OrderEvent::SubmitResponse {
+                venue_order_id: VenueOrderId("wire".into()),
+                fill_count: 0,
+                remaining_count: 100,
+                avg_price_cents: None,
+                fee_cents: None,
+                snapshot_boundary: None,
+            },
+        ]
+        .into_iter()
+        .chain(amended.then_some(OrderEvent::AmendObserved))
+        {
+            book.apply_and_journal(
+                &mut state,
+                &mut ctx,
+                &mut cursor,
+                &event,
+                journal,
+                ExecutionSource::CreateResponseBackfill,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn injected_amend_clock_waits_until_exact_recovery_boundary() {
+        let mut book = LiveOmsBookState::<(), ()>::default();
+        let mut journal = Journal::default();
+        // A past anchor makes an accidental real-time consumer fail immediately.
+        let t0 = Instant::now() - Duration::from_secs(120);
+        NOW.with(|now| now.set(Some(t0)));
+        book.set_amend_clock_for_test(clock_now);
+        submit(&mut book, &mut journal, "old", false);
+        book.stage_amend_lineage_for_presend_group("old", "new", "wire", 100, &mut journal)
+            .unwrap();
+        submit(&mut book, &mut journal, "new", true);
+        book.advance_amend_lineage(
+            "wire",
+            AmendPhase::AppliedNeedsObservation,
+            Some(1),
+            &mut journal,
+        )
+        .unwrap();
+        assert_eq!(book.amend_applied_mono.get("wire"), Some(&t0));
+        let wire = VenueOrderId("wire".into());
+        journal
+            .apply_effects(&[Effect::ReconcileCancel {
+                venue_order_id: Some(wire.clone()),
+            }])
+            .unwrap();
+        let before_poll = journal.records.len();
+
+        NOW.with(|now| {
+            now.set(Some(
+                t0 + Duration::from_nanos(LIVE_RECOVERY_INTERVAL_NS - 1),
+            ))
+        });
+        assert!(book
+            .drain_authority_requests::<Client, _>(&mut journal)
+            .is_empty());
+        assert_eq!(
+            book.registry
+                .get(book.ledger(), &wire)
+                .unwrap()
+                .amend_lineage
+                .as_ref()
+                .unwrap()
+                .phase,
+            AmendPhase::AppliedNeedsObservation
+        );
+        assert_eq!(journal.records.len(), before_poll);
+
+        NOW.with(|now| now.set(Some(t0 + Duration::from_nanos(LIVE_RECOVERY_INTERVAL_NS))));
+        let requests = book.drain_authority_requests::<Client, _>(&mut journal);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].wire, wire);
+        assert_eq!(
+            book.registry
+                .get(book.ledger(), &wire)
+                .unwrap()
+                .amend_lineage
+                .as_ref()
+                .unwrap()
+                .phase,
+            AmendPhase::RestDue
+        );
+        assert_eq!(journal.records.len(), before_poll + 1);
+        assert!(
+            matches!(journal.records.last(), Some(JournalRecord::AmendLineage {
+            lineage: Some(lineage), ..
+        }) if lineage.phase == AmendPhase::RestDue)
+        );
+        assert!(!book.stopped);
     }
 }

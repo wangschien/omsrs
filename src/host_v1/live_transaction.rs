@@ -398,8 +398,7 @@ impl<R, Stage> LiveOmsBookState<R, Stage> {
             .map_err(|e| anyhow::anyhow!("amend lineage transition: {e:?}"))?;
         self.commit_registry_record(record, journal)?;
         if phase == AmendPhase::AppliedNeedsObservation {
-            self.amend_applied_mono
-                .insert(wire.0, std::time::Instant::now());
+            self.amend_applied_mono.insert(wire.0, (self.amend_clock)());
         }
         Ok(())
     }
