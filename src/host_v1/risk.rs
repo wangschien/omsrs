@@ -1,4 +1,14 @@
+use crate::lifecycle::Side;
+use rust_decimal::Decimal;
 use std::collections::BTreeSet;
+
+pub fn invalid_book(bid: Option<Decimal>, ask: Option<Decimal>) -> Option<InvalidBook> {
+    match (bid, ask) {
+        (Some(bid), Some(ask)) if bid > ask => Some(InvalidBook::Crossed),
+        (Some(bid), Some(ask)) if bid == ask => Some(InvalidBook::Locked),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthorityReason {
@@ -58,46 +68,7 @@ impl AdmissionReasons {
     /// Intersect every independent reason. Clearing one reason never clears
     /// another reason or implicitly grants exit-cancellation authority.
     pub fn admits(&self, action: AdmissionAction, facts: AdmissionFacts) -> bool {
-        if action == AdmissionAction::CancelExit {
-            return false;
-        }
-        let trusted_net =
-            self.authority.is_empty() && matches!(facts.net_trusted, NetTrust::Trusted { .. });
-        self.authority.iter().all(|reason| match reason {
-            AuthorityReason::AuthorityHold => match action {
-                AdmissionAction::New | AdmissionAction::ExitReduce => false,
-                AdmissionAction::CancelEntry | AdmissionAction::ExitKeep => true,
-                AdmissionAction::CancelExit => false,
-            },
-        }) && self.guards.iter().all(|reason| {
-            use AdmissionAction::{CancelEntry, CancelExit, ExitKeep, ExitReduce, New};
-            match reason {
-                GuardReason::IdentityUnverified => false,
-                GuardReason::ExchangePaused => action == ExitKeep,
-                GuardReason::TradingPaused
-                | GuardReason::InvalidBook
-                | GuardReason::ScheduleUnknown => {
-                    matches!(action, CancelEntry | ExitKeep)
-                }
-                GuardReason::ScheduleClosed => match action {
-                    New | CancelExit => false,
-                    CancelEntry | ExitKeep => true,
-                    ExitReduce => facts.before_pause,
-                },
-                GuardReason::StatusUnproven
-                | GuardReason::StatusUnknown
-                | GuardReason::DailyLoss
-                | GuardReason::DailyLossUnprovable
-                | GuardReason::WindowStop
-                | GuardReason::MtmInvalid
-                | GuardReason::FeeUnverified
-                | GuardReason::LimitsUnverified => match action {
-                    New | CancelExit => false,
-                    CancelEntry | ExitKeep => true,
-                    ExitReduce => trusted_net,
-                },
-            }
-        })
+        admission_permits(&self.authority, &self.guards, action, facts)
     }
 }
 
@@ -119,6 +90,23 @@ pub struct BookGuard {
 }
 
 impl BookGuard {
+    /// A one-sided book does not establish recovery from a prior invalid
+    /// two-sided book.  A later valid two-sided update does.
+    pub fn observe(&mut self, bid: Option<Decimal>, ask: Option<Decimal>) {
+        if bid.is_none() || ask.is_none() {
+            return;
+        }
+        let next = invalid_book(bid, ask);
+        self.healthy_seen = next.is_none();
+        if next.is_some() {
+            self.invalid_updates = self.invalid_updates.saturating_add(1);
+            if self.current.is_none() {
+                self.episodes = self.episodes.saturating_add(1);
+            }
+        }
+        self.current = next;
+    }
+
     pub fn observe_class(&mut self, observation: Option<Option<InvalidBook>>) {
         let Some(next) = observation else { return };
         self.healthy_seen = next.is_none();
@@ -585,5 +573,105 @@ impl AuthorityHold {
     /// callback, clock, transport or journal operation runs in this owner.
     pub fn take_entered_effects(&mut self) -> Vec<HoldCause> {
         std::mem::take(&mut self.entered_effects)
+    }
+}
+
+// One reducer shared by the native and compatibility field names.
+pub(crate) fn admission_permits(
+    authority: &BTreeSet<AuthorityReason>,
+    guards: &BTreeSet<GuardReason>,
+    action: AdmissionAction,
+    facts: AdmissionFacts,
+) -> bool {
+    if action == AdmissionAction::CancelExit {
+        return false;
+    }
+    let trusted_net = authority.is_empty() && matches!(facts.net_trusted, NetTrust::Trusted { .. });
+    authority.iter().all(|reason| match reason {
+        AuthorityReason::AuthorityHold => match action {
+            AdmissionAction::New | AdmissionAction::ExitReduce => false,
+            AdmissionAction::CancelEntry | AdmissionAction::ExitKeep => true,
+            AdmissionAction::CancelExit => false,
+        },
+    }) && guards.iter().all(|reason| {
+        use AdmissionAction::{CancelEntry, CancelExit, ExitKeep, ExitReduce, New};
+        match reason {
+            GuardReason::IdentityUnverified => false,
+            GuardReason::ExchangePaused => action == ExitKeep,
+            GuardReason::TradingPaused
+            | GuardReason::InvalidBook
+            | GuardReason::ScheduleUnknown => {
+                matches!(action, CancelEntry | ExitKeep)
+            }
+            GuardReason::ScheduleClosed => match action {
+                New | CancelExit => false,
+                CancelEntry | ExitKeep => true,
+                ExitReduce => facts.before_pause,
+            },
+            GuardReason::StatusUnproven
+            | GuardReason::StatusUnknown
+            | GuardReason::DailyLoss
+            | GuardReason::DailyLossUnprovable
+            | GuardReason::WindowStop
+            | GuardReason::MtmInvalid
+            | GuardReason::FeeUnverified
+            | GuardReason::LimitsUnverified => match action {
+                New | CancelExit => false,
+                CancelEntry | ExitKeep => true,
+                ExitReduce => trusted_net,
+            },
+        }
+    })
+}
+
+pub fn reducing_side(side: Side, net_centi: i64) -> bool {
+    match net_centi {
+        n if n > 0 => side == Side::SellYes,
+        n if n < 0 => side == Side::BuyYes,
+        _ => false,
+    }
+}
+
+pub fn exit_reduce_action(
+    side: Side,
+    qty_centi: u64,
+    net_centi: i64,
+    reduce_only: bool,
+) -> AdmissionAction {
+    if reduce_only && reducing_side(side, net_centi) && net_centi.unsigned_abs() >= qty_centi {
+        AdmissionAction::ExitReduce
+    } else {
+        AdmissionAction::New
+    }
+}
+
+pub fn entry_identity_row<'a, R, Stage>(
+    oms: &'a super::live_state::LiveOmsBookState<R, Stage>,
+    cid: &str,
+) -> Option<&'a super::live_state::LiveOmsOrder<R>> {
+    let row = oms.by_client.get(cid)?;
+    if row.ctx.client_order_id.0 != cid || row.state.is_submission_closed() {
+        return None;
+    }
+    let wire = row.ctx.venue_order_id.as_ref()?;
+    let known = oms.public_fields.registry.get(oms.ledger(), wire)?;
+    if known.authority_hold
+        || known.amend_lineage.is_some()
+        || known.observed_exchange_index != oms.public_fields.expected_exchange_index
+        || known.proved_current_cid.as_ref() != Some(&row.ctx.client_order_id)
+        || !known.members.iter().any(|member| {
+            member.role == crate::observation::MemberRole::Current
+                && member.cid == row.ctx.client_order_id
+        })
+    {
+        return None;
+    }
+    Some(row)
+}
+
+pub fn entry_matches_net(side: Side, net_centi: i64) -> bool {
+    match side {
+        Side::BuyYes => net_centi >= 0,
+        Side::SellYes => net_centi <= 0,
     }
 }
